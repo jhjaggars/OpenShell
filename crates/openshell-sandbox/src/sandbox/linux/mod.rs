@@ -18,6 +18,7 @@ use std::sync::Once;
 pub struct PreparedSandbox {
     landlock: Option<landlock::PreparedRuleset>,
     policy: SandboxPolicy,
+    allow_cuda_procfs_writes: bool,
 }
 
 /// Phase 1: Prepare sandbox restrictions **as root** (before `drop_privileges`).
@@ -29,6 +30,7 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Prepared
     Ok(PreparedSandbox {
         landlock,
         policy: policy.clone(),
+        allow_cuda_procfs_writes: crate::has_gpu_devices(),
     })
 }
 
@@ -38,7 +40,14 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Prepared
 /// Neither operation requires root privileges.
 pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
     if let Some(ruleset) = prepared.landlock {
-        landlock::enforce(ruleset)?;
+        let ruleset = if prepared.allow_cuda_procfs_writes {
+            landlock::allow_cuda_procfs_writes(ruleset)?
+        } else {
+            Some(ruleset)
+        };
+        if let Some(ruleset) = ruleset {
+            landlock::enforce(ruleset)?;
+        }
     }
     seccomp::apply(&prepared.policy)?;
     Ok(())

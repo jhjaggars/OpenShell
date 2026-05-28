@@ -6,7 +6,7 @@
 use crate::policy::{LandlockCompatibility, SandboxPolicy};
 use landlock::{
     ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, PathFdError, Ruleset,
-    RulesetAttr, RulesetCreatedAttr,
+    RulesetAttr, RulesetCreatedAttr, make_bitflags,
 };
 use miette::{IntoDiagnostic, Result};
 use std::path::{Path, PathBuf};
@@ -264,6 +264,51 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
     }
 }
 
+/// Add the procfs write rule required by CUDA thread naming.
+///
+/// CUDA writes to `/proc/<pid>/task/<tid>/comm` during initialization.  The
+/// CUDA process may be a descendant of the command process that first receives
+/// Landlock restrictions, so per-process paths such as `/proc/self/task` are
+/// too narrow.  Grant only `WriteFile` on procfs; do not promote `/proc` to the
+/// full read-write access set used for ordinary read-write paths.
+pub fn allow_cuda_procfs_writes(prepared: PreparedRuleset) -> Result<Option<PreparedRuleset>> {
+    let procfs = Path::new("/proc");
+    let path_fd = match PathFd::new(procfs) {
+        Ok(fd) => fd,
+        Err(err) => {
+            if matches!(prepared.compatibility, LandlockCompatibility::BestEffort) {
+                return Ok(Some(prepared));
+            }
+            return Err(miette::miette!(
+                "Landlock path unavailable in hard_requirement mode: {} ({}): {}",
+                procfs.display(),
+                classify_path_fd_error(&err),
+                err,
+            ));
+        }
+    };
+
+    let PreparedRuleset {
+        ruleset,
+        compatibility,
+    } = prepared;
+    let result = ruleset
+        .add_rule(PathBeneath::new(
+            path_fd,
+            make_bitflags!(AccessFs::{WriteFile}),
+        ))
+        .into_diagnostic();
+
+    match result {
+        Ok(ruleset) => Ok(Some(PreparedRuleset {
+            ruleset,
+            compatibility,
+        })),
+        Err(_) if matches!(compatibility, LandlockCompatibility::BestEffort) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 /// Phase 2: Enforce a prepared Landlock ruleset by calling `restrict_self()`.
 ///
 /// This runs **after** `drop_privileges()`. The `restrict_self()` syscall does
@@ -415,6 +460,9 @@ fn compat_level(level: &LandlockCompatibility) -> CompatLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    const PROCFS_WRITE_HELPER_ENV: &str = "OPENSHELL_TEST_LANDLOCK_PROCFS_WRITE_HELPER";
 
     #[test]
     fn try_open_path_best_effort_returns_none_for_missing_path() {
@@ -450,6 +498,128 @@ mod tests {
         let result = try_open_path(dir.path(), &LandlockCompatibility::BestEffort);
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn allow_cuda_procfs_writes_allows_descendant_comm_write() {
+        if std::env::var_os(PROCFS_WRITE_HELPER_ENV).is_some() {
+            return;
+        }
+        if !matches!(probe_availability(), LandlockAvailability::Available { .. }) {
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(PROCFS_WRITE_HELPER_ENV, "1")
+            .arg("allow_cuda_procfs_writes_helper")
+            .arg("--nocapture")
+            .output()
+            .expect("failed to run Landlock procfs-write helper");
+
+        assert!(
+            output.status.success(),
+            "Landlock procfs-write helper failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn allow_cuda_procfs_writes_helper() {
+        if std::env::var_os(PROCFS_WRITE_HELPER_ENV).is_none() {
+            return;
+        }
+
+        if let Err(err) = run_procfs_write_helper() {
+            eprintln!("{err:?}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
+    fn run_procfs_write_helper() -> Result<()> {
+        let compatibility = LandlockCompatibility::HardRequirement;
+        let ruleset = Ruleset::default()
+            .set_compatibility(compat_level(&compatibility))
+            .handle_access(AccessFs::from_all(ABI::V2))
+            .into_diagnostic()?
+            .create()
+            .into_diagnostic()?;
+        let prepared = PreparedRuleset {
+            ruleset,
+            compatibility,
+        };
+        let prepared = allow_cuda_procfs_writes(prepared)?
+            .ok_or_else(|| miette::miette!("procfs write rule was not added"))?;
+
+        enforce(prepared)?;
+        write_current_task_comm("openshell-main")?;
+
+        let worker = std::thread::spawn(|| write_current_task_comm("openshell-child"));
+        worker
+            .join()
+            .map_err(|_| miette::miette!("comm writer thread panicked"))??;
+
+        let child_pid = fork_and_write_current_task_comm()?;
+        wait_for_child_success(child_pid)?;
+
+        Ok(())
+    }
+
+    fn write_current_task_comm(name: &str) -> Result<()> {
+        let tid = current_tid();
+        let path = format!("/proc/self/task/{tid}/comm");
+        let mut comm = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .into_diagnostic()?;
+        comm.write_all(name.as_bytes()).into_diagnostic()
+    }
+
+    fn current_tid() -> libc::pid_t {
+        #[allow(unsafe_code, clippy::cast_possible_truncation)]
+        unsafe {
+            libc::syscall(libc::SYS_gettid) as libc::pid_t
+        }
+    }
+
+    fn fork_and_write_current_task_comm() -> Result<libc::pid_t> {
+        #[allow(unsafe_code)]
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(std::io::Error::last_os_error()).into_diagnostic();
+        }
+        if pid == 0 {
+            let code = match write_current_task_comm("openshell-fork") {
+                Ok(()) => 0,
+                Err(err) => {
+                    eprintln!("{err:?}");
+                    1
+                }
+            };
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::_exit(code);
+            }
+        }
+        Ok(pid)
+    }
+
+    fn wait_for_child_success(pid: libc::pid_t) -> Result<()> {
+        let mut status = 0;
+        #[allow(unsafe_code)]
+        let waited = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        if waited < 0 {
+            return Err(std::io::Error::last_os_error()).into_diagnostic();
+        }
+        if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+            return Ok(());
+        }
+        Err(miette::miette!(
+            "forked comm writer exited unsuccessfully: status={status}"
+        ))
     }
 
     #[test]

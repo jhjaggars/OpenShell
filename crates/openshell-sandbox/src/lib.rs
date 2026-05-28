@@ -1408,11 +1408,6 @@ const GPU_BASELINE_READ_ONLY: &[&str] = &[
 /// `/dev/dxg` as the sole GPU device node; it does not exist on native Linux
 /// and will be skipped there by the existence check.
 ///
-/// `/proc`: CUDA writes to `/proc/<pid>/task/<tid>/comm` during `cuInit()`
-/// to set thread names.  Without write access, `cuInit()` returns error 304.
-/// Must use `/proc` (not `/proc/self/task`) because Landlock rules bind to
-/// inodes and child processes have different procfs inodes than the parent.
-///
 /// Per-GPU device files (`/dev/nvidia0`, …) are enumerated at runtime by
 /// `enumerate_gpu_device_nodes()` since the count varies.
 const GPU_BASELINE_READ_WRITE: &[&str] = &[
@@ -1421,7 +1416,6 @@ const GPU_BASELINE_READ_WRITE: &[&str] = &[
     "/dev/nvidia-uvm-tools",
     "/dev/nvidia-modeset",
     "/dev/dxg", // WSL2: DXG device (GPU via DirectX kernel driver, injected by CDI)
-    "/proc",
 ];
 
 /// Returns true if GPU devices are present in the container.
@@ -1429,7 +1423,7 @@ const GPU_BASELINE_READ_WRITE: &[&str] = &[
 /// Checks both the native Linux NVIDIA control device (`/dev/nvidiactl`) and
 /// the WSL2 DXG device (`/dev/dxg`).  CDI injects exactly one of these
 /// depending on the host kernel; the other will not exist.
-fn has_gpu_devices() -> bool {
+pub(crate) fn has_gpu_devices() -> bool {
     std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/dev/dxg").exists()
 }
 
@@ -1512,9 +1506,9 @@ fn collect_baseline_enrichment_paths(
         }
     }
 
-    // A path promoted to read_write (e.g. /proc for GPU) should not also
-    // appear in read_only. Landlock handles the overlap correctly, but the
-    // duplicate obscures the effective policy when operators inspect it.
+    // A path promoted to read_write should not also appear in read_only.
+    // Landlock handles the overlap correctly, but the duplicate obscures the
+    // effective policy when operators inspect it.
     read_only.retain(|p| !read_write.contains(p));
 
     BaselineEnrichmentPaths {
@@ -1770,22 +1764,17 @@ mod baseline_tests {
     use crate::policy::{FilesystemPolicy, LandlockPolicy, ProcessPolicy};
 
     #[test]
-    fn proc_not_in_both_read_only_and_read_write_when_gpu_present() {
-        // When GPU devices are present, /proc is promoted to read_write
-        // (CUDA needs to write /proc/<pid>/task/<tid>/comm). It should
-        // NOT also appear in read_only.
-        if !has_gpu_devices() {
-            // Can't test GPU dedup without GPU devices; skip silently.
-            return;
-        }
-        let (ro, rw) = baseline_enrichment_paths();
+    fn gpu_baseline_does_not_promote_proc_to_read_write() {
+        let paths = collect_baseline_enrichment_paths(true, true, vec!["/dev/nvidia0".to_string()]);
+        let ro = paths.read_only;
+        let rw = paths.read_write;
         assert!(
-            rw.contains(&"/proc".to_string()),
-            "/proc should be in read_write when GPU is present"
+            ro.contains(&"/proc".to_string()),
+            "/proc should remain read-only when proxy baseline paths are included"
         );
         assert!(
-            !ro.contains(&"/proc".to_string()),
-            "/proc should NOT be in read_only when it is already in read_write"
+            !rw.contains(&"/proc".to_string()),
+            "/proc should not be promoted to read_write by GPU enrichment"
         );
     }
 
@@ -1868,7 +1857,7 @@ mod baseline_tests {
     }
 
     #[test]
-    fn proto_gpu_enrichment_promotes_default_proc_without_network_policy() {
+    fn proto_gpu_enrichment_preserves_default_proc_without_network_policy() {
         let mut policy = openshell_policy::restrictive_default_policy();
         assert!(
             policy.network_policies.is_empty(),
@@ -1888,12 +1877,12 @@ mod baseline_tests {
         let filesystem = policy.filesystem.expect("filesystem policy");
         assert!(enriched, "default GPU enrichment should modify policy");
         assert!(
-            !filesystem.read_only.contains(&"/proc".to_string()),
-            "default GPU enrichment should remove /proc from read_only"
+            filesystem.read_only.contains(&"/proc".to_string()),
+            "default GPU enrichment should preserve read-only /proc"
         );
         assert!(
-            filesystem.read_write.contains(&"/proc".to_string()),
-            "default GPU enrichment should promote /proc to read_write"
+            !filesystem.read_write.contains(&"/proc".to_string()),
+            "default GPU enrichment should not promote /proc to read_write"
         );
         assert!(
             filesystem.read_write.contains(&"/dev/nvidia0".to_string()),
@@ -1902,7 +1891,7 @@ mod baseline_tests {
     }
 
     #[test]
-    fn proto_gpu_enrichment_promotes_discovered_image_policy_proc() {
+    fn proto_gpu_enrichment_preserves_discovered_image_policy_proc() {
         let mut policy = openshell_policy::restrictive_default_policy();
         policy.network_policies.insert(
             "image-policy".into(),
@@ -1929,12 +1918,12 @@ mod baseline_tests {
         let filesystem = policy.filesystem.expect("filesystem policy");
         assert!(enriched, "discovered image policy should be enriched");
         assert!(
-            !filesystem.read_only.contains(&"/proc".to_string()),
-            "image-discovered GPU policy should remove /proc from read_only"
+            filesystem.read_only.contains(&"/proc".to_string()),
+            "image-discovered GPU policy should preserve read-only /proc"
         );
         assert!(
-            filesystem.read_write.contains(&"/proc".to_string()),
-            "image-discovered GPU policy should promote /proc to read_write"
+            !filesystem.read_write.contains(&"/proc".to_string()),
+            "image-discovered GPU policy should not promote /proc to read_write"
         );
     }
 
@@ -1953,19 +1942,44 @@ mod baseline_tests {
             &mut policy,
             &paths,
             BaselinePolicySource::Custom,
-            |path| matches!(path, "/proc" | "/dev/nvidia0"),
+            |path| path == "/dev/nvidia0",
         )
         .expect("custom GPU enrichment should add omitted baseline paths");
 
         let filesystem = policy.filesystem.expect("filesystem policy");
         assert!(enriched, "custom GPU enrichment should modify policy");
-        assert!(filesystem.read_write.contains(&"/proc".to_string()));
+        assert!(!filesystem.read_write.contains(&"/proc".to_string()));
         assert!(filesystem.read_write.contains(&"/dev/nvidia0".to_string()));
     }
 
     #[test]
-    fn proto_gpu_enrichment_rejects_custom_read_only_proc() {
+    fn proto_gpu_enrichment_preserves_custom_read_only_proc() {
         let mut policy = openshell_policy::restrictive_default_policy();
+        let paths =
+            collect_baseline_enrichment_paths(false, true, vec!["/dev/nvidia0".to_string()]);
+
+        enrich_proto_baseline_paths_with(
+            &mut policy,
+            &paths,
+            BaselinePolicySource::Custom,
+            |path| matches!(path, "/proc" | "/dev/nvidia0"),
+        )
+        .expect("custom read-only /proc should not conflict with GPU baseline");
+
+        let filesystem = policy.filesystem.expect("filesystem policy");
+        assert!(filesystem.read_only.contains(&"/proc".to_string()));
+        assert!(!filesystem.read_write.contains(&"/proc".to_string()));
+        assert!(filesystem.read_write.contains(&"/dev/nvidia0".to_string()));
+    }
+
+    #[test]
+    fn proto_gpu_enrichment_rejects_custom_read_only_gpu_device() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            read_only: vec!["/dev/nvidia0".to_string()],
+            read_write: vec![],
+            include_workdir: false,
+        });
         let paths =
             collect_baseline_enrichment_paths(false, true, vec!["/dev/nvidia0".to_string()]);
 
@@ -1973,12 +1987,14 @@ mod baseline_tests {
             &mut policy,
             &paths,
             BaselinePolicySource::Custom,
-            |path| path == "/proc",
+            |path| path == "/dev/nvidia0",
         )
-        .expect_err("custom read-only /proc should conflict with GPU baseline");
+        .expect_err("custom read-only GPU device should conflict with GPU baseline");
 
         let message = error.to_string();
-        assert!(message.contains("GPU sandbox policy keeps required path '/proc' read-only"));
+        assert!(
+            message.contains("GPU sandbox policy keeps required path '/dev/nvidia0' read-only")
+        );
         assert!(message.contains("filesystem_policy.read_write"));
     }
 
@@ -2029,7 +2045,7 @@ mod baseline_tests {
     }
 
     #[test]
-    fn local_gpu_enrichment_rejects_custom_read_only_proc() {
+    fn local_gpu_enrichment_preserves_custom_read_only_proc() {
         let mut policy = SandboxPolicy {
             version: 1,
             filesystem: FilesystemPolicy {
@@ -2047,18 +2063,65 @@ mod baseline_tests {
         let paths =
             collect_baseline_enrichment_paths(false, true, vec!["/dev/nvidia0".to_string()]);
 
+        enrich_sandbox_baseline_paths_with(
+            &mut policy,
+            &paths,
+            BaselinePolicySource::Custom,
+            |path| matches!(path, "/proc" | "/dev/nvidia0"),
+        )
+        .expect("custom read-only /proc should not conflict with GPU baseline");
+
+        assert!(
+            policy
+                .filesystem
+                .read_only
+                .contains(&std::path::PathBuf::from("/proc"))
+        );
+        assert!(
+            !policy
+                .filesystem
+                .read_write
+                .contains(&std::path::PathBuf::from("/proc"))
+        );
+        assert!(
+            policy
+                .filesystem
+                .read_write
+                .contains(&std::path::PathBuf::from("/dev/nvidia0"))
+        );
+    }
+
+    #[test]
+    fn local_gpu_enrichment_rejects_custom_read_only_gpu_device() {
+        let mut policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy {
+                read_only: vec![std::path::PathBuf::from("/dev/nvidia0")],
+                read_write: vec![],
+                include_workdir: false,
+            },
+            network: NetworkPolicy {
+                mode: NetworkMode::Block,
+                proxy: None,
+            },
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy::default(),
+        };
+        let paths =
+            collect_baseline_enrichment_paths(false, true, vec!["/dev/nvidia0".to_string()]);
+
         let error = enrich_sandbox_baseline_paths_with(
             &mut policy,
             &paths,
             BaselinePolicySource::Custom,
-            |path| path == "/proc",
+            |path| path == "/dev/nvidia0",
         )
-        .expect_err("custom read-only /proc should conflict with GPU baseline");
+        .expect_err("custom read-only GPU device should conflict with GPU baseline");
 
         assert!(
             error
                 .to_string()
-                .contains("GPU sandbox policy keeps required path '/proc' read-only")
+                .contains("GPU sandbox policy keeps required path '/dev/nvidia0' read-only")
         );
     }
 
