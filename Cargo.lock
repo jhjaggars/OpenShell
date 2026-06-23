@@ -3478,7 +3478,6 @@ name = "openshell-driver-apple-container"
 version = "0.0.0"
 dependencies = [
  "futures",
- "miette",
  "openshell-core",
  "serde",
  "serde_json",

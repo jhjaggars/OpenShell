@@ -202,8 +202,10 @@ impl ContainerCli {
 
     /// Remove a container. Stops it first if necessary.
     pub async fn rm(&self, container_id: &str) -> Result<(), ContainerCliError> {
-        // Stop first (ignore errors — may already be stopped).
-        let _ = self.stop(container_id, 5).await;
+        // Stop first — log errors at debug level (may already be stopped).
+        if let Err(e) = self.stop(container_id, 5).await {
+            debug!(container_id, error = %e, "Stop before rm failed (may already be stopped)");
+        }
         match self.run(&["rm", container_id]).await {
             Ok(_) => Ok(()),
             Err(ContainerCliError::NonZero { stderr, .. })

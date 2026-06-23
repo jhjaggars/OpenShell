@@ -109,9 +109,11 @@ pub fn detect_driver() -> Option<ComputeDriverKind> {
         return Some(ComputeDriverKind::Docker);
     }
 
-    // Apple Container: check if the `container` CLI is available (macOS only).
+    // Apple Container: check if Apple's `container` CLI is available (macOS only).
+    // The binary name "container" is generic, so verify it's actually Apple's
+    // tool by checking that `container list` succeeds (requires the apiserver).
     #[cfg(target_os = "macos")]
-    if is_binary_available("container") {
+    if is_apple_container_available() {
         return Some(ComputeDriverKind::AppleContainer);
     }
 
@@ -124,6 +126,43 @@ fn is_binary_available(name: &str) -> bool {
         .arg("--version")
         .output()
         .is_ok_and(|output| output.status.success())
+}
+
+/// Check if Apple's `container` CLI is available and its system service is
+/// running. The binary name "container" is too generic to rely on
+/// `--version` alone, so we verify the tool can actually list containers,
+/// which requires the `container-apiserver` launchd service to be running.
+///
+/// Uses a 5-second timeout to avoid blocking indefinitely if the
+/// apiserver is hung.
+#[cfg(target_os = "macos")]
+fn is_apple_container_available() -> bool {
+    use std::time::{Duration, Instant};
+
+    let Ok(mut child) = Command::new("container")
+        .args(["list", "--format", "json"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
 fn is_docker_available() -> bool {
