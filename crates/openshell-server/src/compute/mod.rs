@@ -28,6 +28,10 @@ use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
     SandboxTemplate, SshSession,
 };
+use openshell_driver_apple_container::{
+    AppleContainerComputeConfig, AppleContainerComputeDriver,
+    ComputeDriverService as AppleContainerDriverService,
+};
 use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
     ComputeDriverService, KubernetesComputeConfig, KubernetesComputeDriver,
@@ -394,6 +398,35 @@ impl ComputeRuntime {
         let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
         Self::from_driver(
             ComputeDriverKind::Podman,
+            driver,
+            None,
+            None,
+            None,
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            supervisor_sessions,
+            true,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn new_apple_container(
+        config: AppleContainerComputeConfig,
+        store: Arc<Store>,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<SupervisorSessionRegistry>,
+    ) -> Result<Self, ComputeError> {
+        let driver = AppleContainerComputeDriver::new(config)
+            .await
+            .map_err(|err| ComputeError::Message(err.to_string()))?;
+        let driver: SharedComputeDriver = Arc::new(AppleContainerDriverService::new(driver));
+        Self::from_driver(
+            ComputeDriverKind::AppleContainer,
             driver,
             None,
             None,

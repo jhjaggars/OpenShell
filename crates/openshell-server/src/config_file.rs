@@ -286,6 +286,14 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
             "guest_tls_cert",
             "guest_tls_key",
         ],
+        ComputeDriverKind::AppleContainer => &[
+            "sandbox_namespace",
+            "default_image",
+            "supervisor_image",
+            "guest_tls_ca",
+            "guest_tls_cert",
+            "guest_tls_key",
+        ],
     }
 }
 

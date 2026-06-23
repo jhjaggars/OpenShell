@@ -770,6 +770,19 @@ async fn build_compute_runtime(
             .await
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
+        ComputeDriverKind::AppleContainer => {
+            let apple_config = apple_container_config_from_file(file)?;
+            ComputeRuntime::new_apple_container(
+                apple_config,
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+                supervisor_sessions,
+            )
+            .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
+        }
     }
 }
 
@@ -826,6 +839,24 @@ fn podman_config_from_file(
         .map_err(|e| Error::config(format!("invalid [openshell.drivers.podman] table: {e}")))
 }
 
+fn apple_container_config_from_file(
+    file: Option<&config_file::ConfigFile>,
+) -> Result<openshell_driver_apple_container::AppleContainerComputeConfig> {
+    let Some(file) = file else {
+        return Ok(openshell_driver_apple_container::AppleContainerComputeConfig::default());
+    };
+    let merged = config_file::driver_table(
+        ComputeDriverKind::AppleContainer,
+        &file.openshell.gateway,
+        file.openshell.drivers.get("apple-container"),
+    );
+    merged.try_into().map_err(|e| {
+        Error::config(format!(
+            "invalid [openshell.drivers.apple-container] table: {e}"
+        ))
+    })
+}
+
 fn apply_podman_local_tls_defaults(
     config: &Config,
     podman: &mut openshell_driver_podman::PodmanComputeConfig,
@@ -865,7 +896,8 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
             driver @ (ComputeDriverKind::Kubernetes
             | ComputeDriverKind::Vm
             | ComputeDriverKind::Docker
-            | ComputeDriverKind::Podman),
+            | ComputeDriverKind::Podman
+            | ComputeDriverKind::AppleContainer),
         ] => Ok(*driver),
         drivers => Err(Error::config(format!(
             "multiple compute drivers are not supported yet; configured drivers: {}",

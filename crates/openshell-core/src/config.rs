@@ -47,6 +47,7 @@ pub enum ComputeDriverKind {
     Vm,
     Docker,
     Podman,
+    AppleContainer,
 }
 
 impl ComputeDriverKind {
@@ -57,6 +58,7 @@ impl ComputeDriverKind {
             Self::Vm => "vm",
             Self::Docker => "docker",
             Self::Podman => "podman",
+            Self::AppleContainer => "apple-container",
         }
     }
 }
@@ -76,8 +78,9 @@ impl FromStr for ComputeDriverKind {
             "vm" => Ok(Self::Vm),
             "docker" => Ok(Self::Docker),
             "podman" => Ok(Self::Podman),
+            "apple-container" | "apple_container" => Ok(Self::AppleContainer),
             other => Err(format!(
-                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman"
+                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman, apple-container"
             )),
         }
     }
@@ -104,6 +107,12 @@ pub fn detect_driver() -> Option<ComputeDriverKind> {
     // Docker: check if the CLI is available or a local Docker socket exists.
     if is_docker_available() {
         return Some(ComputeDriverKind::Docker);
+    }
+
+    // Apple Container: check if the `container` CLI is available (macOS only).
+    #[cfg(target_os = "macos")]
+    if is_binary_available("container") {
+        return Some(ComputeDriverKind::AppleContainer);
     }
 
     None
