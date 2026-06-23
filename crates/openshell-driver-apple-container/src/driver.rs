@@ -477,6 +477,20 @@ impl AppleContainerComputeDriver {
     }
 
     fn build_supervisor_command(&self, sandbox: &DriverSandbox) -> Vec<String> {
+        // When no supervisor binary is configured (not mounted in), run
+        // `sleep infinity` to keep the VM alive. The gateway will see the
+        // container as "running" but the supervisor won't connect, so the
+        // sandbox stays in Provisioning until a real supervisor is provided.
+        if self.config.supervisor_bin.is_none() {
+            warn!(
+                sandbox_id = %sandbox.id,
+                "No supervisor_bin configured — sandbox will run without supervisor. \
+                 Set supervisor_bin in [openshell.drivers.apple-container] to mount \
+                 a Linux arm64 openshell-sandbox binary."
+            );
+            return vec!["sleep".to_string(), "infinity".to_string()];
+        }
+
         let mut cmd = vec![SUPERVISOR_IMAGE_BINARY_PATH.to_string()];
 
         let grpc_endpoint = self.effective_grpc_endpoint();

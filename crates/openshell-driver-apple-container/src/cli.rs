@@ -253,7 +253,7 @@ impl ContainerCli {
 
     /// Pull an image from a registry.
     pub async fn pull(&self, image: &str) -> Result<(), ContainerCliError> {
-        self.run(&["pull", image]).await?;
+        self.run(&["image", "pull", image]).await?;
         Ok(())
     }
 
