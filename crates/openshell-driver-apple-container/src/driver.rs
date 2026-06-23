@@ -10,7 +10,6 @@
 use crate::cli::{ContainerCli, ContainerCliError, ContainerEntry};
 use crate::config::AppleContainerComputeConfig;
 use crate::watcher::{self, WatchStream};
-use openshell_core::ComputeDriverError;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE, SUPERVISOR_IMAGE_BINARY_PATH,
@@ -18,6 +17,7 @@ use openshell_core::driver_utils::{
 use openshell_core::proto::compute::v1::{
     DriverCondition, DriverSandbox, DriverSandboxStatus, GetCapabilitiesResponse,
 };
+use openshell_core::{ComputeDriverError, sandbox_env};
 use std::path::PathBuf;
 use tracing::{info, warn};
 
@@ -444,8 +444,6 @@ impl AppleContainerComputeDriver {
         // ── Supervisor environment variables ────────────────────────────
         // Use the canonical names from openshell_core::sandbox_env so the
         // supervisor discovers gateway connectivity, identity, and paths.
-        use openshell_core::sandbox_env;
-
         let log_level =
             openshell_core::driver_utils::sandbox_log_level(sandbox, &self.config.log_level);
         args.extend([
@@ -598,7 +596,7 @@ impl AppleContainerComputeDriver {
 
 // ── Conversion helpers ──────────────────────────────────────────────────────
 
-/// Check if a container entry is managed by OpenShell.
+/// Check if a container entry is managed by `OpenShell`.
 fn is_managed_entry(entry: &ContainerEntry) -> bool {
     entry
         .configuration
@@ -610,9 +608,9 @@ fn is_managed_entry(entry: &ContainerEntry) -> bool {
 /// Convert an Apple Container entry (from list or inspect) into a `DriverSandbox`.
 pub fn driver_sandbox_from_entry(entry: &ContainerEntry) -> Option<DriverSandbox> {
     let labels = &entry.configuration.labels;
-    if !labels
+    if labels
         .get(LABEL_MANAGED_BY)
-        .is_some_and(|v| v == LABEL_MANAGED_BY_VALUE)
+        .is_none_or(|v| v != LABEL_MANAGED_BY_VALUE)
     {
         return None;
     }
@@ -627,8 +625,7 @@ pub fn driver_sandbox_from_entry(entry: &ContainerEntry) -> Option<DriverSandbox
     let state = entry
         .status
         .as_ref()
-        .map(|s| s.state.as_str())
-        .unwrap_or("unknown");
+        .map_or("unknown", |s| s.state.as_str());
 
     let condition = condition_from_state(state);
 
@@ -701,11 +698,10 @@ mod tests {
         let managed = ContainerEntry {
             id: "test".to_string(),
             configuration: ContainerConfiguration {
-                labels: [(
+                labels: std::iter::once((
                     LABEL_MANAGED_BY.to_string(),
                     LABEL_MANAGED_BY_VALUE.to_string(),
-                )]
-                .into_iter()
+                ))
                 .collect(),
                 ..Default::default()
             },

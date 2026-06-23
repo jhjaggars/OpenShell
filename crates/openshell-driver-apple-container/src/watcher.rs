@@ -66,7 +66,7 @@ pub async fn start_watch(cli: ContainerCli) -> Result<WatchStream, ContainerCliE
                     for (id, sandbox) in &current {
                         let changed = previous
                             .get(id)
-                            .map_or(true, |prev| !sandbox_status_eq(prev, sandbox));
+                            .is_none_or(|prev| !sandbox_status_eq(prev, sandbox));
                         if changed
                             && tx
                                 .send(Ok(WatchSandboxesEvent {

@@ -254,7 +254,7 @@ impl ContainerCli {
     // ── internal helpers ────────────────────────────────────────────────
 
     async fn run(&self, args: &[&str]) -> Result<String, ContainerCliError> {
-        let string_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let string_args: Vec<String> = args.iter().map(ToString::to_string).collect();
         self.run_args(&string_args).await
     }
 
