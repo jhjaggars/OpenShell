@@ -250,7 +250,7 @@ impl AppleContainerComputeDriver {
         let run_args = self.build_run_args(sandbox, token_host_path.as_deref());
 
         // Build the entrypoint command for the supervisor.
-        let command = self.build_supervisor_command(sandbox);
+        let command = self.build_supervisor_command();
 
         // Run the container in detached mode.
         match self
@@ -436,29 +436,58 @@ impl AppleContainerComputeDriver {
             args.extend(["--memory".to_string(), memory.clone()]);
         }
 
-        // Environment variables.
+        // The supervisor needs CAP_NET_ADMIN and CAP_SYS_ADMIN for
+        // network namespace creation and iptables-based policy enforcement.
+        args.extend(["--cap-add".to_string(), "NET_ADMIN".to_string()]);
+        args.extend(["--cap-add".to_string(), "SYS_ADMIN".to_string()]);
+
+        // ── Supervisor environment variables ────────────────────────────
+        // Use the canonical names from openshell_core::sandbox_env so the
+        // supervisor discovers gateway connectivity, identity, and paths.
+        use openshell_core::sandbox_env;
+
         let log_level =
             openshell_core::driver_utils::sandbox_log_level(sandbox, &self.config.log_level);
         args.extend([
             "-e".to_string(),
-            format!("OPENSHELL_LOG_LEVEL={log_level}"),
+            format!("{}={log_level}", sandbox_env::LOG_LEVEL),
         ]);
 
         let grpc_endpoint = self.effective_grpc_endpoint();
         args.extend([
             "-e".to_string(),
-            format!("OPENSHELL_GRPC_ENDPOINT={grpc_endpoint}"),
+            format!("{}={grpc_endpoint}", sandbox_env::ENDPOINT),
         ]);
         args.extend([
             "-e".to_string(),
-            format!("OPENSHELL_SANDBOX_ID={}", sandbox.id),
+            format!("{}={}", sandbox_env::SANDBOX_ID, sandbox.id),
         ]);
         args.extend([
             "-e".to_string(),
-            format!("OPENSHELL_SANDBOX_NAME={}", sandbox.name),
+            format!("{}={}", sandbox_env::SANDBOX, sandbox.name),
+        ]);
+        // The supervisor runs `sleep infinity` as the user-visible process
+        // while it manages SSH, policy, and the gateway relay.
+        args.extend([
+            "-e".to_string(),
+            format!("{}=sleep infinity", sandbox_env::SANDBOX_COMMAND),
+        ]);
+        // SSH socket path for the in-sandbox SSH daemon that the supervisor
+        // bridges via the ConnectSupervisor relay back to the gateway.
+        args.extend([
+            "-e".to_string(),
+            format!("{}=/run/openshell/ssh.sock", sandbox_env::SSH_SOCKET_PATH),
+        ]);
+        args.extend([
+            "-e".to_string(),
+            format!(
+                "{}={}",
+                sandbox_env::TELEMETRY_ENABLED,
+                openshell_core::telemetry::enabled_env_value()
+            ),
         ]);
 
-        // Template environment variables.
+        // Template / spec environment variables.
         if let Some(spec) = sandbox.spec.as_ref() {
             for (key, value) in &spec.environment {
                 args.extend(["-e".to_string(), format!("{key}={value}")]);
@@ -482,34 +511,48 @@ impl AppleContainerComputeDriver {
             ]);
         }
 
-        // Mount TLS certificates if configured.
-        if let Some(ref ca) = self.config.guest_tls_ca {
+        // Mount TLS certificates and tell the supervisor where to find them.
+        if self.config.tls_enabled() {
+            let ca_mount = "/etc/openshell/tls/client/ca.crt";
+            let cert_mount = "/etc/openshell/tls/client/tls.crt";
+            let key_mount = "/etc/openshell/tls/client/tls.key";
+
             args.extend([
                 "-v".to_string(),
-                format!("{}:/etc/openshell/tls/client/ca.crt", ca.display()),
+                format!("{}:{ca_mount}", self.config.guest_tls_ca.as_ref().unwrap().display()),
             ]);
-        }
-        if let Some(ref cert) = self.config.guest_tls_cert {
             args.extend([
                 "-v".to_string(),
-                format!("{}:/etc/openshell/tls/client/tls.crt", cert.display()),
+                format!("{}:{cert_mount}", self.config.guest_tls_cert.as_ref().unwrap().display()),
             ]);
-        }
-        if let Some(ref key) = self.config.guest_tls_key {
             args.extend([
                 "-v".to_string(),
-                format!("{}:/etc/openshell/tls/client/tls.key", key.display()),
+                format!("{}:{key_mount}", self.config.guest_tls_key.as_ref().unwrap().display()),
+            ]);
+            args.extend([
+                "-e".to_string(),
+                format!("{}={ca_mount}", sandbox_env::TLS_CA),
+            ]);
+            args.extend([
+                "-e".to_string(),
+                format!("{}={cert_mount}", sandbox_env::TLS_CERT),
+            ]);
+            args.extend([
+                "-e".to_string(),
+                format!("{}={key_mount}", sandbox_env::TLS_KEY),
             ]);
         }
 
-        // Mount sandbox token if available.
+        // Mount sandbox token and tell the supervisor where to find it.
         if let Some(token_path) = token_host_path {
+            let token_mount = "/etc/openshell/auth/sandbox.jwt";
             args.extend([
                 "-v".to_string(),
-                format!(
-                    "{}:/etc/openshell/auth/sandbox.jwt",
-                    token_path.display()
-                ),
+                format!("{}:{token_mount}", token_path.display()),
+            ]);
+            args.extend([
+                "-e".to_string(),
+                format!("{}={token_mount}", sandbox_env::SANDBOX_TOKEN_FILE),
             ]);
         }
 
@@ -518,23 +561,19 @@ impl AppleContainerComputeDriver {
 
     /// Build the supervisor entrypoint command.
     ///
+    /// The supervisor reads all configuration from environment variables
+    /// (set in `build_run_args`), so the command is just the binary path.
+    ///
     /// Callers must ensure `supervisor_bin` is set before calling this
     /// (enforced by `validate_sandbox_create` which `create_sandbox` calls).
-    fn build_supervisor_command(&self, sandbox: &DriverSandbox) -> Vec<String> {
+    fn build_supervisor_command(&self) -> Vec<String> {
         debug_assert!(
             self.config.supervisor_bin.is_some(),
             "build_supervisor_command called without supervisor_bin; \
              create_sandbox should call validate_sandbox_create first"
         );
 
-        let mut cmd = vec![SUPERVISOR_IMAGE_BINARY_PATH.to_string()];
-
-        let grpc_endpoint = self.effective_grpc_endpoint();
-        cmd.extend(["--grpc-endpoint".to_string(), grpc_endpoint]);
-        cmd.extend(["--sandbox-id".to_string(), sandbox.id.clone()]);
-        cmd.extend(["--sandbox-name".to_string(), sandbox.name.clone()]);
-
-        cmd
+        vec![SUPERVISOR_IMAGE_BINARY_PATH.to_string()]
     }
 
     fn effective_grpc_endpoint(&self) -> String {
