@@ -4,11 +4,11 @@
 //! Sandbox watch loop for the Apple Container driver.
 //!
 //! Apple's `container` CLI does not provide a streaming events API, so this
-//! module polls `container ls --all --format json` at a regular interval and
+//! module polls `container list --all --format json` at a regular interval and
 //! emits snapshot diffs as `WatchSandboxesEvent` messages.
 
 use crate::cli::{ContainerCli, ContainerCliError};
-use crate::driver::{driver_sandbox_from_inspect, driver_sandbox_from_list_entry};
+use crate::driver::driver_sandbox_from_entry;
 use openshell_core::driver_utils::{LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE};
 use openshell_core::proto::compute::v1::{
     DriverSandbox, WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesSandboxEvent,
@@ -61,8 +61,8 @@ pub async fn start_watch(cli: ContainerCli) -> Result<WatchStream, ContainerCliE
                         let changed = previous
                             .get(id)
                             .map_or(true, |prev| !sandbox_status_eq(prev, sandbox));
-                        if changed {
-                            if tx
+                        if changed
+                            && tx
                                 .send(Ok(WatchSandboxesEvent {
                                     payload: Some(watch_sandboxes_event::Payload::Sandbox(
                                         WatchSandboxesSandboxEvent {
@@ -72,16 +72,15 @@ pub async fn start_watch(cli: ContainerCli) -> Result<WatchStream, ContainerCliE
                                 }))
                                 .await
                                 .is_err()
-                            {
-                                return;
-                            }
+                        {
+                            return;
                         }
                     }
 
                     // Emit deletions for sandboxes that disappeared.
                     for id in previous.keys() {
-                        if !current.contains_key(id) {
-                            if tx
+                        if !current.contains_key(id)
+                            && tx
                                 .send(Ok(WatchSandboxesEvent {
                                     payload: Some(watch_sandboxes_event::Payload::Deleted(
                                         WatchSandboxesDeletedEvent {
@@ -91,9 +90,8 @@ pub async fn start_watch(cli: ContainerCli) -> Result<WatchStream, ContainerCliE
                                 }))
                                 .await
                                 .is_err()
-                            {
-                                return;
-                            }
+                        {
+                            return;
                         }
                     }
 
@@ -124,25 +122,15 @@ async fn poll_managed_sandboxes(
 
     for entry in &entries {
         let managed = entry
+            .configuration
             .labels
-            .as_ref()
-            .and_then(|l| l.get(LABEL_MANAGED_BY))
+            .get(LABEL_MANAGED_BY)
             .is_some_and(|v| v == LABEL_MANAGED_BY_VALUE);
         if !managed {
             continue;
         }
 
-        // For running containers, try to get full inspect data.
-        if entry.state == "running" {
-            if let Ok(inspect) = cli.inspect(&entry.id).await {
-                if let Some(sandbox) = driver_sandbox_from_inspect(&inspect) {
-                    result.insert(sandbox.id.clone(), sandbox);
-                    continue;
-                }
-            }
-        }
-
-        if let Some(sandbox) = driver_sandbox_from_list_entry(entry) {
+        if let Some(sandbox) = driver_sandbox_from_entry(entry) {
             result.insert(sandbox.id.clone(), sandbox);
         }
     }

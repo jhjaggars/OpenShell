@@ -7,7 +7,7 @@
 //! with Apple Silicon. Each sandbox runs as a lightweight Linux VM via the
 //! macOS Virtualization framework.
 
-use crate::cli::{ContainerCli, ContainerCliError, ContainerInspect, ContainerListEntry};
+use crate::cli::{ContainerCli, ContainerCliError, ContainerEntry};
 use crate::config::AppleContainerComputeConfig;
 use crate::watcher::{self, WatchStream};
 use openshell_core::driver_utils::{
@@ -32,9 +32,7 @@ fn container_name(sandbox_name: &str) -> String {
 impl From<ContainerCliError> for ComputeDriverError {
     fn from(err: ContainerCliError) -> Self {
         match err {
-            ContainerCliError::NotFound(msg) => {
-                Self::Message(format!("not found: {msg}"))
-            }
+            ContainerCliError::NotFound(msg) => Self::Message(format!("not found: {msg}")),
             ContainerCliError::AlreadyExists(_) => Self::AlreadyExists,
             other => Self::Message(other.to_string()),
         }
@@ -118,7 +116,6 @@ impl AppleContainerComputeDriver {
     pub async fn new(config: AppleContainerComputeConfig) -> Result<Self, ComputeDriverError> {
         let cli = ContainerCli::new(&config.container_bin);
 
-        // Verify the CLI is available and the daemon is reachable.
         match cli.verify().await {
             Ok(_) => {
                 info!(
@@ -204,13 +201,10 @@ impl AppleContainerComputeDriver {
         );
 
         // Ensure the image is available locally.
-        self.ensure_image(&image).await?;
+        self.ensure_image(image).await?;
 
         // Write sandbox token file if JWT auth is configured.
-        let token_host_path = match write_sandbox_token_file(sandbox).await {
-            Ok(path) => path,
-            Err(e) => return Err(e),
-        };
+        let token_host_path = write_sandbox_token_file(sandbox).await?;
 
         // Build container run arguments.
         let run_args = self.build_run_args(sandbox, token_host_path.as_deref());
@@ -219,7 +213,11 @@ impl AppleContainerComputeDriver {
         let command = self.build_supervisor_command(sandbox);
 
         // Run the container in detached mode.
-        match self.cli.run_detached(&image, &name, &run_args, &command).await {
+        match self
+            .cli
+            .run_detached(image, &name, &run_args, &command)
+            .await
+        {
             Ok(container_id) => {
                 info!(
                     sandbox_id = %sandbox.id,
@@ -289,7 +287,7 @@ impl AppleContainerComputeDriver {
     ) -> Result<Option<DriverSandbox>, ComputeDriverError> {
         let name = container_name(sandbox_name);
         match self.cli.inspect(&name).await {
-            Ok(inspect) => Ok(driver_sandbox_from_inspect(&inspect)),
+            Ok(entry) => Ok(driver_sandbox_from_entry(&entry)),
             Err(ContainerCliError::NotFound(_)) => Ok(None),
             Err(e) => Err(ComputeDriverError::from(e)),
         }
@@ -301,20 +299,10 @@ impl AppleContainerComputeDriver {
 
         let mut sandboxes = Vec::new();
         for entry in &entries {
-            if !is_managed_container(entry) {
+            if !is_managed_entry(entry) {
                 continue;
             }
-            // For running containers, inspect for full state.
-            if entry.state == "running" {
-                if let Ok(inspect) = self.cli.inspect(&entry.id).await {
-                    if let Some(sandbox) = driver_sandbox_from_inspect(&inspect) {
-                        sandboxes.push(sandbox);
-                        continue;
-                    }
-                }
-            }
-            // Fallback to list entry data.
-            if let Some(sandbox) = driver_sandbox_from_list_entry(entry) {
+            if let Some(sandbox) = driver_sandbox_from_entry(entry) {
                 sandboxes.push(sandbox);
             }
         }
@@ -369,10 +357,7 @@ impl AppleContainerComputeDriver {
 
     async fn pull_image(&self, image: &str) -> Result<(), ComputeDriverError> {
         info!(image = %image, "Pulling image");
-        self.cli
-            .pull(image)
-            .await
-            .map_err(ComputeDriverError::from)
+        self.cli.pull(image).await.map_err(ComputeDriverError::from)
     }
 
     fn build_run_args(
@@ -412,10 +397,8 @@ impl AppleContainerComputeDriver {
         }
 
         // Environment variables.
-        let log_level = openshell_core::driver_utils::sandbox_log_level(
-            sandbox,
-            &self.config.log_level,
-        );
+        let log_level =
+            openshell_core::driver_utils::sandbox_log_level(sandbox, &self.config.log_level);
         args.extend([
             "-e".to_string(),
             format!("OPENSHELL_LOG_LEVEL={log_level}"),
@@ -490,20 +473,14 @@ impl AppleContainerComputeDriver {
             ]);
         }
 
-        // Publish the SSH port (let the container pick a host port).
-        args.extend(["-p".to_string(), "2222".to_string()]);
-
         args
     }
 
     fn build_supervisor_command(&self, sandbox: &DriverSandbox) -> Vec<String> {
         let mut cmd = vec![SUPERVISOR_IMAGE_BINARY_PATH.to_string()];
 
-        // The supervisor needs the gRPC endpoint to connect back.
         let grpc_endpoint = self.effective_grpc_endpoint();
         cmd.extend(["--grpc-endpoint".to_string(), grpc_endpoint]);
-
-        // Pass sandbox identity.
         cmd.extend(["--sandbox-id".to_string(), sandbox.id.clone()]);
         cmd.extend(["--sandbox-name".to_string(), sandbox.name.clone()]);
 
@@ -514,38 +491,36 @@ impl AppleContainerComputeDriver {
         if !self.config.grpc_endpoint.is_empty() {
             return self.config.grpc_endpoint.clone();
         }
-        // Auto-detect: Apple containers can reach the host via
-        // the gateway IP on the vmnet bridge.
+        // Apple containers can reach the host at the vmnet gateway IP
+        // (typically 192.168.64.1).
         let scheme = if self.config.tls_enabled() {
             "https"
         } else {
             "http"
         };
         let port = self.config.gateway_port;
-        // The host is reachable from inside the VM — Apple's container
-        // networking bridges VMs to the host network via vmnet.
         format!("{scheme}://192.168.64.1:{port}")
     }
 }
 
 // ── Conversion helpers ──────────────────────────────────────────────────────
 
-/// Check if a container list entry is managed by OpenShell.
-fn is_managed_container(entry: &ContainerListEntry) -> bool {
+/// Check if a container entry is managed by OpenShell.
+fn is_managed_entry(entry: &ContainerEntry) -> bool {
     entry
+        .configuration
         .labels
-        .as_ref()
-        .and_then(|labels| labels.get(LABEL_MANAGED_BY))
+        .get(LABEL_MANAGED_BY)
         .is_some_and(|v| v == LABEL_MANAGED_BY_VALUE)
 }
 
-/// Convert a `container inspect` result into a `DriverSandbox`.
-pub fn driver_sandbox_from_inspect(inspect: &ContainerInspect) -> Option<DriverSandbox> {
-    let labels = &inspect.config.labels;
-    let managed = labels
+/// Convert an Apple Container entry (from list or inspect) into a `DriverSandbox`.
+pub fn driver_sandbox_from_entry(entry: &ContainerEntry) -> Option<DriverSandbox> {
+    let labels = &entry.configuration.labels;
+    if !labels
         .get(LABEL_MANAGED_BY)
-        .is_some_and(|v| v == LABEL_MANAGED_BY_VALUE);
-    if !managed {
+        .is_some_and(|v| v == LABEL_MANAGED_BY_VALUE)
+    {
         return None;
     }
 
@@ -556,7 +531,13 @@ pub fn driver_sandbox_from_inspect(inspect: &ContainerInspect) -> Option<DriverS
         .cloned()
         .unwrap_or_else(|| "default".to_string());
 
-    let (condition, _is_running) = condition_from_state(&inspect.state.status, inspect.state.running);
+    let state = entry
+        .status
+        .as_ref()
+        .map(|s| s.state.as_str())
+        .unwrap_or("unknown");
+
+    let condition = condition_from_state(state);
 
     Some(DriverSandbox {
         id: sandbox_id,
@@ -564,42 +545,7 @@ pub fn driver_sandbox_from_inspect(inspect: &ContainerInspect) -> Option<DriverS
         namespace,
         spec: None,
         status: Some(DriverSandboxStatus {
-            sandbox_name: inspect.name.clone(),
-            instance_id: inspect.id.clone(),
-            agent_fd: String::new(),
-            sandbox_fd: String::new(),
-            conditions: vec![condition],
-            deleting: false,
-        }),
-    })
-}
-
-/// Convert a `container ls` entry into a `DriverSandbox`.
-pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<DriverSandbox> {
-    let labels = entry.labels.as_ref()?;
-    let managed = labels
-        .get(LABEL_MANAGED_BY)
-        .is_some_and(|v| v == LABEL_MANAGED_BY_VALUE);
-    if !managed {
-        return None;
-    }
-
-    let sandbox_id = labels.get(LABEL_SANDBOX_ID)?.clone();
-    let sandbox_name = labels.get(LABEL_SANDBOX_NAME)?.clone();
-    let namespace = labels
-        .get(LABEL_SANDBOX_NAMESPACE)
-        .cloned()
-        .unwrap_or_else(|| "default".to_string());
-
-    let (condition, _) = condition_from_state(&entry.state, entry.state == "running");
-
-    Some(DriverSandbox {
-        id: sandbox_id,
-        name: sandbox_name,
-        namespace,
-        spec: None,
-        status: Some(DriverSandboxStatus {
-            sandbox_name: entry.name.clone(),
+            sandbox_name: entry.id.clone(),
             instance_id: entry.id.clone(),
             agent_fd: String::new(),
             sandbox_fd: String::new(),
@@ -609,59 +555,48 @@ pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<Driv
     })
 }
 
-/// Derive a `DriverCondition` from container state.
-fn condition_from_state(status: &str, running: bool) -> (DriverCondition, bool) {
-    let lower = status.to_ascii_lowercase();
-    if running || lower == "running" {
-        (
-            DriverCondition {
-                r#type: "Ready".to_string(),
-                status: "False".to_string(),
-                reason: "DependenciesNotReady".to_string(),
-                message: "Container is running, waiting for supervisor".to_string(),
-                last_transition_time: String::new(),
-            },
-            true,
-        )
+/// Derive a `DriverCondition` from Apple Container state string.
+fn condition_from_state(state: &str) -> DriverCondition {
+    let lower = state.to_ascii_lowercase();
+    if lower == "running" {
+        DriverCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: "DependenciesNotReady".to_string(),
+            message: "Container is running, waiting for supervisor".to_string(),
+            last_transition_time: String::new(),
+        }
     } else if lower == "created" || lower == "starting" {
-        (
-            DriverCondition {
-                r#type: "Ready".to_string(),
-                status: "False".to_string(),
-                reason: "Starting".to_string(),
-                message: format!("Container state: {status}"),
-                last_transition_time: String::new(),
-            },
-            false,
-        )
+        DriverCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: "Starting".to_string(),
+            message: format!("Container state: {state}"),
+            last_transition_time: String::new(),
+        }
     } else if lower == "exited" || lower == "stopped" || lower == "dead" {
-        (
-            DriverCondition {
-                r#type: "Ready".to_string(),
-                status: "False".to_string(),
-                reason: "ContainerExited".to_string(),
-                message: format!("Container state: {status}"),
-                last_transition_time: String::new(),
-            },
-            false,
-        )
+        DriverCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: "ContainerExited".to_string(),
+            message: format!("Container state: {state}"),
+            last_transition_time: String::new(),
+        }
     } else {
-        (
-            DriverCondition {
-                r#type: "Ready".to_string(),
-                status: "False".to_string(),
-                reason: "Unknown".to_string(),
-                message: format!("Container state: {status}"),
-                last_transition_time: String::new(),
-            },
-            false,
-        )
+        DriverCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: "Unknown".to_string(),
+            message: format!("Container state: {state}"),
+            last_transition_time: String::new(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::{ContainerConfiguration, ContainerStatus};
 
     #[test]
     fn container_name_prefix() {
@@ -669,41 +604,78 @@ mod tests {
     }
 
     #[test]
-    fn managed_container_detection() {
-        let managed = ContainerListEntry {
-            id: "abc".to_string(),
-            name: "test".to_string(),
-            image: "ubuntu".to_string(),
-            state: "running".to_string(),
-            labels: Some(
-                [(LABEL_MANAGED_BY.to_string(), LABEL_MANAGED_BY_VALUE.to_string())]
-                    .into_iter()
-                    .collect(),
-            ),
+    fn managed_entry_detection() {
+        let managed = ContainerEntry {
+            id: "test".to_string(),
+            configuration: ContainerConfiguration {
+                labels: [(
+                    LABEL_MANAGED_BY.to_string(),
+                    LABEL_MANAGED_BY_VALUE.to_string(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            status: None,
         };
-        assert!(is_managed_container(&managed));
+        assert!(is_managed_entry(&managed));
 
-        let unmanaged = ContainerListEntry {
-            id: "def".to_string(),
-            name: "other".to_string(),
-            image: "nginx".to_string(),
-            state: "running".to_string(),
-            labels: None,
+        let unmanaged = ContainerEntry {
+            id: "other".to_string(),
+            configuration: ContainerConfiguration::default(),
+            status: None,
         };
-        assert!(!is_managed_container(&unmanaged));
+        assert!(!is_managed_entry(&unmanaged));
     }
 
     #[test]
-    fn condition_from_running_state() {
-        let (cond, running) = condition_from_state("running", true);
-        assert!(running);
+    fn driver_sandbox_from_entry_extracts_labels() {
+        let entry = ContainerEntry {
+            id: "openshell-demo".to_string(),
+            configuration: ContainerConfiguration {
+                labels: [
+                    (
+                        LABEL_MANAGED_BY.to_string(),
+                        LABEL_MANAGED_BY_VALUE.to_string(),
+                    ),
+                    (LABEL_SANDBOX_ID.to_string(), "sb-123".to_string()),
+                    (LABEL_SANDBOX_NAME.to_string(), "demo".to_string()),
+                    (LABEL_SANDBOX_NAMESPACE.to_string(), "default".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            status: Some(ContainerStatus {
+                state: "running".to_string(),
+                ..Default::default()
+            }),
+        };
+
+        let sandbox = driver_sandbox_from_entry(&entry).unwrap();
+        assert_eq!(sandbox.id, "sb-123");
+        assert_eq!(sandbox.name, "demo");
+        assert_eq!(sandbox.namespace, "default");
+        let cond = &sandbox.status.unwrap().conditions[0];
         assert_eq!(cond.reason, "DependenciesNotReady");
     }
 
     #[test]
-    fn condition_from_exited_state() {
-        let (cond, running) = condition_from_state("exited", false);
-        assert!(!running);
+    fn condition_from_running() {
+        let cond = condition_from_state("running");
+        assert_eq!(cond.reason, "DependenciesNotReady");
+        assert_eq!(cond.status, "False");
+    }
+
+    #[test]
+    fn condition_from_stopped() {
+        let cond = condition_from_state("stopped");
         assert_eq!(cond.reason, "ContainerExited");
+    }
+
+    #[test]
+    fn condition_from_unknown() {
+        let cond = condition_from_state("weird");
+        assert_eq!(cond.reason, "Unknown");
     }
 }
