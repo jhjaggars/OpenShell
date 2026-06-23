@@ -283,9 +283,7 @@ impl ContainerCli {
             );
 
             if stderr.contains("already exists") || stderr.contains("already in use") {
-                return Err(ContainerCliError::AlreadyExists(
-                    stderr.trim().to_string(),
-                ));
+                return Err(ContainerCliError::AlreadyExists(stderr.trim().to_string()));
             }
 
             return Err(ContainerCliError::NonZero {
@@ -307,7 +305,10 @@ fn parse_container_entries(output: &str) -> Result<Vec<ContainerEntry>, Containe
         return Ok(Vec::new());
     }
     serde_json::from_str(trimmed).map_err(|e| {
-        ContainerCliError::Parse(format!("{e} (input starts with: {})", &trimmed[..trimmed.len().min(200)]))
+        ContainerCliError::Parse(format!(
+            "{e} (input starts with: {})",
+            &trimmed[..trimmed.len().min(200)]
+        ))
     })
 }
 
@@ -354,13 +355,13 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, "test-sandbox");
         assert_eq!(
-            entries[0].configuration.labels.get("openshell.ai/sandbox-id"),
+            entries[0]
+                .configuration
+                .labels
+                .get("openshell.ai/sandbox-id"),
             Some(&"sb-123".to_string())
         );
-        assert_eq!(
-            entries[0].status.as_ref().unwrap().state,
-            "running"
-        );
+        assert_eq!(entries[0].status.as_ref().unwrap().state, "running");
     }
 
     #[test]

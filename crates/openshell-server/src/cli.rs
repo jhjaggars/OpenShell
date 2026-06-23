@@ -636,7 +636,12 @@ fn resolve_mtls_auth_enabled(
 
     matches!(
         effective_single_driver(args),
-        Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman | ComputeDriverKind::Vm | ComputeDriverKind::AppleContainer)
+        Some(
+            ComputeDriverKind::Docker
+                | ComputeDriverKind::Podman
+                | ComputeDriverKind::Vm
+                | ComputeDriverKind::AppleContainer
+        )
     )
 }
 

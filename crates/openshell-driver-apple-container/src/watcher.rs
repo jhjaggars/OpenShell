@@ -158,9 +158,7 @@ fn sandbox_status_eq(a: &DriverSandbox, b: &DriverSandbox) -> bool {
                     .iter()
                     .zip(b_s.conditions.iter())
                     .all(|(ac, bc)| {
-                        ac.r#type == bc.r#type
-                            && ac.status == bc.status
-                            && ac.reason == bc.reason
+                        ac.r#type == bc.r#type && ac.status == bc.status && ac.reason == bc.reason
                     })
         }
         (None, None) => true,

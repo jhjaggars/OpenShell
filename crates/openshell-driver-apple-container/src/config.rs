@@ -115,9 +115,7 @@ impl AppleContainerComputeConfig {
     /// Whether TLS client certs are fully configured for guest mTLS.
     #[must_use]
     pub fn tls_enabled(&self) -> bool {
-        self.guest_tls_ca.is_some()
-            && self.guest_tls_cert.is_some()
-            && self.guest_tls_key.is_some()
+        self.guest_tls_ca.is_some() && self.guest_tls_cert.is_some() && self.guest_tls_key.is_some()
     }
 }
 

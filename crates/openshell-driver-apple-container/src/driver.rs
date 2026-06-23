@@ -10,6 +10,7 @@
 use crate::cli::{ContainerCli, ContainerCliError, ContainerEntry};
 use crate::config::AppleContainerComputeConfig;
 use crate::watcher::{self, WatchStream};
+use openshell_core::ComputeDriverError;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE, SUPERVISOR_IMAGE_BINARY_PATH,
@@ -17,7 +18,6 @@ use openshell_core::driver_utils::{
 use openshell_core::proto::compute::v1::{
     DriverCondition, DriverSandbox, DriverSandboxStatus, GetCapabilitiesResponse,
 };
-use openshell_core::ComputeDriverError;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
@@ -530,18 +530,9 @@ impl AppleContainerComputeDriver {
             let cert_mount = "/etc/openshell/tls/client/tls.crt";
             let key_mount = "/etc/openshell/tls/client/tls.key";
 
-            args.extend([
-                "-v".to_string(),
-                format!("{}:{ca_mount}", ca.display()),
-            ]);
-            args.extend([
-                "-v".to_string(),
-                format!("{}:{cert_mount}", cert.display()),
-            ]);
-            args.extend([
-                "-v".to_string(),
-                format!("{}:{key_mount}", key.display()),
-            ]);
+            args.extend(["-v".to_string(), format!("{}:{ca_mount}", ca.display())]);
+            args.extend(["-v".to_string(), format!("{}:{cert_mount}", cert.display())]);
+            args.extend(["-v".to_string(), format!("{}:{key_mount}", key.display())]);
             args.extend([
                 "-e".to_string(),
                 format!("{}={ca_mount}", sandbox_env::TLS_CA),
@@ -803,7 +794,10 @@ mod tests {
         assert!(!is_valid_env_key("0BAD"));
 
         // Disallowed characters
-        assert!(!is_valid_env_key("KEY=VALUE"), "= is not alphanumeric or underscore");
+        assert!(
+            !is_valid_env_key("KEY=VALUE"),
+            "= is not alphanumeric or underscore"
+        );
         assert!(!is_valid_env_key("KEY WITH SPACES"));
         assert!(!is_valid_env_key("KEY\nINJECT"));
     }
