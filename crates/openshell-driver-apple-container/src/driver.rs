@@ -683,6 +683,39 @@ fn condition_from_state(state: &str) -> DriverCondition {
     }
 }
 
+/// Build a test config with required fields populated.
+#[cfg(test)]
+fn test_config() -> AppleContainerComputeConfig {
+    AppleContainerComputeConfig {
+        default_image: "test-image:latest".to_string(),
+        grpc_endpoint: "http://192.168.64.1:17670".to_string(),
+        supervisor_bin: Some(std::path::PathBuf::from("/opt/openshell-sandbox")),
+        ..AppleContainerComputeConfig::default()
+    }
+}
+
+/// Build a minimal `DriverSandbox` for testing.
+#[cfg(test)]
+fn test_sandbox(id: &str, name: &str) -> DriverSandbox {
+    use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+    DriverSandbox {
+        id: id.to_string(),
+        name: name.to_string(),
+        namespace: "default".to_string(),
+        spec: Some(DriverSandboxSpec {
+            log_level: "info".to_string(),
+            environment: Default::default(),
+            template: Some(DriverSandboxTemplate {
+                image: "ubuntu:latest".to_string(),
+                ..Default::default()
+            }),
+            gpu: false,
+            ..Default::default()
+        }),
+        status: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,5 +829,457 @@ mod tests {
         );
         assert!(!is_valid_env_key("KEY WITH SPACES"));
         assert!(!is_valid_env_key("KEY\nINJECT"));
+    }
+
+    // ── build_run_args tests ────────────────────────────────────────────
+
+    #[test]
+    fn run_args_include_required_labels() {
+        let config = test_config();
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config,
+        };
+        let sandbox = test_sandbox("sb-1", "demo");
+        let args = driver.build_run_args(&sandbox, None);
+
+        let find = |prefix: &str| {
+            args.windows(2)
+                .find(|pair| pair[0] == "-l" && pair[1].starts_with(prefix))
+                .map(|pair| pair[1].clone())
+        };
+        assert_eq!(
+            find(LABEL_MANAGED_BY),
+            Some(format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}"))
+        );
+        assert_eq!(
+            find(LABEL_SANDBOX_ID),
+            Some(format!("{LABEL_SANDBOX_ID}=sb-1"))
+        );
+        assert_eq!(
+            find(LABEL_SANDBOX_NAME),
+            Some(format!("{LABEL_SANDBOX_NAME}=demo"))
+        );
+    }
+
+    #[test]
+    fn run_args_include_capabilities() {
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config: test_config(),
+        };
+        let sandbox = test_sandbox("sb-1", "demo");
+        let args = driver.build_run_args(&sandbox, None);
+
+        let caps: Vec<&str> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--cap-add")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert!(caps.contains(&"NET_ADMIN"), "missing NET_ADMIN");
+        assert!(caps.contains(&"SYS_ADMIN"), "missing SYS_ADMIN");
+    }
+
+    #[test]
+    fn run_args_include_supervisor_env_vars() {
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config: test_config(),
+        };
+        let sandbox = test_sandbox("sb-1", "demo");
+        let args = driver.build_run_args(&sandbox, None);
+
+        // Use exact "KEY=" prefix matching to avoid SANDBOX matching SANDBOX_ID.
+        let env = |key: &str| {
+            let prefix = format!("{key}=");
+            args.windows(2)
+                .find(|pair| pair[0] == "-e" && pair[1].starts_with(&prefix))
+                .map(|pair| pair[1].clone())
+        };
+        assert_eq!(
+            env(sandbox_env::ENDPOINT),
+            Some(format!(
+                "{}=http://192.168.64.1:17670",
+                sandbox_env::ENDPOINT
+            ))
+        );
+        assert_eq!(
+            env(sandbox_env::SANDBOX_ID),
+            Some(format!("{}=sb-1", sandbox_env::SANDBOX_ID))
+        );
+        assert_eq!(
+            env(sandbox_env::SANDBOX),
+            Some(format!("{}=demo", sandbox_env::SANDBOX))
+        );
+        assert!(
+            env(sandbox_env::SANDBOX_COMMAND).is_some(),
+            "missing SANDBOX_COMMAND"
+        );
+        assert!(
+            env(sandbox_env::SSH_SOCKET_PATH).is_some(),
+            "missing SSH_SOCKET_PATH"
+        );
+    }
+
+    #[test]
+    fn run_args_mount_supervisor_binary() {
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config: test_config(),
+        };
+        let sandbox = test_sandbox("sb-1", "demo");
+        let args = driver.build_run_args(&sandbox, None);
+
+        let vol = args
+            .windows(2)
+            .find(|pair| pair[0] == "-v" && pair[1].contains(SUPERVISOR_IMAGE_BINARY_PATH))
+            .map(|pair| pair[1].clone());
+        assert_eq!(
+            vol,
+            Some(format!(
+                "/opt/openshell-sandbox:{SUPERVISOR_IMAGE_BINARY_PATH}"
+            ))
+        );
+    }
+
+    #[test]
+    fn run_args_apply_cpu_and_memory_limits() {
+        let mut config = test_config();
+        config.sandbox_cpus = Some(4);
+        config.sandbox_memory = Some("2G".to_string());
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config,
+        };
+        let sandbox = test_sandbox("sb-1", "demo");
+        let args = driver.build_run_args(&sandbox, None);
+
+        let cpu = args
+            .windows(2)
+            .find(|pair| pair[0] == "--cpus")
+            .map(|pair| pair[1].clone());
+        assert_eq!(cpu, Some("4".to_string()));
+
+        let mem = args
+            .windows(2)
+            .find(|pair| pair[0] == "--memory")
+            .map(|pair| pair[1].clone());
+        assert_eq!(mem, Some("2G".to_string()));
+    }
+
+    #[test]
+    fn run_args_omit_limits_when_not_configured() {
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config: test_config(),
+        };
+        let sandbox = test_sandbox("sb-1", "demo");
+        let args = driver.build_run_args(&sandbox, None);
+
+        assert!(
+            !args.contains(&"--cpus".to_string()),
+            "--cpus should be absent"
+        );
+        assert!(
+            !args.contains(&"--memory".to_string()),
+            "--memory should be absent"
+        );
+    }
+
+    #[test]
+    fn run_args_include_tls_mounts_when_configured() {
+        let mut config = test_config();
+        config.guest_tls_ca = Some("/tls/ca.crt".into());
+        config.guest_tls_cert = Some("/tls/tls.crt".into());
+        config.guest_tls_key = Some("/tls/tls.key".into());
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config,
+        };
+        let sandbox = test_sandbox("sb-1", "demo");
+        let args = driver.build_run_args(&sandbox, None);
+
+        let vols: Vec<&str> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-v" && pair[1].contains("/etc/openshell/tls/"))
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(vols.len(), 3, "should mount ca, cert, and key");
+
+        let env = |key: &str| {
+            args.windows(2)
+                .any(|pair| pair[0] == "-e" && pair[1].starts_with(key))
+        };
+        assert!(env(sandbox_env::TLS_CA), "missing TLS_CA env");
+        assert!(env(sandbox_env::TLS_CERT), "missing TLS_CERT env");
+        assert!(env(sandbox_env::TLS_KEY), "missing TLS_KEY env");
+    }
+
+    #[test]
+    fn run_args_omit_tls_when_not_configured() {
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config: test_config(),
+        };
+        let sandbox = test_sandbox("sb-1", "demo");
+        let args = driver.build_run_args(&sandbox, None);
+
+        let tls_vols = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-v" && pair[1].contains("/etc/openshell/tls/"))
+            .count();
+        assert_eq!(tls_vols, 0, "no TLS mounts without config");
+    }
+
+    #[test]
+    fn run_args_include_token_mount() {
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config: test_config(),
+        };
+        let sandbox = test_sandbox("sb-1", "demo");
+        let token_path = std::path::Path::new("/tmp/sandbox.jwt");
+        let args = driver.build_run_args(&sandbox, Some(token_path));
+
+        let vol = args
+            .windows(2)
+            .find(|pair| pair[0] == "-v" && pair[1].contains("sandbox.jwt"));
+        assert!(vol.is_some(), "should mount token file");
+
+        let env = args
+            .windows(2)
+            .any(|pair| pair[0] == "-e" && pair[1].starts_with(sandbox_env::SANDBOX_TOKEN_FILE));
+        assert!(env, "should set SANDBOX_TOKEN_FILE env");
+    }
+
+    #[test]
+    fn run_args_omit_token_when_not_provided() {
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config: test_config(),
+        };
+        let sandbox = test_sandbox("sb-1", "demo");
+        let args = driver.build_run_args(&sandbox, None);
+
+        let has_token = args
+            .windows(2)
+            .any(|pair| pair[0] == "-e" && pair[1].starts_with(sandbox_env::SANDBOX_TOKEN_FILE));
+        assert!(!has_token, "should not set token env without path");
+    }
+
+    #[test]
+    fn run_args_filter_invalid_env_keys() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config: test_config(),
+        };
+        let sandbox = DriverSandbox {
+            id: "sb-1".to_string(),
+            name: "demo".to_string(),
+            namespace: "default".to_string(),
+            spec: Some(DriverSandboxSpec {
+                environment: [
+                    ("VALID_KEY".to_string(), "good".to_string()),
+                    ("--privileged".to_string(), "injected".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                template: Some(DriverSandboxTemplate {
+                    image: "test:latest".to_string(),
+                    environment: [("1BAD".to_string(), "nope".to_string())]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let args = driver.build_run_args(&sandbox, None);
+
+        let env_vals: Vec<&str> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-e")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert!(
+            env_vals.iter().any(|v| v.starts_with("VALID_KEY=")),
+            "valid key should pass"
+        );
+        assert!(
+            !env_vals.iter().any(|v| v.contains("privileged")),
+            "--privileged should be filtered"
+        );
+        assert!(
+            !env_vals.iter().any(|v| v.starts_with("1BAD=")),
+            "digit-leading key should be filtered"
+        );
+    }
+
+    // ── validate_sandbox_create tests ───────────────────────────────────
+
+    #[test]
+    fn validate_rejects_gpu_sandbox() {
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config: test_config(),
+        };
+        let mut sandbox = test_sandbox("sb-1", "demo");
+        sandbox.spec.as_mut().unwrap().gpu = true;
+
+        let err = driver.validate_sandbox_create(&sandbox).unwrap_err();
+        assert!(
+            matches!(err, ComputeDriverError::Precondition(_)),
+            "GPU should be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_supervisor_bin() {
+        let mut config = test_config();
+        config.supervisor_bin = None;
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config,
+        };
+        let sandbox = test_sandbox("sb-1", "demo");
+
+        let err = driver.validate_sandbox_create(&sandbox).unwrap_err();
+        assert!(
+            matches!(err, ComputeDriverError::Precondition(ref msg) if msg.contains("supervisor_bin")),
+            "missing supervisor_bin should be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_valid_sandbox() {
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config: test_config(),
+        };
+        let sandbox = test_sandbox("sb-1", "demo");
+        driver.validate_sandbox_create(&sandbox).unwrap();
+    }
+
+    // ── build_supervisor_command tests ──────────────────────────────────
+
+    #[test]
+    fn supervisor_command_is_binary_path_only() {
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config: test_config(),
+        };
+        let cmd = driver.build_supervisor_command();
+        assert_eq!(cmd, vec![SUPERVISOR_IMAGE_BINARY_PATH]);
+    }
+
+    // ── effective_grpc_endpoint tests ───────────────────────────────────
+
+    #[test]
+    fn explicit_grpc_endpoint_takes_precedence() {
+        let mut config = test_config();
+        config.grpc_endpoint = "https://custom:9090".to_string();
+        config.host_gateway_ip = "10.0.0.1".to_string();
+        config.gateway_port = 8080;
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config,
+        };
+        assert_eq!(driver.effective_grpc_endpoint(), "https://custom:9090");
+    }
+
+    #[test]
+    fn auto_detected_endpoint_uses_host_gateway_ip() {
+        let mut config = test_config();
+        config.grpc_endpoint = String::new();
+        config.host_gateway_ip = "10.0.0.1".to_string();
+        config.gateway_port = 8080;
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config,
+        };
+        assert_eq!(driver.effective_grpc_endpoint(), "http://10.0.0.1:8080");
+    }
+
+    #[test]
+    fn auto_detected_endpoint_uses_https_with_tls() {
+        let mut config = test_config();
+        config.grpc_endpoint = String::new();
+        config.host_gateway_ip = "192.168.64.1".to_string();
+        config.gateway_port = 17670;
+        config.guest_tls_ca = Some("/tls/ca.crt".into());
+        config.guest_tls_cert = Some("/tls/tls.crt".into());
+        config.guest_tls_key = Some("/tls/tls.key".into());
+        let driver = AppleContainerComputeDriver {
+            cli: ContainerCli::new("false"),
+            config,
+        };
+        assert_eq!(
+            driver.effective_grpc_endpoint(),
+            "https://192.168.64.1:17670"
+        );
+    }
+
+    // ── driver_sandbox_from_entry edge cases ────────────────────────────
+
+    #[test]
+    fn driver_sandbox_from_entry_returns_none_for_missing_labels() {
+        let entry = ContainerEntry {
+            id: "test".to_string(),
+            configuration: ContainerConfiguration {
+                labels: std::iter::once((
+                    LABEL_MANAGED_BY.to_string(),
+                    LABEL_MANAGED_BY_VALUE.to_string(),
+                ))
+                .collect(),
+                ..Default::default()
+            },
+            status: Some(ContainerStatus {
+                state: "running".to_string(),
+                ..Default::default()
+            }),
+        };
+        // Missing SANDBOX_ID and SANDBOX_NAME → should return None
+        assert!(driver_sandbox_from_entry(&entry).is_none());
+    }
+
+    #[test]
+    fn driver_sandbox_defaults_namespace_when_label_absent() {
+        let entry = ContainerEntry {
+            id: "test".to_string(),
+            configuration: ContainerConfiguration {
+                labels: [
+                    (
+                        LABEL_MANAGED_BY.to_string(),
+                        LABEL_MANAGED_BY_VALUE.to_string(),
+                    ),
+                    (LABEL_SANDBOX_ID.to_string(), "sb-1".to_string()),
+                    (LABEL_SANDBOX_NAME.to_string(), "demo".to_string()),
+                    // No LABEL_SANDBOX_NAMESPACE
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            status: None,
+        };
+        let sandbox = driver_sandbox_from_entry(&entry).unwrap();
+        assert_eq!(sandbox.namespace, "default");
+    }
+
+    // ── error mapping ──────────────────────────────────────────────────
+
+    #[test]
+    fn cli_not_found_maps_to_driver_message() {
+        let err: ComputeDriverError = ContainerCliError::NotFound("gone".into()).into();
+        assert!(matches!(err, ComputeDriverError::Message(_)));
+    }
+
+    #[test]
+    fn cli_already_exists_maps_to_already_exists() {
+        let err: ComputeDriverError = ContainerCliError::AlreadyExists("dup".into()).into();
+        assert!(matches!(err, ComputeDriverError::AlreadyExists));
     }
 }
