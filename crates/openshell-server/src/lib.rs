@@ -773,6 +773,7 @@ async fn build_compute_runtime(
         ComputeDriverKind::AppleContainer => {
             let mut apple_config = apple_container_config_from_file(file)?;
             apple_config.gateway_port = config.bind_address.port();
+            apply_apple_container_local_tls_defaults(config, &mut apple_config)?;
             ComputeRuntime::new_apple_container(
                 apple_config,
                 store,
@@ -858,15 +859,15 @@ fn apple_container_config_from_file(
     })
 }
 
-fn apply_podman_local_tls_defaults(
+/// Apply local TLS cert defaults to a driver config's `guest_tls_*` fields
+/// when TLS is enabled on the gateway and the driver hasn't set them explicitly.
+fn apply_local_tls_defaults(
     config: &Config,
-    podman: &mut openshell_driver_podman::PodmanComputeConfig,
+    ca: &mut Option<PathBuf>,
+    cert: &mut Option<PathBuf>,
+    key: &mut Option<PathBuf>,
 ) -> Result<()> {
-    if config.tls.is_none()
-        || podman.guest_tls_ca.is_some()
-        || podman.guest_tls_cert.is_some()
-        || podman.guest_tls_key.is_some()
-    {
+    if config.tls.is_none() || ca.is_some() || cert.is_some() || key.is_some() {
         return Ok(());
     }
 
@@ -875,10 +876,34 @@ fn apply_podman_local_tls_defaults(
     else {
         return Ok(());
     };
-    podman.guest_tls_ca = Some(paths.ca);
-    podman.guest_tls_cert = Some(paths.client_cert);
-    podman.guest_tls_key = Some(paths.client_key);
+    *ca = Some(paths.ca);
+    *cert = Some(paths.client_cert);
+    *key = Some(paths.client_key);
     Ok(())
+}
+
+fn apply_podman_local_tls_defaults(
+    config: &Config,
+    podman: &mut openshell_driver_podman::PodmanComputeConfig,
+) -> Result<()> {
+    apply_local_tls_defaults(
+        config,
+        &mut podman.guest_tls_ca,
+        &mut podman.guest_tls_cert,
+        &mut podman.guest_tls_key,
+    )
+}
+
+fn apply_apple_container_local_tls_defaults(
+    config: &Config,
+    apple: &mut openshell_driver_apple_container::AppleContainerComputeConfig,
+) -> Result<()> {
+    apply_local_tls_defaults(
+        config,
+        &mut apple.guest_tls_ca,
+        &mut apple.guest_tls_cert,
+        &mut apple.guest_tls_key,
+    )
 }
 
 fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {

@@ -252,12 +252,20 @@ fn build_env(
             );
         }
         for (k, v) in &s.environment {
-            env.insert(k.clone(), v.clone());
+            if openshell_core::sandbox_env::is_valid_env_key(k) {
+                env.insert(k.clone(), v.clone());
+            } else {
+                tracing::warn!(key = %k, "Dropping environment variable with invalid key");
+            }
         }
     }
     if let Some(t) = template {
         for (k, v) in &t.environment {
-            env.insert(k.clone(), v.clone());
+            if openshell_core::sandbox_env::is_valid_env_key(k) {
+                env.insert(k.clone(), v.clone());
+            } else {
+                tracing::warn!(key = %k, "Dropping environment variable with invalid key");
+            }
         }
     }
 

@@ -56,3 +56,15 @@ pub const SANDBOX_TOKEN_FILE: &str = "OPENSHELL_SANDBOX_TOKEN_FILE";
 /// writes and rotates this file; the supervisor exchanges its contents
 /// for a gateway JWT at startup and on refresh.
 pub const K8S_SA_TOKEN_FILE: &str = "OPENSHELL_K8S_SA_TOKEN_FILE";
+
+/// Validate that `key` is a valid POSIX environment variable name.
+///
+/// Keys must match `[A-Za-z_][A-Za-z0-9_]*`. This also rejects strings
+/// that could be misinterpreted as CLI flags (e.g. `--privileged`) when
+/// passed as `-e KEY=VALUE` arguments to container runtimes.
+#[must_use]
+pub fn is_valid_env_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}

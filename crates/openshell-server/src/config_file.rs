@@ -289,7 +289,7 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
         ComputeDriverKind::AppleContainer => &[
             "sandbox_namespace",
             "default_image",
-            "supervisor_image",
+            "supervisor_bin",
             "host_gateway_ip",
             "guest_tls_ca",
             "guest_tls_cert",

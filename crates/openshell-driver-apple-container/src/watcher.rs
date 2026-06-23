@@ -34,7 +34,13 @@ pub async fn start_watch(cli: ContainerCli) -> Result<WatchStream, ContainerCliE
     let (tx, rx) = mpsc::channel(WATCH_BUFFER);
 
     // Seed with current state.
-    let initial = poll_managed_sandboxes(&cli).await.unwrap_or_default();
+    let initial = match poll_managed_sandboxes(&cli).await {
+        Ok(sandboxes) => sandboxes,
+        Err(err) => {
+            warn!(error = %err, "Failed to seed initial sandbox state");
+            HashMap::new()
+        }
+    };
     for sandbox in initial.values() {
         let _ = tx
             .send(Ok(WatchSandboxesEvent {

@@ -488,13 +488,22 @@ impl AppleContainerComputeDriver {
         ]);
 
         // Template / spec environment variables.
+        // Validate keys to prevent CLI flag injection via crafted env names.
         if let Some(spec) = sandbox.spec.as_ref() {
             for (key, value) in &spec.environment {
-                args.extend(["-e".to_string(), format!("{key}={value}")]);
+                if sandbox_env::is_valid_env_key(key) {
+                    args.extend(["-e".to_string(), format!("{key}={value}")]);
+                } else {
+                    warn!(key = %key, "Dropping environment variable with invalid key");
+                }
             }
             if let Some(template) = spec.template.as_ref() {
                 for (key, value) in &template.environment {
-                    args.extend(["-e".to_string(), format!("{key}={value}")]);
+                    if sandbox_env::is_valid_env_key(key) {
+                        args.extend(["-e".to_string(), format!("{key}={value}")]);
+                    } else {
+                        warn!(key = %key, "Dropping environment variable with invalid key");
+                    }
                 }
             }
         }
@@ -512,22 +521,26 @@ impl AppleContainerComputeDriver {
         }
 
         // Mount TLS certificates and tell the supervisor where to find them.
-        if self.config.tls_enabled() {
+        if let (Some(ca), Some(cert), Some(key)) = (
+            self.config.guest_tls_ca.as_ref(),
+            self.config.guest_tls_cert.as_ref(),
+            self.config.guest_tls_key.as_ref(),
+        ) {
             let ca_mount = "/etc/openshell/tls/client/ca.crt";
             let cert_mount = "/etc/openshell/tls/client/tls.crt";
             let key_mount = "/etc/openshell/tls/client/tls.key";
 
             args.extend([
                 "-v".to_string(),
-                format!("{}:{ca_mount}", self.config.guest_tls_ca.as_ref().unwrap().display()),
+                format!("{}:{ca_mount}", ca.display()),
             ]);
             args.extend([
                 "-v".to_string(),
-                format!("{}:{cert_mount}", self.config.guest_tls_cert.as_ref().unwrap().display()),
+                format!("{}:{cert_mount}", cert.display()),
             ]);
             args.extend([
                 "-v".to_string(),
-                format!("{}:{key_mount}", self.config.guest_tls_key.as_ref().unwrap().display()),
+                format!("{}:{key_mount}", key.display()),
             ]);
             args.extend([
                 "-e".to_string(),
@@ -766,5 +779,32 @@ mod tests {
     fn condition_from_unknown() {
         let cond = condition_from_state("weird");
         assert_eq!(cond.reason, "Unknown");
+    }
+
+    #[test]
+    fn env_key_validation_uses_shared_function() {
+        use openshell_core::sandbox_env::is_valid_env_key;
+
+        // Valid POSIX keys
+        assert!(is_valid_env_key("OPENSHELL_LOG_LEVEL"));
+        assert!(is_valid_env_key("PATH"));
+        assert!(is_valid_env_key("_INTERNAL"));
+        assert!(is_valid_env_key("A1"));
+
+        // Empty
+        assert!(!is_valid_env_key(""));
+
+        // CLI flag injection
+        assert!(!is_valid_env_key("--privileged"));
+        assert!(!is_valid_env_key("-e"));
+
+        // Digit-leading (invalid per POSIX)
+        assert!(!is_valid_env_key("1PASSWORD_TOKEN"));
+        assert!(!is_valid_env_key("0BAD"));
+
+        // Disallowed characters
+        assert!(!is_valid_env_key("KEY=VALUE"), "= is not alphanumeric or underscore");
+        assert!(!is_valid_env_key("KEY WITH SPACES"));
+        assert!(!is_valid_env_key("KEY\nINJECT"));
     }
 }

@@ -240,17 +240,6 @@ impl ContainerCli {
             .ok_or_else(|| ContainerCliError::NotFound(container_id.to_string()))
     }
 
-    /// Execute a command inside a running container.
-    pub async fn exec(
-        &self,
-        container_id: &str,
-        command: &[&str],
-    ) -> Result<String, ContainerCliError> {
-        let mut args = vec!["exec", container_id];
-        args.extend(command);
-        self.run(&args).await
-    }
-
     /// Pull an image from a registry.
     pub async fn pull(&self, image: &str) -> Result<(), ContainerCliError> {
         self.run(&["image", "pull", image]).await?;

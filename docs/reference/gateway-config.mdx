@@ -279,7 +279,7 @@ guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
 
 ### Apple Container (macOS)
 
-Each sandbox runs as a lightweight Linux VM on macOS with Apple Silicon via Apple's [`container`](https://github.com/apple/container) CLI and the macOS Virtualization framework. Requires macOS 26 and the `container` system service running (`container system start`).
+Each sandbox runs as a lightweight Linux VM on macOS with Apple Silicon via Apple's [`container`](https://github.com/apple/container) CLI and the macOS Virtualization framework. Requires macOS 26 (Tahoe) or later and the `container` system service running (`container system start`).
 
 ```toml
 [openshell]

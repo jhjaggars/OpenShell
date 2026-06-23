@@ -602,14 +602,7 @@ fn active_provider_credential_keys(provider: &Provider, now_ms: i64) -> Vec<Stri
 }
 
 pub(super) fn is_valid_env_key(key: &str) -> bool {
-    let mut bytes = key.bytes();
-    let Some(first) = bytes.next() else {
-        return false;
-    };
-    if !(first == b'_' || first.is_ascii_alphabetic()) {
-        return false;
-    }
-    bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+    openshell_core::sandbox_env::is_valid_env_key(key)
 }
 
 // ---------------------------------------------------------------------------

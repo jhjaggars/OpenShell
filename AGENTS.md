@@ -42,6 +42,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-driver-kubernetes/` | Kubernetes compute driver | In-process `ComputeDriver` backend for K8s sandbox pods |
 | `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
+| `crates/openshell-driver-apple-container/` | Apple Container compute driver | In-process `ComputeDriver` backend for macOS Apple Silicon via Apple's `container` CLI (each sandbox is a lightweight Linux VM) |
 | `python/openshell/` | Python SDK | Python bindings and CLI packaging |
 | `proto/` | Protobuf definitions | gRPC service contracts |
 | `deploy/` | Docker, Helm, K8s | Dockerfiles, Helm chart, manifests |

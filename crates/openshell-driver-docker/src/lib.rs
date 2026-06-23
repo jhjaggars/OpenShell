@@ -1662,9 +1662,21 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
 
     if let Some(spec) = sandbox.spec.as_ref() {
         if let Some(template) = spec.template.as_ref() {
-            environment.extend(template.environment.clone());
+            for (k, v) in &template.environment {
+                if openshell_core::sandbox_env::is_valid_env_key(k) {
+                    environment.insert(k.clone(), v.clone());
+                } else {
+                    warn!(key = %k, "Dropping environment variable with invalid key");
+                }
+            }
         }
-        environment.extend(spec.environment.clone());
+        for (k, v) in &spec.environment {
+            if openshell_core::sandbox_env::is_valid_env_key(k) {
+                environment.insert(k.clone(), v.clone());
+            } else {
+                warn!(key = %k, "Dropping environment variable with invalid key");
+            }
+        }
     }
 
     environment.insert(
