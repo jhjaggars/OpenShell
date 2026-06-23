@@ -6,6 +6,12 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Default vmnet gateway address used by Apple's `container` runtime.
+///
+/// Sandbox VMs reach the macOS host at this IP on the default vmnet bridge.
+/// Override with `host_gateway_ip` when using custom vmnet configurations.
+pub const DEFAULT_HOST_GATEWAY_IP: &str = "192.168.64.1";
+
 /// Gateway-local configuration for the Apple Container compute driver.
 ///
 /// Corresponds to `[openshell.drivers.apple-container]` in the gateway TOML.
@@ -25,19 +31,34 @@ pub struct AppleContainerComputeConfig {
 
     /// Gateway gRPC endpoint the sandbox connects back to.
     ///
-    /// When empty, the driver auto-detects using the container's gateway IP
-    /// and the configured port.
+    /// When empty, the driver auto-detects using `host_gateway_ip` and the
+    /// gateway port.
     pub grpc_endpoint: String,
 
     /// Gateway listen port used to construct the auto-detected gRPC endpoint.
+    ///
+    /// Populated automatically from the gateway's bind address when the driver
+    /// is initialised by the server. Must be non-zero for the auto-detected
+    /// endpoint to be valid.
     pub gateway_port: u16,
 
-    /// Optional override for the `openshell-sandbox` supervisor binary
-    /// mounted into containers.
+    /// Host IP address reachable from inside sandbox VMs.
+    ///
+    /// Apple's `container` runtime bridges each VM to the host via vmnet.
+    /// The default gateway address is `192.168.64.1`. Override this when
+    /// using a custom vmnet subnet or when the default does not apply.
+    pub host_gateway_ip: String,
+
+    /// Path to a Linux arm64 `openshell-sandbox` supervisor binary to mount
+    /// into sandbox containers.
+    ///
+    /// When set, the binary is bind-mounted at `/openshell-sandbox` and
+    /// launched as the container entrypoint. When unset, sandbox creation
+    /// is rejected with a clear error.
     pub supervisor_bin: Option<PathBuf>,
 
     /// Supervisor image containing the Linux `openshell-sandbox` binary.
-    /// Mounted into sandbox containers using `--volume` or `--mount`.
+    /// Reserved for future image-based supervisor extraction.
     pub supervisor_image: String,
 
     /// Host-side CA certificate for sandbox mTLS.
@@ -75,6 +96,7 @@ impl Default for AppleContainerComputeConfig {
             sandbox_namespace: "default".to_string(),
             grpc_endpoint: String::new(),
             gateway_port: 0,
+            host_gateway_ip: DEFAULT_HOST_GATEWAY_IP.to_string(),
             supervisor_bin: None,
             supervisor_image: default_supervisor_image(),
             guest_tls_ca: None,

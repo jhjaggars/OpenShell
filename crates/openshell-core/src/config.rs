@@ -88,8 +88,8 @@ impl FromStr for ComputeDriverKind {
 
 /// Auto-detect the appropriate compute driver based on the runtime environment.
 ///
-/// Priority order: Kubernetes → Podman → Docker.
-/// VM is never auto-detected (requires explicit `--drivers vm`).
+/// Priority order: Kubernetes → Podman → Docker → Apple Container (macOS only).
+/// VM is never auto-detected and requires explicit `--drivers vm`.
 ///
 /// Returns the first driver where the environment check passes.
 /// Returns `None` if no compatible driver is found.

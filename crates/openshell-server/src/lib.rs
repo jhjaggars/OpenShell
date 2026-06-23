@@ -771,7 +771,8 @@ async fn build_compute_runtime(
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
         ComputeDriverKind::AppleContainer => {
-            let apple_config = apple_container_config_from_file(file)?;
+            let mut apple_config = apple_container_config_from_file(file)?;
+            apple_config.gateway_port = config.bind_address.port();
             ComputeRuntime::new_apple_container(
                 apple_config,
                 store,

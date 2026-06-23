@@ -290,6 +290,7 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
             "sandbox_namespace",
             "default_image",
             "supervisor_image",
+            "host_gateway_ip",
             "guest_tls_ca",
             "guest_tls_cert",
             "guest_tls_key",

@@ -139,6 +139,36 @@ impl AppleContainerComputeDriver {
             }
         }
 
+        // Validate the effective gRPC endpoint is resolvable. When no
+        // explicit grpc_endpoint is set, host_gateway_ip and gateway_port
+        // must both be usable.
+        if config.grpc_endpoint.is_empty() {
+            if config.host_gateway_ip.trim().is_empty() {
+                return Err(ComputeDriverError::Message(
+                    "host_gateway_ip must not be empty when grpc_endpoint is unset. \
+                     Set grpc_endpoint or host_gateway_ip in \
+                     [openshell.drivers.apple-container]."
+                        .to_string(),
+                ));
+            }
+            if config.gateway_port == 0 {
+                warn!(
+                    "gateway_port is 0 and grpc_endpoint is unset — the \
+                     auto-detected gRPC endpoint will use port 0. The server \
+                     normally injects the gateway port; if you are constructing \
+                     the driver manually, set grpc_endpoint explicitly."
+                );
+            }
+        }
+
+        if config.default_image.trim().is_empty() {
+            return Err(ComputeDriverError::Message(
+                "default_image must not be empty. Set default_image in \
+                 [openshell.drivers.apple-container]."
+                    .to_string(),
+            ));
+        }
+
         Ok(Self { cli, config })
     }
 
@@ -165,11 +195,21 @@ impl AppleContainerComputeDriver {
                     .to_string(),
             ));
         }
+        if self.config.supervisor_bin.is_none() {
+            return Err(ComputeDriverError::Precondition(
+                "supervisor_bin is required for the Apple Container driver. \
+                 Set supervisor_bin in [openshell.drivers.apple-container] \
+                 to the path of a Linux arm64 openshell-sandbox binary."
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 
     /// Create and start a sandbox container.
     pub async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), ComputeDriverError> {
+        self.validate_sandbox_create(sandbox)?;
+
         if sandbox.name.is_empty() {
             return Err(ComputeDriverError::Precondition(
                 "sandbox name is required".into(),
@@ -182,7 +222,7 @@ impl AppleContainerComputeDriver {
         }
 
         let name = container_name(&sandbox.name);
-        let image = self.resolve_image(sandbox);
+        let image = self.resolve_image(sandbox).to_string();
         if image.is_empty() {
             return Err(ComputeDriverError::Precondition(
                 "no sandbox image configured: set default_image in \
@@ -201,7 +241,7 @@ impl AppleContainerComputeDriver {
         );
 
         // Ensure the image is available locally.
-        self.ensure_image(image).await?;
+        self.ensure_image(&image).await?;
 
         // Write sandbox token file if JWT auth is configured.
         let token_host_path = write_sandbox_token_file(sandbox).await?;
@@ -215,7 +255,7 @@ impl AppleContainerComputeDriver {
         // Run the container in detached mode.
         match self
             .cli
-            .run_detached(image, &name, &run_args, &command)
+            .run_detached(&image, &name, &run_args, &command)
             .await
         {
             Ok(container_id) => {
@@ -476,20 +516,16 @@ impl AppleContainerComputeDriver {
         args
     }
 
+    /// Build the supervisor entrypoint command.
+    ///
+    /// Callers must ensure `supervisor_bin` is set before calling this
+    /// (enforced by `validate_sandbox_create` which `create_sandbox` calls).
     fn build_supervisor_command(&self, sandbox: &DriverSandbox) -> Vec<String> {
-        // When no supervisor binary is configured (not mounted in), run
-        // `sleep infinity` to keep the VM alive. The gateway will see the
-        // container as "running" but the supervisor won't connect, so the
-        // sandbox stays in Provisioning until a real supervisor is provided.
-        if self.config.supervisor_bin.is_none() {
-            warn!(
-                sandbox_id = %sandbox.id,
-                "No supervisor_bin configured — sandbox will run without supervisor. \
-                 Set supervisor_bin in [openshell.drivers.apple-container] to mount \
-                 a Linux arm64 openshell-sandbox binary."
-            );
-            return vec!["sleep".to_string(), "infinity".to_string()];
-        }
+        debug_assert!(
+            self.config.supervisor_bin.is_some(),
+            "build_supervisor_command called without supervisor_bin; \
+             create_sandbox should call validate_sandbox_create first"
+        );
 
         let mut cmd = vec![SUPERVISOR_IMAGE_BINARY_PATH.to_string()];
 
@@ -505,15 +541,15 @@ impl AppleContainerComputeDriver {
         if !self.config.grpc_endpoint.is_empty() {
             return self.config.grpc_endpoint.clone();
         }
-        // Apple containers can reach the host at the vmnet gateway IP
-        // (typically 192.168.64.1).
+        // Apple containers reach the macOS host at the vmnet gateway IP.
         let scheme = if self.config.tls_enabled() {
             "https"
         } else {
             "http"
         };
+        let host = &self.config.host_gateway_ip;
         let port = self.config.gateway_port;
-        format!("{scheme}://192.168.64.1:{port}")
+        format!("{scheme}://{host}:{port}")
     }
 }
 

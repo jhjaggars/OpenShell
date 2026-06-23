@@ -276,3 +276,41 @@ guest_tls_ca     = "/var/lib/openshell/guest-tls/ca.pem"
 guest_tls_cert   = "/var/lib/openshell/guest-tls/client.pem"
 guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
 ```
+
+### Apple Container (macOS)
+
+Each sandbox runs as a lightweight Linux VM on macOS with Apple Silicon via Apple's [`container`](https://github.com/apple/container) CLI and the macOS Virtualization framework. Requires macOS 26 and the `container` system service running (`container system start`).
+
+```toml
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address    = "0.0.0.0:17670"
+log_level       = "info"
+compute_drivers = ["apple-container"]
+
+[openshell.drivers.apple-container]
+default_image    = "ghcr.io/nvidia/openshell/sandbox:latest"
+image_pull_policy = ""            # "" (pull if absent) | always | never
+# Path to a Linux arm64 openshell-sandbox binary. Required.
+supervisor_bin   = "/usr/local/libexec/openshell/openshell-sandbox"
+# Reserved for future image-based supervisor extraction; not used yet.
+# supervisor_image = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Overwritten at runtime from bind_address; rarely needs to be set manually.
+# gateway_port   = 17670
+# Host IP reachable from inside sandbox VMs via the vmnet bridge.
+# Default is the standard vmnet gateway address. Override for custom subnets.
+host_gateway_ip  = "192.168.64.1"
+# Explicit gRPC endpoint. When set, overrides host_gateway_ip + gateway_port.
+# grpc_endpoint  = "http://192.168.64.1:17670"
+stop_timeout_secs = 10
+# container CLI binary path. Defaults to searching PATH.
+container_bin    = "container"
+guest_tls_ca     = "/etc/openshell/certs/ca.pem"
+guest_tls_cert   = "/etc/openshell/certs/client.pem"
+guest_tls_key    = "/etc/openshell/certs/client-key.pem"
+# Optional resource limits per sandbox VM.
+# sandbox_cpus   = 2
+# sandbox_memory = "2G"
+```
