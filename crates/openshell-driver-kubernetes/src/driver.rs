@@ -1722,24 +1722,32 @@ impl KubernetesComputeDriver {
         let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
         let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
 
-        create_companion_if_absent(&secrets, &companions.secret, "proxy-pod CA secret").await?;
-        create_companion_if_absent(&services, &companions.service, "proxy-pod service").await?;
+        // The CA Secret skips ownership verification: the gateway holds no
+        // Secret read permission, and the UUID-keyed name already implies the
+        // object is this sandbox's own.
+        create_companion_if_absent(&secrets, &companions.secret, "proxy-pod CA secret", false)
+            .await?;
+        create_companion_if_absent(&services, &companions.service, "proxy-pod service", true)
+            .await?;
         create_companion_if_absent(
             &policies,
             &companions.agent_egress,
             "proxy-pod agent egress NetworkPolicy",
+            true,
         )
         .await?;
         create_companion_if_absent(
             &policies,
             &companions.supervisor_ingress,
             "proxy-pod supervisor ingress NetworkPolicy",
+            true,
         )
         .await?;
         create_companion_if_absent(
             &deployments,
             &companions.supervisor_deployment,
             "proxy-pod supervisor deployment",
+            true,
         )
         .await?;
         Ok(())
@@ -1813,9 +1821,11 @@ impl KubernetesComputeDriver {
     /// (gateway start and watch re-establishment). Best-effort: failures are
     /// logged, not fatal.
     async fn reconcile_proxy_pod_companions(&self) {
-        if self.config.topology != SupervisorTopology::ProxyPod {
-            return;
-        }
+        // Driven by each CR's persisted creation-time topology, not the
+        // gateway's current config: a gateway whose Helm topology was changed to
+        // `combined` must still reconcile sandboxes that were created as
+        // `proxy-pod` (whose companions and lifecycle it still owns). The
+        // per-CR filter below selects those.
         let lookup_api = match self
             .supported_sandbox_api_for_lookup(self.client.clone())
             .await
@@ -1827,7 +1837,9 @@ impl KubernetesComputeDriver {
             }
         };
         let api_version = format!("{SANDBOX_GROUP}/{}", lookup_api.resource.version);
-        let lp = ListParams::default().labels(&openshell_sandbox_label_selector());
+        // Gateway-scoped selector: never touch another gateway's sandboxes,
+        // whose companions carry that gateway's image, endpoint, and config.
+        let lp = ListParams::default().labels(&self.openshell_sandbox_selector());
         let list = match tokio::time::timeout(KUBE_API_TIMEOUT, lookup_api.api.list(&lp)).await {
             Ok(Ok(list)) => list,
             Ok(Err(err)) => {
@@ -5264,10 +5276,17 @@ fn build_proxy_pod_companions(
 /// Create a companion object, treating an `AlreadyExists` (409) conflict as
 /// success. This makes companion provisioning idempotent so it is safe to run
 /// repeatedly from the reconciliation path without clobbering existing objects.
+///
+/// `verify_ownership` controls whether a 409 triggers an ownership-verifying
+/// GET. It is `false` for the CA Secret because the gateway deliberately holds
+/// no Secret read permission (least privilege); the companion name is keyed on
+/// the immutable sandbox UUID, so a 409 already implies the object is this
+/// sandbox's own. Non-secret companions verify via a metadata GET.
 async fn create_companion_if_absent<K>(
     api: &Api<K>,
     obj: &K,
     description: &str,
+    verify_ownership: bool,
 ) -> Result<(), KubernetesDriverError>
 where
     K: kube::Resource + Clone + std::fmt::Debug + serde::Serialize + DeserializeOwned + Sync,
@@ -5276,7 +5295,11 @@ where
     match tokio::time::timeout(KUBE_API_TIMEOUT, api.create(&PostParams::default(), obj)).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(KubeError::Api(err))) if err.code == 409 => {
-            verify_companion_ownership(api, obj, description).await
+            if verify_ownership {
+                verify_companion_ownership(api, obj, description).await
+            } else {
+                Ok(())
+            }
         }
         Ok(Err(err)) => Err(KubernetesDriverError::from_kube(err)),
         Err(_elapsed) => Err(KubernetesDriverError::Message(format!(
@@ -5334,6 +5357,17 @@ where
         // Raced with garbage collection: the conflicting object is already gone,
         // so a later reconcile pass will recreate it cleanly.
         Ok(Err(KubeError::Api(err))) if err.code == 404 => Ok(()),
+        // Cannot read the object to verify (should not happen with the rendered
+        // RBAC, which grants get on non-secret companions). Accept rather than
+        // wedge reconciliation: the UUID-keyed name already implies it is ours.
+        Ok(Err(KubeError::Api(err))) if err.code == 403 => {
+            warn!(
+                companion = %description,
+                name = %name,
+                "Cannot verify companion ownership (forbidden); accepting existing object by UUID-keyed name"
+            );
+            Ok(())
+        }
         Ok(Err(err)) => Err(KubernetesDriverError::from_kube(err)),
         Err(_elapsed) => Err(KubernetesDriverError::Message(format!(
             "timed out after {}s verifying ownership of {description} {name}",

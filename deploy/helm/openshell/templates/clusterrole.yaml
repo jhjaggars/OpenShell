@@ -152,17 +152,19 @@ rules:
   # NetworkPolicy pair per sandbox in the sandbox's namespace. In managed and
   # operator modes that namespace is per-workspace, so these permissions must be
   # cluster-scoped; shared mode grants the same access through the namespaced
-  # Role instead. `patch` on deployments scales the supervisor on stop/start,
-  # and `get` on replicasets lets the gateway verify the supervisor pod's
-  # Pod -> ReplicaSet -> Deployment -> Sandbox owner chain during ServiceAccount
-  # bootstrap.
+  # Role instead. Companions are owner-referenced to the Sandbox CR and removed
+  # by garbage collection when it is deleted, so no `delete` verbs are granted —
+  # a compromised gateway must not be able to delete cluster resources. `get`
+  # supports crash-recovery reconciliation and, on deployments, readiness and
+  # the ServiceAccount-bootstrap owner-chain check. `patch` on deployments scales
+  # the supervisor on stop/start. The gateway never reads Secret contents, so
+  # Secrets get `create` only (no cluster-wide Secret read).
   - apiGroups:
       - apps
     resources:
       - deployments
     verbs:
       - create
-      - delete
       - get
       - patch
   - apiGroups:
@@ -171,28 +173,24 @@ rules:
       - replicasets
     verbs:
       - get
-  # Services are addressed by name for create/delete only.
   - apiGroups:
       - ""
     resources:
       - services
     verbs:
       - create
-      - delete
-  # The generated CA Secret is only created and deleted by name; the gateway
-  # never reads Secrets, so it must not hold cluster-wide Secret read access.
+      - get
   - apiGroups:
       - ""
     resources:
       - secrets
     verbs:
       - create
-      - delete
   - apiGroups:
       - networking.k8s.io
     resources:
       - networkpolicies
     verbs:
       - create
-      - delete
+      - get
   {{- end }}

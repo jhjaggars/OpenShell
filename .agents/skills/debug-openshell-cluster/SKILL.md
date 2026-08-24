@@ -529,6 +529,13 @@ it through the namespaced Role, while `managed` and `operator` grant it through
 the ClusterRole (the sandbox namespace is per-workspace). If those resources fail
 with forbidden errors, confirm both the rendered `gateway.toml` and Helm values
 use proxy-pod topology and that the workspace mode's Role/ClusterRole was applied.
+The gateway never deletes companions (garbage collection removes them with the
+Sandbox CR), so the RBAC grants no `delete` on them and no Secret read; a 403 on
+a companion `delete`/Secret `get` indicates stale expectations, not a missing
+grant. Do not change `supervisor.topology` away from proxy-pod while proxy-pod
+sandboxes still exist: their companion RBAC and reconciliation are gated on the
+rendered topology, so start/stop and crash-recovery for those sandboxes stop
+working until they are deleted or the topology is restored.
 If the agent cannot reach the gateway, check DNS to the headless Service, the
 agent egress NetworkPolicy DNS exception for kube-dns/CoreDNS, and the
 supervisor ingress NetworkPolicy allowing only that agent pod on port `3128`.

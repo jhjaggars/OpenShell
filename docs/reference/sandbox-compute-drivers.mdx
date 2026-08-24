@@ -10,7 +10,7 @@ position: 4
 
 The gateway's configured compute driver determines how OpenShell creates each sandbox. The CLI workflow stays the same across drivers: you create, connect to, inspect, stop, start, and delete sandboxes through the gateway API.
 
-Every compute driver runs the OpenShell supervisor inside the sandbox workload. The supervisor launches the agent process, applies policy, routes egress through the proxy, injects configured credentials, and maintains the gateway session.
+Most compute drivers run the OpenShell supervisor inside the sandbox workload container. The supervisor launches the agent process, applies policy, routes egress through the proxy, injects configured credentials, and maintains the gateway session. The Kubernetes driver's `proxy-pod` topology is the exception: network enforcement runs in a separate supervisor Deployment, and the workload pod runs directly with no in-pod supervisor session. As a result, `proxy-pod` sandboxes are sessionless — `openshell sandbox exec`, `connect`, port forwarding, and uploads are rejected — and `openshell logs` does not contain the workload's stdout/stderr.
 
 Stop stops compute but retains the sandbox record and the driver's
 persistent workspace boundary. Start reactivates the same driver resource.
