@@ -1554,11 +1554,7 @@ impl KubernetesComputeDriver {
             // Delete the CR we actually created, addressed by its returned name
             // (the workspace-scoped CR name, not the bare sandbox name) and
             // guarded by its UID so we never remove a same-named successor.
-            // Every companion is owner-referenced to this CR, so deleting the CR
-            // lets Kubernetes garbage-collect whichever companions were created
-            // before the failure — including the egress NetworkPolicy, which GC
-            // removes as part of the CR teardown rather than while the workload
-            // pod may still be running.
+            // Owner-referenced companions are garbage-collected with the CR.
             let created_name = created.metadata.name.as_deref().unwrap_or(params.cr_name);
             let mut delete_params = DeleteParams::default();
             if let Some(uid) = created.metadata.uid.clone() {
@@ -1570,6 +1566,18 @@ impl KubernetesComputeDriver {
             let _ = tokio::time::timeout(
                 KUBE_API_TIMEOUT,
                 agent_sandbox_api.api.delete(created_name, &delete_params),
+            )
+            .await;
+            // The agent egress NetworkPolicy carries no owner reference, so GC
+            // will not collect it — delete it explicitly. The workload pod is
+            // being torn down with the CR, and on create failure it never became
+            // Ready, so there is no fenced traffic to protect here.
+            let names = proxy_pod_resource_names(params.cr_name, &sandbox.id);
+            let policies: Api<NetworkPolicy> =
+                Api::namespaced(self.client.clone(), params.namespace);
+            let _ = tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                policies.delete(&names.agent_egress_network_policy, &DeleteParams::default()),
             )
             .await;
             return Err(err);
@@ -1620,6 +1628,7 @@ impl KubernetesComputeDriver {
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
+            gateway_id: &self.config.gateway_id,
             cr_name,
             grpc_endpoint: &self.config.grpc_endpoint,
             ssh_socket_path: self.ssh_socket_path(),
@@ -1854,11 +1863,15 @@ impl KubernetesComputeDriver {
 
         let mut checked = 0usize;
         let mut failed = 0usize;
+        let mut live_sandbox_ids = HashSet::new();
         for obj in list.items {
             if !is_openshell_managed(&obj)
                 || topology_from_object(&obj, self.config.topology) != SupervisorTopology::ProxyPod
             {
                 continue;
+            }
+            if let Ok(id) = sandbox_id_from_object(&obj) {
+                live_sandbox_ids.insert(id);
             }
             checked += 1;
             if let Err(err) = self
@@ -1878,6 +1891,82 @@ impl KubernetesComputeDriver {
                 checked,
                 failed, "Reconciled proxy-pod companions for existing sandboxes"
             );
+        }
+
+        // Reap orphaned egress fences: the agent egress NetworkPolicy has no
+        // owner reference (so it can outlive its workload pod on delete), which
+        // means a gateway crash between CR deletion and fence teardown leaves it
+        // behind. Delete any whose sandbox CR no longer exists.
+        self.reap_orphaned_egress_fences(&live_sandbox_ids).await;
+    }
+
+    /// Delete agent egress `NetworkPolicy` objects whose Sandbox CR is gone.
+    /// Their CRs having been reaped means the workload pods were torn down with
+    /// them, so removing the now-purposeless fence is safe.
+    async fn reap_orphaned_egress_fences(&self, live_sandbox_ids: &HashSet<String>) {
+        let policies: Api<NetworkPolicy> = if self.config.is_multi_namespace() {
+            Api::all(self.client.clone())
+        } else {
+            Api::namespaced(self.client.clone(), &self.config.namespace)
+        };
+        // Gateway-scoped, agent-role egress policies only.
+        let selector = format!(
+            "{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_GATEWAY_ID}={},{LABEL_SANDBOX_ROLE}={SANDBOX_ROLE_AGENT}",
+            self.config.gateway_id
+        );
+        let list = match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            policies.list(&ListParams::default().labels(&selector)),
+        )
+        .await
+        {
+            Ok(Ok(list)) => list,
+            Ok(Err(err)) => {
+                warn!(error = %err, "Skipping orphaned egress fence reap: list failed");
+                return;
+            }
+            Err(_elapsed) => {
+                warn!("Skipping orphaned egress fence reap: list timed out");
+                return;
+            }
+        };
+        for policy in list.items {
+            let sandbox_id = policy
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
+                .cloned()
+                .unwrap_or_default();
+            if sandbox_id.is_empty() || live_sandbox_ids.contains(&sandbox_id) {
+                continue;
+            }
+            let Some(name) = policy.metadata.name.as_deref() else {
+                continue;
+            };
+            let ns = policy
+                .metadata
+                .namespace
+                .as_deref()
+                .unwrap_or(&self.config.namespace);
+            let scoped: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), ns);
+            match tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                scoped.delete(name, &DeleteParams::default()),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    info!(sandbox_id = %sandbox_id, policy = %name, "Reaped orphaned proxy-pod egress fence");
+                }
+                Ok(Err(KubeError::Api(_))) => {}
+                Ok(Err(err)) => {
+                    warn!(policy = %name, error = %err, "Failed to reap orphaned egress fence");
+                }
+                Err(_elapsed) => {
+                    warn!(policy = %name, "Timed out reaping orphaned egress fence");
+                }
+            }
         }
     }
 
@@ -2218,75 +2307,85 @@ impl KubernetesComputeDriver {
             .await?;
         let selector = self.sandbox_lookup_selector(sandbox_id);
         let lp = ListParams::default().labels(&selector);
-        let (kube_name, obj_namespace, _workspace, preconditions) = match tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            lookup_api.api.list(&lp),
-        )
-        .await
-        {
-            Ok(Ok(list)) => {
-                if let Some(obj) = list.items.into_iter().next() {
-                    match obj.metadata.name {
-                        Some(name) => {
-                            let ns = obj
-                                .metadata
-                                .namespace
-                                .clone()
-                                .unwrap_or_else(|| self.config.namespace.clone());
-                            let ws = obj
-                                .metadata
-                                .labels
-                                .as_ref()
-                                .and_then(|l| l.get(LABEL_SANDBOX_WORKSPACE).cloned())
-                                .unwrap_or_default();
-                            let pc = Preconditions {
-                                uid: obj.metadata.uid,
-                                resource_version: obj.metadata.resource_version,
-                            };
-                            (name, ns, ws, pc)
+        let (kube_name, obj_namespace, _workspace, preconditions, topology, pod_name, stop_timeout) =
+            match tokio::time::timeout(KUBE_API_TIMEOUT, lookup_api.api.list(&lp)).await {
+                Ok(Ok(list)) => {
+                    if let Some(obj) = list.items.into_iter().next() {
+                        // Read fields that borrow the object before its `name` is moved.
+                        let topology = topology_from_object(&obj, self.config.topology);
+                        let stop_timeout = kubernetes_sandbox_stop_timeout(&obj);
+                        let pod_name = obj
+                            .metadata
+                            .annotations
+                            .as_ref()
+                            .and_then(|annotations| annotations.get(SANDBOX_POD_NAME_ANNOTATION))
+                            .cloned();
+                        match obj.metadata.name {
+                            Some(name) => {
+                                let ns = obj
+                                    .metadata
+                                    .namespace
+                                    .clone()
+                                    .unwrap_or_else(|| self.config.namespace.clone());
+                                let ws = obj
+                                    .metadata
+                                    .labels
+                                    .as_ref()
+                                    .and_then(|l| l.get(LABEL_SANDBOX_WORKSPACE).cloned())
+                                    .unwrap_or_default();
+                                let pc = Preconditions {
+                                    uid: obj.metadata.uid,
+                                    resource_version: obj.metadata.resource_version,
+                                };
+                                let pod_name = pod_name.unwrap_or_else(|| name.clone());
+                                (name, ns, ws, pc, topology, pod_name, stop_timeout)
+                            }
+                            None => return Ok(false),
                         }
-                        None => return Ok(false),
+                    } else {
+                        debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted)");
+                        return Ok(false);
                     }
-                } else {
-                    debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted)");
-                    return Ok(false);
                 }
-            }
-            Ok(Err(err)) => {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    error = %err,
-                    "Failed to list sandbox for deletion from Kubernetes"
-                );
-                return Err(err.to_string());
-            }
-            Err(_elapsed) => {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    timeout_secs = KUBE_API_TIMEOUT.as_secs(),
-                    "Timed out listing sandbox for deletion from Kubernetes"
-                );
-                return Err(format!(
-                    "timed out after {}s waiting for Kubernetes API",
-                    KUBE_API_TIMEOUT.as_secs()
-                ));
-            }
-        };
+                Ok(Err(err)) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        error = %err,
+                        "Failed to list sandbox for deletion from Kubernetes"
+                    );
+                    return Err(err.to_string());
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                        "Timed out listing sandbox for deletion from Kubernetes"
+                    );
+                    return Err(format!(
+                        "timed out after {}s waiting for Kubernetes API",
+                        KUBE_API_TIMEOUT.as_secs()
+                    ));
+                }
+            };
 
         let delete_api = self
             .supported_agent_sandbox_api(self.client.clone(), &obj_namespace)
             .await?;
         let dp = DeleteParams::default().preconditions(preconditions);
-        // Delete only the Sandbox CR. Every proxy-pod companion — including the
-        // agent egress NetworkPolicy that fences the workload — is
-        // owner-referenced to this CR, so Kubernetes garbage collection removes
-        // them as part of the CR teardown. Deleting the fence eagerly here would
-        // race the workload pod's termination grace period and could reopen
-        // unrestricted egress while the pod is still running; letting GC tie
-        // companion removal to the CR's own deletion lifecycle avoids that. The
-        // UID precondition also means a 409 (replacement) or 404 leaves the
-        // successor's companions untouched.
-        match tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.delete(&kube_name, &dp)).await {
+        // Delete the Sandbox CR. Owner-referenced companions (supervisor
+        // Deployment, Service, CA Secret, supervisor-ingress NetworkPolicy) are
+        // reaped by garbage collection. The agent egress NetworkPolicy — the
+        // workload's fence — has no owner reference and is torn down explicitly
+        // below, only after the workload pod is gone, so a pod that ignores
+        // SIGTERM cannot regain direct egress during its termination grace
+        // period. The UID precondition means a 409 (replacement) or 404 leaves a
+        // successor untouched.
+        let deleted = match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            delete_api.api.delete(&kube_name, &dp),
+        )
+        .await
+        {
             Ok(Ok(_response)) => {
                 info!(sandbox_id = %sandbox_id, namespace = %obj_namespace, "Sandbox deleted from Kubernetes");
                 Ok(true)
@@ -2313,6 +2412,84 @@ impl KubernetesComputeDriver {
                     "timed out after {}s waiting for Kubernetes API",
                     KUBE_API_TIMEOUT.as_secs()
                 ))
+            }
+        };
+
+        // Ordered fence teardown for proxy-pod: only after THIS CR was confirmed
+        // deleted, wait for the workload pod to disappear, then delete its egress
+        // NetworkPolicy. A 409/404 (`Ok(false)`) means a successor owns the name,
+        // so we must not touch its fence.
+        if matches!(deleted, Ok(true)) && topology == SupervisorTopology::ProxyPod {
+            self.teardown_proxy_pod_fence(
+                &obj_namespace,
+                &kube_name,
+                sandbox_id,
+                &pod_name,
+                stop_timeout,
+            )
+            .await;
+        }
+        deleted
+    }
+
+    /// Delete a proxy-pod sandbox's egress `NetworkPolicy` once its workload pod
+    /// is gone, so the fence outlives a pod that ignores `SIGTERM`. Best-effort: any
+    /// leftover is reaped by [`Self::reconcile_proxy_pod_companions`] on restart.
+    async fn teardown_proxy_pod_fence(
+        &self,
+        namespace: &str,
+        cr_name: &str,
+        sandbox_id: &str,
+        pod_name: &str,
+        stop_timeout: Duration,
+    ) {
+        let pod_api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let deadline = tokio::time::Instant::now() + stop_timeout;
+        let mut poll = STOP_INITIAL_POLL_INTERVAL;
+        loop {
+            match kubernetes_sandbox_pod_is_gone(&pod_api, pod_name, deadline).await {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(err) => {
+                    // Could not confirm the pod is gone. Do NOT drop the fence on
+                    // a guess; leave it for reconciliation to reap once the CR is
+                    // confirmed gone.
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        pod = %pod_name,
+                        error = %err,
+                        "Could not confirm workload pod termination; leaving egress fence for reconciliation"
+                    );
+                    return;
+                }
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    pod = %pod_name,
+                    "Workload pod still present at deadline; leaving egress fence for reconciliation"
+                );
+                return;
+            }
+            tokio::time::sleep(poll.min(deadline.saturating_duration_since(now))).await;
+            poll = next_stop_poll_interval(poll);
+        }
+
+        let names = proxy_pod_resource_names(cr_name, sandbox_id);
+        let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            policies.delete(&names.agent_egress_network_policy, &DeleteParams::default()),
+        )
+        .await
+        {
+            Ok(Ok(_) | Err(KubeError::Api(_))) => {}
+            Ok(Err(err)) => {
+                warn!(sandbox_id = %sandbox_id, error = %err, "Failed to delete proxy-pod egress fence");
+            }
+            Err(_elapsed) => {
+                warn!(sandbox_id = %sandbox_id, "Timed out deleting proxy-pod egress fence");
             }
         }
     }
@@ -4281,6 +4458,10 @@ struct SandboxPodParams<'a> {
     service_account_name: &'a str,
     sandbox_id: &'a str,
     sandbox_name: &'a str,
+    /// Gateway that owns this sandbox. Stamped as a label on proxy-pod
+    /// companions so reconciliation can list and reap only this gateway's
+    /// resources, never another gateway's.
+    gateway_id: &'a str,
     /// Sandbox CR resource name (`kube_resource_name`), unique per sandbox in
     /// every workspace mode. Companion resource names derive from this so they
     /// match across the workload pod template and the companion objects.
@@ -4329,6 +4510,7 @@ impl Default for SandboxPodParams<'_> {
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
             sandbox_name: "",
+            gateway_id: "",
             cr_name: "",
             grpc_endpoint: "",
             ssh_socket_path: "",
@@ -5039,7 +5221,7 @@ fn proxy_pod_owner_reference(
     }))
 }
 
-fn proxy_pod_labels(sandbox_id: &str, role: &str) -> serde_json::Value {
+fn proxy_pod_labels(sandbox_id: &str, role: &str, gateway_id: &str) -> serde_json::Value {
     let mut labels = serde_json::Map::new();
     labels.insert(
         LABEL_MANAGED_BY.to_string(),
@@ -5047,6 +5229,10 @@ fn proxy_pod_labels(sandbox_id: &str, role: &str) -> serde_json::Value {
     );
     labels.insert(LABEL_SANDBOX_ID.to_string(), serde_json::json!(sandbox_id));
     labels.insert(LABEL_SANDBOX_ROLE.to_string(), serde_json::json!(role));
+    // Gateway ownership so reconciliation can scope list/reap to this gateway.
+    if !gateway_id.is_empty() {
+        labels.insert(LABEL_GATEWAY_ID.to_string(), serde_json::json!(gateway_id));
+    }
     serde_json::Value::Object(labels)
 }
 
@@ -5062,12 +5248,13 @@ fn proxy_pod_object_meta(
     namespace: &str,
     sandbox_id: &str,
     role: &str,
+    gateway_id: &str,
     owner_ref: serde_json::Value,
 ) -> serde_json::Value {
     serde_json::json!({
         "name": name,
         "namespace": namespace,
-        "labels": proxy_pod_labels(sandbox_id, role),
+        "labels": proxy_pod_labels(sandbox_id, role, gateway_id),
         "annotations": {
             "openshell.io/sandbox-id": sandbox_id
         },
@@ -5178,7 +5365,7 @@ fn proxy_pod_ca_secret(
         "metadata": {
             "name": names.proxy_ca_secret,
             "namespace": params.namespace,
-            "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
+            "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR, params.gateway_id),
             "ownerReferences": [owner_ref],
         },
         "type": "Opaque",
@@ -5197,7 +5384,7 @@ fn proxy_pod_supervisor_service(
         "metadata": {
             "name": names.service,
             "namespace": params.namespace,
-            "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
+            "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR, params.gateway_id),
             "ownerReferences": [owner_ref],
         },
         "spec": {
@@ -5251,11 +5438,9 @@ fn build_proxy_pod_companions(
             ca_key_pem,
         ),
         service: proxy_pod_supervisor_service(names, params, dependent_owner_ref.clone()),
-        agent_egress: proxy_pod_agent_egress_network_policy(
-            names,
-            params,
-            dependent_owner_ref.clone(),
-        ),
+        // No owner reference: the gateway manages this fence's lifecycle so it
+        // outlives the workload pod on deletion.
+        agent_egress: proxy_pod_agent_egress_network_policy(names, params),
         supervisor_ingress: proxy_pod_supervisor_ingress_network_policy(
             names,
             params,
@@ -5629,6 +5814,7 @@ fn proxy_pod_supervisor_deployment(
             params.namespace,
             params.sandbox_id,
             SANDBOX_ROLE_SUPERVISOR,
+            params.gateway_id,
             owner_ref
         ),
         "spec": {
@@ -5638,7 +5824,7 @@ fn proxy_pod_supervisor_deployment(
             },
             "template": {
                 "metadata": {
-                    "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
+                    "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR, params.gateway_id),
                     "annotations": {
                         "openshell.io/sandbox-id": params.sandbox_id
                     }
@@ -5698,7 +5884,6 @@ fn proxy_pod_dns_egress_rules(peers: &[ProxyPodDnsPeer]) -> Vec<serde_json::Valu
 fn proxy_pod_agent_egress_network_policy(
     names: &ProxyPodResourceNames,
     params: &SandboxPodParams<'_>,
-    owner_ref: serde_json::Value,
 ) -> NetworkPolicy {
     let mut egress = vec![serde_json::json!({
         "to": [{
@@ -5712,14 +5897,20 @@ fn proxy_pod_agent_egress_network_policy(
     })];
     egress.extend(proxy_pod_dns_egress_rules(params.proxy_pod_dns_peers));
 
+    // Deliberately NO ownerReference: this egress policy is the workload's fence,
+    // and it must outlive the workload pod during deletion. Owner-reference
+    // garbage collection deletes it concurrently with the pod (siblings of the
+    // Sandbox CR), which would reopen direct egress for a pod that ignores
+    // SIGTERM during its termination grace period. The gateway instead deletes
+    // it explicitly after the pod is gone (delete_sandbox) and reaps orphans in
+    // reconciliation, so it is never collected while the workload can still run.
     k8s_object(serde_json::json!({
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
         "metadata": {
             "name": names.agent_egress_network_policy,
             "namespace": params.namespace,
-            "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_AGENT),
-            "ownerReferences": [owner_ref],
+            "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_AGENT, params.gateway_id),
         },
         "spec": {
             "podSelector": {
@@ -5742,7 +5933,7 @@ fn proxy_pod_supervisor_ingress_network_policy(
         "metadata": {
             "name": names.supervisor_ingress_network_policy,
             "namespace": params.namespace,
-            "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
+            "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR, params.gateway_id),
             "ownerReferences": [owner_ref],
         },
         "spec": {
@@ -8360,15 +8551,18 @@ mod tests {
             Some("0.0.0.0:3128")
         );
 
-        let agent_egress = serde_json::to_value(proxy_pod_agent_egress_network_policy(
-            &names,
-            &params,
-            owner_ref.clone(),
-        ))
-        .unwrap();
+        let agent_egress =
+            serde_json::to_value(proxy_pod_agent_egress_network_policy(&names, &params)).unwrap();
         assert_eq!(
             agent_egress["spec"]["policyTypes"],
             serde_json::json!(["Egress"])
+        );
+        // The egress fence must carry NO owner reference: it is gateway-managed
+        // so it outlives the workload pod during deletion rather than being
+        // garbage-collected concurrently with it.
+        assert!(
+            agent_egress["metadata"].get("ownerReferences").is_none(),
+            "agent egress NetworkPolicy must have no ownerReferences: {agent_egress}"
         );
         assert_eq!(
             agent_egress["spec"]["podSelector"]["matchLabels"][LABEL_SANDBOX_ROLE],
@@ -8442,7 +8636,6 @@ mod tests {
         proxy_pod_agent_egress_network_policy(
             &proxy_pod_resource_names(params.cr_name, params.sandbox_id),
             &params,
-            serde_json::json!({}),
         )
     }
 

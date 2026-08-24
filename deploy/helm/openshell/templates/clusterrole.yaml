@@ -186,11 +186,19 @@ rules:
       - secrets
     verbs:
       - create
+  # The agent egress NetworkPolicy (the workload's egress fence) has no owner
+  # reference so it can outlive the workload pod during deletion; the gateway
+  # manages its lifecycle directly. `delete` tears it down after the pod is gone,
+  # and `list` lets reconciliation reap fences orphaned by a gateway crash.
+  # Owner-referenced NetworkPolicies (supervisor ingress) are garbage-collected
+  # with the Sandbox CR.
   - apiGroups:
       - networking.k8s.io
     resources:
       - networkpolicies
     verbs:
       - create
+      - delete
       - get
+      - list
   {{- end }}

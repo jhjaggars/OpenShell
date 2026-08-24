@@ -176,11 +176,21 @@ alongside the `Sandbox` CR, all in the sandbox namespace:
 Names are `<prefix>-<sanitized-name>-<fnv32>` to stay within the 63-character
 DNS label limit while remaining collision-resistant and human-recognizable.
 
-The `Deployment` carries a **controlling** `Sandbox` ownerReference; the other
-four carry non-controlling ones. Kubernetes garbage collection therefore reclaims
-all five when the sandbox is deleted, and the driver additionally deletes them
-explicitly on the delete path so teardown does not wait on the GC controller. The
-`Deployment` recreates the supervisor pod if it is deleted independently.
+The `Deployment` carries a **controlling** `Sandbox` ownerReference; the
+`Service`, CA `Secret`, and supervisor-ingress `NetworkPolicy` carry
+non-controlling ones. Kubernetes garbage collection reclaims those four when the
+sandbox is deleted. The `Deployment` recreates the supervisor pod if it is
+deleted independently.
+
+The agent egress `NetworkPolicy` — the workload's egress fence — deliberately
+carries **no** ownerReference. Owner-reference garbage collection does not order
+sibling deletion, so a GC-owned fence would be removed concurrently with the
+workload pod; a pod that ignores `SIGTERM` could then regain direct egress during
+its termination grace period. Instead the gateway manages the fence's lifecycle
+directly: it deletes the fence only after the workload pod is gone (the delete
+path waits for the pod to disappear), and reconciliation reaps any fence orphaned
+by a gateway crash (an `os-eg-*` policy whose Sandbox CR no longer exists). This
+keeps the fence in place for exactly as long as the workload can still run.
 
 Because the supervisor pod is created by a `Deployment`, its owner chain is
 `Pod → ReplicaSet → Deployment → Sandbox` rather than `Pod → Sandbox`. Gateway
