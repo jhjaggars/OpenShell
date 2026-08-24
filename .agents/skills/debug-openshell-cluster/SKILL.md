@@ -524,12 +524,14 @@ a sandbox JWT. For supervisor pods, the gateway validates the
 `Pod -> ReplicaSet -> Deployment -> Sandbox` owner chain, so missing
 `apps/replicasets get` RBAC can also break bootstrap. Helm renders the
 Deployment, ReplicaSet, Service, Secret, and NetworkPolicy RBAC only when
-`supervisor.topology=proxy-pod`; if those resources fail with forbidden errors,
-confirm both the rendered `gateway.toml` and Helm values use proxy-pod topology.
+`supervisor.topology=proxy-pod`, and scopes it by workspace mode: `shared` grants
+it through the namespaced Role, while `managed` and `operator` grant it through
+the ClusterRole (the sandbox namespace is per-workspace). If those resources fail
+with forbidden errors, confirm both the rendered `gateway.toml` and Helm values
+use proxy-pod topology and that the workspace mode's Role/ClusterRole was applied.
 If the agent cannot reach the gateway, check DNS to the headless Service, the
 agent egress NetworkPolicy DNS exception for kube-dns/CoreDNS, and the
-supervisor ingress NetworkPolicy allowing only that agent pod on ports `3128`
-and `18080`.
+supervisor ingress NetworkPolicy allowing only that agent pod on port `3128`.
 
 Inspect the relevant containers when sandbox registration or egress enforcement
 fails:

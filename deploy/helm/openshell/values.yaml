@@ -137,6 +137,10 @@ sandboxServiceAccount:
     # `nonroot-v2` ships with OpenShift and already permits exactly what this
     # topology needs, keeping drop-ALL capabilities, no privilege escalation,
     # and no host namespaces. Creates a ClusterRole + ClusterRoleBinding.
+    # Supported only with server.drivers.kubernetes.workspaceMode=shared: the
+    # ClusterRoleBinding is scoped to the static sandbox namespace, so it does
+    # not reach the dynamically created workspace namespaces used by managed and
+    # operator modes. Enabling it with a non-shared mode fails the Helm render.
     nonrootSCC: false
 
 # -- Extra annotations to add to the gateway pod.

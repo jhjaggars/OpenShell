@@ -146,11 +146,13 @@ rules:
       - patch
       - update
   {{- end }}
-  {{- if eq (.Values.supervisor.topology | default "combined") "proxy-pod" }}
+  {{- end }}
+  {{- if and (ne $workspaceMode "shared") (eq (.Values.supervisor.topology | default "combined") "proxy-pod") }}
   # Proxy-pod topology creates a supervisor Deployment, Service, CA Secret, and
   # NetworkPolicy pair per sandbox in the sandbox's namespace. In managed and
   # operator modes that namespace is per-workspace, so these permissions must be
-  # cluster-scoped. `patch` on deployments scales the supervisor on stop/start,
+  # cluster-scoped; shared mode grants the same access through the namespaced
+  # Role instead. `patch` on deployments scales the supervisor on stop/start,
   # and `get` on replicasets lets the gateway verify the supervisor pod's
   # Pod -> ReplicaSet -> Deployment -> Sandbox owner chain during ServiceAccount
   # bootstrap.
@@ -192,5 +194,4 @@ rules:
       - get
       - list
       - watch
-  {{- end }}
   {{- end }}

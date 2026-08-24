@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 {{- if .Values.sandboxServiceAccount.openshift.nonrootSCC }}
+{{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" }}
+{{- if ne $workspaceMode "shared" }}
+{{- fail (printf "sandboxServiceAccount.openshift.nonrootSCC is only supported with server.drivers.kubernetes.workspaceMode=shared (got %q). Managed and operator modes run sandboxes under ServiceAccounts in dynamically created workspace namespaces, which this single ClusterRoleBinding (scoped to the static sandbox namespace) does not cover, so nonroot-v2 would not be granted and non-root sandbox pods would be inadmissible. Grant the nonroot-v2 SCC per workspace namespace out-of-band, or use shared workspace mode." $workspaceMode) }}
+{{- end }}
 # Grant the built-in OpenShift `nonroot-v2` SCC to the sandbox ServiceAccount.
 #
 # No SecurityContextConstraints object is created: `nonroot-v2` ships with
