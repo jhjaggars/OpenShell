@@ -98,5 +98,13 @@ rules:
       - delete
       - get
       - list
+  # `list` on pods lets ordered fence teardown and orphan reaping confirm the
+  # workload pod is gone (by sandbox-id label) before removing its egress fence.
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - list
   {{- end }}
 {{- end }}

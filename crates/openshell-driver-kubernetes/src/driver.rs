@@ -1569,15 +1569,16 @@ impl KubernetesComputeDriver {
             )
             .await;
             // The agent egress NetworkPolicy carries no owner reference, so GC
-            // will not collect it — delete it explicitly. The workload pod is
-            // being torn down with the CR, and on create failure it never became
-            // Ready, so there is no fenced traffic to protect here.
-            let names = proxy_pod_resource_names(params.cr_name, &sandbox.id);
-            let policies: Api<NetworkPolicy> =
-                Api::namespaced(self.client.clone(), params.namespace);
-            let _ = tokio::time::timeout(
-                KUBE_API_TIMEOUT,
-                policies.delete(&names.agent_egress_network_policy, &DeleteParams::default()),
+            // will not collect it. The CR delete above may have raced a partially
+            // committed create and the controller may already have started the
+            // workload pod, so tear the fence down only after confirming the pod
+            // is gone (the same ordered-teardown invariant as delete_sandbox);
+            // if that cannot be confirmed the fence is retained for the reaper.
+            self.teardown_proxy_pod_fence(
+                params.namespace,
+                params.cr_name,
+                &sandbox.id,
+                DEFAULT_POD_TERMINATION_GRACE_PERIOD.saturating_add(KUBE_API_TIMEOUT),
             )
             .await;
             return Err(err);
@@ -1697,6 +1698,8 @@ impl KubernetesComputeDriver {
             &spec_environment,
             &pod_driver_config,
             &placement,
+            // A newly created sandbox starts running.
+            1,
             deployment_owner_ref,
             dependent_owner_ref,
             &ca_cert_pem,
@@ -1738,13 +1741,11 @@ impl KubernetesComputeDriver {
             .await?;
         create_companion_if_absent(&services, &companions.service, "proxy-pod service", true)
             .await?;
-        create_companion_if_absent(
-            &policies,
-            &companions.agent_egress,
-            "proxy-pod agent egress NetworkPolicy",
-            true,
-        )
-        .await?;
+        // The egress fence carries no owner reference (it is gateway-managed), so
+        // owner-based verification cannot vouch for it. Validate its enforcement
+        // fields instead: an existing same-name policy must fence exactly this
+        // agent, or a stale/altered one would be silently accepted.
+        create_or_validate_egress_fence(&policies, &companions.agent_egress).await?;
         create_companion_if_absent(
             &policies,
             &companions.supervisor_ingress,
@@ -1794,33 +1795,7 @@ impl KubernetesComputeDriver {
         namespace: &str,
         deployment_name: &str,
     ) -> bool {
-        let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
-        match tokio::time::timeout(KUBE_API_TIMEOUT, deployments.get_opt(deployment_name)).await {
-            Ok(Ok(Some(deployment))) => {
-                let available = deployment
-                    .status
-                    .as_ref()
-                    .and_then(|status| status.available_replicas)
-                    .unwrap_or(0);
-                available < 1
-            }
-            Ok(Ok(None)) => true,
-            Ok(Err(err)) => {
-                warn!(
-                    deployment = %deployment_name,
-                    error = %err,
-                    "Could not determine proxy-pod supervisor availability; leaving readiness unchanged"
-                );
-                false
-            }
-            Err(_elapsed) => {
-                warn!(
-                    deployment = %deployment_name,
-                    "Timed out checking proxy-pod supervisor availability; leaving readiness unchanged"
-                );
-                false
-            }
-        }
+        proxy_pod_supervisor_unavailable(&self.client, namespace, deployment_name).await
     }
 
     /// Repair proxy-pod companions for every existing Sandbox CR. A gateway
@@ -1948,8 +1923,18 @@ impl KubernetesComputeDriver {
                 .metadata
                 .namespace
                 .as_deref()
-                .unwrap_or(&self.config.namespace);
-            let scoped: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), ns);
+                .unwrap_or(&self.config.namespace)
+                .to_string();
+            // The CR is gone, but background garbage collection may still be
+            // terminating the workload pod. Only drop the fence once that pod is
+            // confirmed absent; retain it (this sweep or a later one reaps it)
+            // when absence cannot be confirmed, so a SIGTERM-ignoring workload
+            // never regains direct egress.
+            if self.workload_pod_absent(&ns, &sandbox_id).await != Some(true) {
+                debug!(sandbox_id = %sandbox_id, policy = %name, "Retaining orphaned egress fence: workload pod not confirmed absent");
+                continue;
+            }
+            let scoped: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), &ns);
             match tokio::time::timeout(
                 KUBE_API_TIMEOUT,
                 scoped.delete(name, &DeleteParams::default()),
@@ -2015,6 +2000,9 @@ impl KubernetesComputeDriver {
         let (ca_cert_pem, ca_key_pem) = generate_proxy_pod_ca()?;
         let placement = proxy_pod_placement_from_cr(obj);
         let spec_environment = proxy_pod_log_level_env_from_cr(obj);
+        // Derive the desired supervisor replica count from the CR's operating
+        // state so a missing Deployment is recreated with the right count.
+        let replicas = desired_supervisor_replicas(obj);
         let companions = build_proxy_pod_companions(
             &names,
             &params,
@@ -2022,13 +2010,26 @@ impl KubernetesComputeDriver {
             &spec_environment,
             &KubernetesPodDriverConfig::default(),
             &placement,
+            replicas,
             deployment_owner_ref,
             dependent_owner_ref,
             &ca_cert_pem,
             &ca_key_pem,
         );
         self.apply_proxy_pod_companions(&namespace, &companions)
-            .await
+            .await?;
+        // Reconcile replica drift on an already-existing Deployment (create is
+        // idempotent and does not touch it): a crash between the CR operating-
+        // state patch and the scale could otherwise leave a running workload
+        // with zero supervisors, or a stopped sandbox with a live one.
+        self.scale_proxy_pod_supervisor(
+            &cr_name,
+            &sandbox.id,
+            &namespace,
+            SupervisorTopology::ProxyPod,
+            replicas,
+        )
+        .await
     }
 
     /// Scale a sandbox's paired supervisor `Deployment`.
@@ -2307,19 +2308,13 @@ impl KubernetesComputeDriver {
             .await?;
         let selector = self.sandbox_lookup_selector(sandbox_id);
         let lp = ListParams::default().labels(&selector);
-        let (kube_name, obj_namespace, _workspace, preconditions, topology, pod_name, stop_timeout) =
+        let (kube_name, obj_namespace, _workspace, preconditions, topology, stop_timeout) =
             match tokio::time::timeout(KUBE_API_TIMEOUT, lookup_api.api.list(&lp)).await {
                 Ok(Ok(list)) => {
                     if let Some(obj) = list.items.into_iter().next() {
                         // Read fields that borrow the object before its `name` is moved.
                         let topology = topology_from_object(&obj, self.config.topology);
                         let stop_timeout = kubernetes_sandbox_stop_timeout(&obj);
-                        let pod_name = obj
-                            .metadata
-                            .annotations
-                            .as_ref()
-                            .and_then(|annotations| annotations.get(SANDBOX_POD_NAME_ANNOTATION))
-                            .cloned();
                         match obj.metadata.name {
                             Some(name) => {
                                 let ns = obj
@@ -2337,8 +2332,7 @@ impl KubernetesComputeDriver {
                                     uid: obj.metadata.uid,
                                     resource_version: obj.metadata.resource_version,
                                 };
-                                let pod_name = pod_name.unwrap_or_else(|| name.clone());
-                                (name, ns, ws, pc, topology, pod_name, stop_timeout)
+                                (name, ns, ws, pc, topology, stop_timeout)
                             }
                             None => return Ok(false),
                         }
@@ -2420,56 +2414,72 @@ impl KubernetesComputeDriver {
         // NetworkPolicy. A 409/404 (`Ok(false)`) means a successor owns the name,
         // so we must not touch its fence.
         if matches!(deleted, Ok(true)) && topology == SupervisorTopology::ProxyPod {
-            self.teardown_proxy_pod_fence(
-                &obj_namespace,
-                &kube_name,
-                sandbox_id,
-                &pod_name,
-                stop_timeout,
-            )
-            .await;
+            self.teardown_proxy_pod_fence(&obj_namespace, &kube_name, sandbox_id, stop_timeout)
+                .await;
         }
         deleted
     }
 
-    /// Delete a proxy-pod sandbox's egress `NetworkPolicy` once its workload pod
-    /// is gone, so the fence outlives a pod that ignores `SIGTERM`. Best-effort: any
-    /// leftover is reaped by [`Self::reconcile_proxy_pod_companions`] on restart.
+    /// Report whether the workload (agent) pod for a sandbox is absent.
+    ///
+    /// Identifies the pod by its immutable `sandbox-id` + `agent` role labels
+    /// (not by name, so it works from the delete, rollback, and reconciliation
+    /// paths alike). `Some(true)` means no such pod exists, `Some(false)` that
+    /// one is still present, and `None` that the check could not be performed —
+    /// callers must retain the egress fence on `None` rather than guess.
+    async fn workload_pod_absent(&self, namespace: &str, sandbox_id: &str) -> Option<bool> {
+        if sandbox_id.is_empty() {
+            return None;
+        }
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let selector =
+            format!("{LABEL_SANDBOX_ID}={sandbox_id},{LABEL_SANDBOX_ROLE}={SANDBOX_ROLE_AGENT}");
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            pods.list(&ListParams::default().labels(&selector)),
+        )
+        .await
+        {
+            Ok(Ok(list)) => Some(list.items.is_empty()),
+            Ok(Err(err)) => {
+                warn!(sandbox_id = %sandbox_id, error = %err, "Could not list workload pod");
+                None
+            }
+            Err(_elapsed) => {
+                warn!(sandbox_id = %sandbox_id, "Timed out listing workload pod");
+                None
+            }
+        }
+    }
+
+    /// Delete a proxy-pod sandbox's egress `NetworkPolicy`, but only once its
+    /// workload pod is confirmed gone, so the fence outlives a pod that ignores
+    /// `SIGTERM`. Waits up to `stop_timeout` for the pod to disappear and RETAINS
+    /// the fence if absence cannot be confirmed (leaving it for the reconciler to
+    /// reap once the pod is truly gone). Best-effort deletion.
     async fn teardown_proxy_pod_fence(
         &self,
         namespace: &str,
         cr_name: &str,
         sandbox_id: &str,
-        pod_name: &str,
         stop_timeout: Duration,
     ) {
-        let pod_api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         let deadline = tokio::time::Instant::now() + stop_timeout;
         let mut poll = STOP_INITIAL_POLL_INTERVAL;
         loop {
-            match kubernetes_sandbox_pod_is_gone(&pod_api, pod_name, deadline).await {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(err) => {
-                    // Could not confirm the pod is gone. Do NOT drop the fence on
-                    // a guess; leave it for reconciliation to reap once the CR is
-                    // confirmed gone.
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        pod = %pod_name,
-                        error = %err,
-                        "Could not confirm workload pod termination; leaving egress fence for reconciliation"
-                    );
+            match self.workload_pod_absent(namespace, sandbox_id).await {
+                Some(true) => break,
+                // Could not confirm, or pod still present: never drop the fence on
+                // a guess. Retain it; reconciliation reaps it once the pod is gone.
+                None => {
+                    warn!(sandbox_id = %sandbox_id, "Leaving egress fence: workload pod absence unconfirmed");
                     return;
                 }
+                Some(false) => {}
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    pod = %pod_name,
-                    "Workload pod still present at deadline; leaving egress fence for reconciliation"
-                );
+                warn!(sandbox_id = %sandbox_id, "Workload pod still present at deadline; leaving egress fence for reconciliation");
                 return;
             }
             tokio::time::sleep(poll.min(deadline.saturating_duration_since(now))).await;
@@ -2525,6 +2535,8 @@ impl KubernetesComputeDriver {
     async fn watch_sandboxes_single_namespace(&self) -> Result<WatchStream, String> {
         let namespace = self.config.namespace.clone();
         let topology = self.config.topology;
+        // Plain client for supervisor Deployment readiness checks inside the task.
+        let client = self.client.clone();
         let agent_sandbox_api = self
             .supported_agent_sandbox_api(self.watch_client.clone(), &self.config.namespace)
             .await?;
@@ -2542,7 +2554,7 @@ impl KubernetesComputeDriver {
                 tokio::select! {
                     result = sandbox_stream.try_next() => match result {
                         Ok(Some(Event::Applied(obj))) => {
-                            if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj, topology) {
+                            if let Ok((kube_name, sandbox)) = sandbox_from_object_with_supervisor_readiness(&client, &namespace, obj, topology).await {
                                 update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
                                 let event = WatchSandboxesEvent {
                                     payload: Some(watch_sandboxes_event::Payload::Sandbox(
@@ -2571,7 +2583,7 @@ impl KubernetesComputeDriver {
                         }
                         Ok(Some(Event::Restarted(objs))) => {
                             for obj in objs {
-                                if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj, topology) {
+                                if let Ok((kube_name, sandbox)) = sandbox_from_object_with_supervisor_readiness(&client, &namespace, obj, topology).await {
                                     update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
                                     let event = WatchSandboxesEvent {
                                         payload: Some(watch_sandboxes_event::Payload::Sandbox(
@@ -2637,6 +2649,8 @@ impl KubernetesComputeDriver {
 
     async fn watch_sandboxes_cluster_wide(&self) -> Result<WatchStream, String> {
         let topology = self.config.topology;
+        // Plain client for supervisor Deployment readiness checks inside the task.
+        let client = self.client.clone();
         let sandbox_api_version = self
             .supported_sandbox_api_version(self.watch_client.clone())
             .await?;
@@ -2655,7 +2669,7 @@ impl KubernetesComputeDriver {
                         Ok(Some(Event::Applied(obj))) => {
                             let ns = obj.metadata.namespace.clone()
                                 .unwrap_or_else(|| default_namespace.clone());
-                            if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj, topology) {
+                            if let Ok((_kube_name, sandbox)) = sandbox_from_object_with_supervisor_readiness(&client, &ns, obj, topology).await {
                                 let event = WatchSandboxesEvent {
                                     payload: Some(watch_sandboxes_event::Payload::Sandbox(
                                         WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
@@ -2684,7 +2698,7 @@ impl KubernetesComputeDriver {
                             for obj in objs {
                                 let ns = obj.metadata.namespace.clone()
                                     .unwrap_or_else(|| default_namespace.clone());
-                                if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj, topology) {
+                                if let Ok((_kube_name, sandbox)) = sandbox_from_object_with_supervisor_readiness(&client, &ns, obj, topology).await {
                                     let event = WatchSandboxesEvent {
                                         payload: Some(watch_sandboxes_event::Payload::Sandbox(
                                             WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
@@ -2911,9 +2925,23 @@ fn is_openshell_managed(obj: &DynamicObject) -> bool {
 /// Falls back to `fallback` (the gateway's current configured topology) for CRs
 /// created before this annotation existed, preserving their prior behavior.
 fn topology_from_object(obj: &DynamicObject, fallback: SupervisorTopology) -> SupervisorTopology {
-    annotation_or_label(obj, ANNOTATION_SUPERVISOR_TOPOLOGY)
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(fallback)
+    if let Some(topology) = annotation_or_label(obj, ANNOTATION_SUPERVISOR_TOPOLOGY)
+        .and_then(|value| value.parse::<SupervisorTopology>().ok())
+    {
+        return topology;
+    }
+    // No annotation: this CR predates the topology annotation, which every
+    // sandbox created by this code stamps — including all proxy-pod sandboxes.
+    // Such a CR therefore was NEVER proxy-pod, so it must not be classified as
+    // proxy-pod even when the gateway is now configured that way (which would
+    // wrongly report it sessionless and hunt for companions it never had).
+    // Combined and sidecar share the session model and have no companions, so
+    // collapsing an unknown fallback to combined is safe.
+    if fallback == SupervisorTopology::ProxyPod {
+        SupervisorTopology::Combined
+    } else {
+        fallback
+    }
 }
 
 /// Returns `(kube_resource_name, DriverSandbox)`.
@@ -5424,6 +5452,7 @@ fn build_proxy_pod_companions(
     spec_environment: &std::collections::HashMap<String, String>,
     pod_driver_config: &KubernetesPodDriverConfig,
     placement: &ProxyPodPlacement,
+    supervisor_replicas: u32,
     deployment_owner_ref: serde_json::Value,
     dependent_owner_ref: serde_json::Value,
     ca_cert_pem: &str,
@@ -5453,6 +5482,7 @@ fn build_proxy_pod_companions(
             params,
             pod_driver_config,
             placement,
+            supervisor_replicas,
             deployment_owner_ref,
         ),
     }
@@ -5467,6 +5497,67 @@ fn build_proxy_pod_companions(
 /// no Secret read permission (least privilege); the companion name is keyed on
 /// the immutable sandbox UUID, so a 409 already implies the object is this
 /// sandbox's own. Non-secret companions verify via a metadata GET.
+/// Create the agent egress fence, or validate an existing same-name policy.
+///
+/// The fence carries no owner reference, so ownership verification cannot vouch
+/// for it. On an `AlreadyExists` conflict, fetch the existing policy and confirm
+/// its enforcement fields (`spec`) and `sandbox-id` label match what we intended
+/// to create; fail closed on any mismatch so a stale or altered policy is never
+/// treated as a valid fence.
+async fn create_or_validate_egress_fence(
+    api: &Api<NetworkPolicy>,
+    expected: &NetworkPolicy,
+) -> Result<(), KubernetesDriverError> {
+    const DESC: &str = "proxy-pod agent egress NetworkPolicy";
+    match tokio::time::timeout(
+        KUBE_API_TIMEOUT,
+        api.create(&PostParams::default(), expected),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(KubeError::Api(err))) if err.code == 409 => {
+            let name = expected.metadata.name.clone().unwrap_or_default();
+            let existing = match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(&name)).await {
+                Ok(Ok(existing)) => existing,
+                // Vanished after the conflict; a later reconcile recreates it.
+                Ok(Err(KubeError::Api(err))) if err.code == 404 => return Ok(()),
+                Ok(Err(err)) => return Err(KubernetesDriverError::from_kube(err)),
+                Err(_elapsed) => {
+                    return Err(KubernetesDriverError::Message(format!(
+                        "timed out after {}s validating {DESC} {name}",
+                        KUBE_API_TIMEOUT.as_secs()
+                    )));
+                }
+            };
+            let expected_sandbox_id = expected
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(LABEL_SANDBOX_ID));
+            let existing_sandbox_id = existing
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(LABEL_SANDBOX_ID));
+            if existing.spec == expected.spec && existing_sandbox_id == expected_sandbox_id {
+                Ok(())
+            } else {
+                Err(KubernetesDriverError::Message(format!(
+                    "{DESC} {name} already exists but its enforcement does not match the intended \
+                     fence (selector, egress rules, or sandbox-id differ); refusing to treat it \
+                     as provisioned"
+                )))
+            }
+        }
+        Ok(Err(err)) => Err(KubernetesDriverError::from_kube(err)),
+        Err(_elapsed) => Err(KubernetesDriverError::Message(format!(
+            "timed out after {}s creating {DESC}",
+            KUBE_API_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
 async fn create_companion_if_absent<K>(
     api: &Api<K>,
     obj: &K,
@@ -5626,6 +5717,7 @@ fn proxy_pod_log_level_env_from_cr(
     env
 }
 
+#[allow(clippy::too_many_arguments)]
 fn proxy_pod_supervisor_deployment(
     names: &ProxyPodResourceNames,
     template_environment: &std::collections::HashMap<String, String>,
@@ -5633,6 +5725,7 @@ fn proxy_pod_supervisor_deployment(
     params: &SandboxPodParams<'_>,
     pod_config: &KubernetesPodDriverConfig,
     placement: &ProxyPodPlacement,
+    replicas: u32,
     owner_ref: serde_json::Value,
 ) -> Deployment {
     let mut container = serde_json::json!({
@@ -5818,7 +5911,7 @@ fn proxy_pod_supervisor_deployment(
             owner_ref
         ),
         "spec": {
-            "replicas": 1,
+            "replicas": replicas,
             "selector": {
                 "matchLabels": proxy_pod_match_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR)
             },
@@ -6274,6 +6367,97 @@ fn platform_config_struct(template: &SandboxTemplate, key: &str) -> Option<serde
 /// conditions below instead of waiting forever. The agent pod's
 /// `wait-for-proxy` init container is what makes that safe: the pod does not
 /// become Ready until its paired supervisor is accepting connections.
+/// Whether a proxy-pod sandbox's supervisor Deployment currently has no
+/// available replica. A missing Deployment counts as unavailable; a transient
+/// API error does not (returns `false`), so readiness never flaps on a blip.
+async fn proxy_pod_supervisor_unavailable(
+    client: &Client,
+    namespace: &str,
+    deployment_name: &str,
+) -> bool {
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    match tokio::time::timeout(KUBE_API_TIMEOUT, deployments.get_opt(deployment_name)).await {
+        Ok(Ok(Some(deployment))) => {
+            deployment
+                .status
+                .as_ref()
+                .and_then(|status| status.available_replicas)
+                .unwrap_or(0)
+                < 1
+        }
+        Ok(Ok(None)) => true,
+        Ok(Err(err)) => {
+            warn!(
+                deployment = %deployment_name,
+                error = %err,
+                "Could not determine proxy-pod supervisor availability; leaving readiness unchanged"
+            );
+            false
+        }
+        Err(_elapsed) => {
+            warn!(
+                deployment = %deployment_name,
+                "Timed out checking proxy-pod supervisor availability; leaving readiness unchanged"
+            );
+            false
+        }
+    }
+}
+
+/// Map a Sandbox CR to a `DriverSandbox`, folding proxy-pod supervisor
+/// availability into readiness. Used by the watch paths so a CR event never
+/// republishes a sandbox as `Ready` while its supervisor Deployment is down —
+/// matching what the get/list paths already report.
+async fn sandbox_from_object_with_supervisor_readiness(
+    client: &Client,
+    namespace: &str,
+    obj: DynamicObject,
+    fallback_topology: SupervisorTopology,
+) -> Result<(String, Sandbox), String> {
+    let cr_topology = topology_from_object(&obj, fallback_topology);
+    let cr_namespace = obj
+        .metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| namespace.to_string());
+    let cr_name = obj.metadata.name.clone().unwrap_or_default();
+    let sandbox_id = sandbox_id_from_object(&obj).unwrap_or_default();
+    let (kube_name, mut sandbox) = sandbox_from_object(namespace, obj, fallback_topology)?;
+    if cr_topology == SupervisorTopology::ProxyPod && !sandbox_id.is_empty() {
+        let names = proxy_pod_resource_names(&cr_name, &sandbox_id);
+        if proxy_pod_supervisor_unavailable(client, &cr_namespace, &names.supervisor_deployment)
+            .await
+        {
+            mark_supervisor_unavailable(&mut sandbox);
+        }
+    }
+    Ok((kube_name, sandbox))
+}
+
+/// Desired supervisor replica count from a Sandbox CR's operating state: `1`
+/// while running, `0` while suspended. Defaults to `1` (a freshly created CR is
+/// running) when no operating state is recorded. Lets reconciliation restore the
+/// correct replica count after a crash between the operating-state patch and the
+/// supervisor scale.
+fn desired_supervisor_replicas(obj: &DynamicObject) -> u32 {
+    let spec = obj.data.get("spec");
+    // v1beta1 encodes desired state as spec.operatingMode.
+    if let Some(mode) = spec
+        .and_then(|spec| spec.get("operatingMode"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return u32::from(!mode.eq_ignore_ascii_case("Suspended"));
+    }
+    // v1alpha1 encodes it as spec.replicas (0 or 1).
+    if let Some(replicas) = spec
+        .and_then(|spec| spec.get("replicas"))
+        .and_then(serde_json::Value::as_u64)
+    {
+        return u32::from(replicas > 0);
+    }
+    1
+}
+
 /// Force a proxy-pod sandbox's `Ready` condition to `False` because its
 /// supervisor Deployment has no available replica. The agent pod's own Ready
 /// condition (which the CR carries) cannot see the separate supervisor, so
@@ -8512,6 +8696,7 @@ mod tests {
             &params,
             &KubernetesPodDriverConfig::default(),
             &ProxyPodPlacement::default(),
+            1,
             owner_ref.clone(),
         ))
         .unwrap();
@@ -8702,6 +8887,7 @@ mod tests {
             &params,
             &pod_config,
             &ProxyPodPlacement::default(),
+            1,
             serde_json::json!({}),
         ))
         .unwrap();
@@ -8736,6 +8922,7 @@ mod tests {
             &params,
             &KubernetesPodDriverConfig::default(),
             &ProxyPodPlacement::default(),
+            1,
             serde_json::json!({}),
         ))
         .unwrap();
@@ -8838,6 +9025,7 @@ mod tests {
             &params,
             &KubernetesPodDriverConfig::default(),
             &placement,
+            1,
             serde_json::json!({}),
         ))
         .unwrap();
@@ -9093,10 +9281,48 @@ mod tests {
     #[test]
     fn topology_from_object_falls_back_without_annotation() {
         let obj = sandbox_object_with_conditions(&[("Ready", "True")]);
-        // A CR predating the annotation keeps the gateway's current topology.
+        // A CR predating the annotation keeps a non-proxy-pod fallback as-is.
         assert_eq!(
             topology_from_object(&obj, SupervisorTopology::Sidecar),
             SupervisorTopology::Sidecar
+        );
+    }
+
+    #[test]
+    fn desired_supervisor_replicas_follows_operating_state() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut running = DynamicObject::new("s", &resource);
+        running.data = serde_json::json!({"spec": {"operatingMode": "Running"}});
+        assert_eq!(desired_supervisor_replicas(&running), 1);
+
+        let mut suspended = DynamicObject::new("s", &resource);
+        suspended.data = serde_json::json!({"spec": {"operatingMode": "Suspended"}});
+        assert_eq!(desired_supervisor_replicas(&suspended), 0);
+
+        // v1alpha1 encodes it as spec.replicas.
+        let mut alpha_stopped = DynamicObject::new("s", &resource);
+        alpha_stopped.data = serde_json::json!({"spec": {"replicas": 0}});
+        assert_eq!(desired_supervisor_replicas(&alpha_stopped), 0);
+
+        // No operating state recorded defaults to running.
+        let bare = DynamicObject::new("s", &resource);
+        assert_eq!(desired_supervisor_replicas(&bare), 1);
+    }
+
+    #[test]
+    fn topology_from_object_never_falls_back_to_proxy_pod() {
+        // An un-annotated CR was created before this branch, so it was never
+        // proxy-pod. Even when the gateway is now configured proxy-pod, it must
+        // not be misclassified as such (which would report it sessionless and
+        // hunt for companions it never had).
+        let obj = sandbox_object_with_conditions(&[("Ready", "True")]);
+        assert_eq!(
+            topology_from_object(&obj, SupervisorTopology::ProxyPod),
+            SupervisorTopology::Combined
         );
     }
 
