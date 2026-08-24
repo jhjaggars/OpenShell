@@ -1566,9 +1566,12 @@ impl KubernetesComputeDriver {
             );
             // Delete the CR we actually created, addressed by its returned name
             // (the workspace-scoped CR name, not the bare sandbox name) and
-            // guarded by its UID so we never remove a same-named successor. This
-            // tears down the workload before we drop its egress fence below, so a
-            // still-running workload is never left unfenced.
+            // guarded by its UID so we never remove a same-named successor.
+            // Every companion is owner-referenced to this CR, so deleting the CR
+            // lets Kubernetes garbage-collect whichever companions were created
+            // before the failure — including the egress NetworkPolicy, which GC
+            // removes as part of the CR teardown rather than while the workload
+            // pod may still be running.
             let created_name = created.metadata.name.as_deref().unwrap_or(params.cr_name);
             let mut delete_params = DeleteParams::default();
             if let Some(uid) = created.metadata.uid.clone() {
@@ -1582,8 +1585,6 @@ impl KubernetesComputeDriver {
                 agent_sandbox_api.api.delete(created_name, &delete_params),
             )
             .await;
-            self.cleanup_proxy_pod_resources(params.cr_name, params.namespace)
-                .await;
             return Err(err);
         }
 
@@ -1784,43 +1785,6 @@ impl KubernetesComputeDriver {
                 names.supervisor_deployment
             ))),
         }
-    }
-
-    async fn cleanup_proxy_pod_resources(&self, sandbox_name: &str, namespace: &str) {
-        let names = proxy_pod_resource_names(sandbox_name);
-        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
-        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
-        let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
-        let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
-
-        let _ = tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            deployments.delete(&names.supervisor_deployment, &DeleteParams::default()),
-        )
-        .await;
-        let _ = tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            policies.delete(
-                &names.supervisor_ingress_network_policy,
-                &DeleteParams::default(),
-            ),
-        )
-        .await;
-        let _ = tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            policies.delete(&names.agent_egress_network_policy, &DeleteParams::default()),
-        )
-        .await;
-        let _ = tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            services.delete(&names.service, &DeleteParams::default()),
-        )
-        .await;
-        let _ = tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            secrets.delete(&names.proxy_ca_secret, &DeleteParams::default()),
-        )
-        .await;
     }
 
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
@@ -2041,76 +2005,75 @@ impl KubernetesComputeDriver {
             .await?;
         let selector = self.sandbox_lookup_selector(sandbox_id);
         let lp = ListParams::default().labels(&selector);
-        let (kube_name, obj_namespace, _workspace, preconditions, topology) =
-            match tokio::time::timeout(KUBE_API_TIMEOUT, lookup_api.api.list(&lp)).await {
-                Ok(Ok(list)) => {
-                    if let Some(obj) = list.items.into_iter().next() {
-                        // Read topology before moving `metadata.name` out below.
-                        let topology = topology_from_object(&obj, self.config.topology);
-                        match obj.metadata.name {
-                            Some(name) => {
-                                let ns = obj
-                                    .metadata
-                                    .namespace
-                                    .clone()
-                                    .unwrap_or_else(|| self.config.namespace.clone());
-                                let ws = obj
-                                    .metadata
-                                    .labels
-                                    .as_ref()
-                                    .and_then(|l| l.get(LABEL_SANDBOX_WORKSPACE).cloned())
-                                    .unwrap_or_default();
-                                let pc = Preconditions {
-                                    uid: obj.metadata.uid,
-                                    resource_version: obj.metadata.resource_version,
-                                };
-                                (name, ns, ws, pc, topology)
-                            }
-                            None => return Ok(false),
+        let (kube_name, obj_namespace, _workspace, preconditions) = match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            lookup_api.api.list(&lp),
+        )
+        .await
+        {
+            Ok(Ok(list)) => {
+                if let Some(obj) = list.items.into_iter().next() {
+                    match obj.metadata.name {
+                        Some(name) => {
+                            let ns = obj
+                                .metadata
+                                .namespace
+                                .clone()
+                                .unwrap_or_else(|| self.config.namespace.clone());
+                            let ws = obj
+                                .metadata
+                                .labels
+                                .as_ref()
+                                .and_then(|l| l.get(LABEL_SANDBOX_WORKSPACE).cloned())
+                                .unwrap_or_default();
+                            let pc = Preconditions {
+                                uid: obj.metadata.uid,
+                                resource_version: obj.metadata.resource_version,
+                            };
+                            (name, ns, ws, pc)
                         }
-                    } else {
-                        debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted)");
-                        return Ok(false);
+                        None => return Ok(false),
                     }
+                } else {
+                    debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes (already deleted)");
+                    return Ok(false);
                 }
-                Ok(Err(err)) => {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        error = %err,
-                        "Failed to list sandbox for deletion from Kubernetes"
-                    );
-                    return Err(err.to_string());
-                }
-                Err(_elapsed) => {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        timeout_secs = KUBE_API_TIMEOUT.as_secs(),
-                        "Timed out listing sandbox for deletion from Kubernetes"
-                    );
-                    return Err(format!(
-                        "timed out after {}s waiting for Kubernetes API",
-                        KUBE_API_TIMEOUT.as_secs()
-                    ));
-                }
-            };
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "Failed to list sandbox for deletion from Kubernetes"
+                );
+                return Err(err.to_string());
+            }
+            Err(_elapsed) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                    "Timed out listing sandbox for deletion from Kubernetes"
+                );
+                return Err(format!(
+                    "timed out after {}s waiting for Kubernetes API",
+                    KUBE_API_TIMEOUT.as_secs()
+                ));
+            }
+        };
 
         let delete_api = self
             .supported_agent_sandbox_api(self.client.clone(), &obj_namespace)
             .await?;
         let dp = DeleteParams::default().preconditions(preconditions);
-        // Delete the Sandbox CR (which tears down the workload pod) BEFORE
-        // removing the proxy-pod companion resources. The agent egress
-        // NetworkPolicy is the egress fence; removing it while the workload is
-        // still running would open unrestricted egress, and if the CR delete
-        // failed the exposure would persist. Companions are owner-referenced to
-        // the CR, so this ordering also matches Kubernetes garbage collection;
-        // the explicit cleanup below only accelerates it.
-        let deleted = match tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            delete_api.api.delete(&kube_name, &dp),
-        )
-        .await
-        {
+        // Delete only the Sandbox CR. Every proxy-pod companion — including the
+        // agent egress NetworkPolicy that fences the workload — is
+        // owner-referenced to this CR, so Kubernetes garbage collection removes
+        // them as part of the CR teardown. Deleting the fence eagerly here would
+        // race the workload pod's termination grace period and could reopen
+        // unrestricted egress while the pod is still running; letting GC tie
+        // companion removal to the CR's own deletion lifecycle avoids that. The
+        // UID precondition also means a 409 (replacement) or 404 leaves the
+        // successor's companions untouched.
+        match tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.delete(&kube_name, &dp)).await {
             Ok(Ok(_response)) => {
                 info!(sandbox_id = %sandbox_id, namespace = %obj_namespace, "Sandbox deleted from Kubernetes");
                 Ok(true)
@@ -2138,19 +2101,7 @@ impl KubernetesComputeDriver {
                     KUBE_API_TIMEOUT.as_secs()
                 ))
             }
-        };
-
-        // Only remove the egress fence once THIS CR was confirmed deleted. A 409
-        // (UID/resource-version precondition conflict) means the CR was replaced
-        // by a same-named successor whose companions we must not touch, and a 404
-        // means it is already gone; both return `Ok(false)`. Cleaning up on
-        // either would strip a live replacement's egress fence, Deployment,
-        // Secret, and Service.
-        if matches!(deleted, Ok(true)) && topology == SupervisorTopology::ProxyPod {
-            self.cleanup_proxy_pod_resources(&kube_name, &obj_namespace)
-                .await;
         }
-        deleted
     }
 
     pub async fn sandbox_exists(&self, sandbox_id: &str) -> Result<bool, String> {
@@ -3150,7 +3101,12 @@ fn dns_label_name(prefix: &str, name: &str) -> String {
 }
 
 fn proxy_pod_service_dns(service_name: &str, namespace: &str) -> String {
-    format!("{service_name}.{namespace}.svc.cluster.local")
+    // Search-domain-relative rather than a hardcoded `.svc.cluster.local` FQDN:
+    // clusters can run a custom cluster domain, and the pod resolver's search
+    // list (`<ns>.svc.<domain>`, `svc.<domain>`, `<domain>`) resolves this form
+    // on any domain. Hardcoding `cluster.local` would leave the workload's
+    // wait-for-proxy init container unable to resolve its supervisor there.
+    format!("{service_name}.{namespace}.svc")
 }
 
 fn proxy_pod_proxy_url(service_dns: &str) -> String {

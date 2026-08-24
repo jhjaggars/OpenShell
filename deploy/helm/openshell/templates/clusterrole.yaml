@@ -164,26 +164,30 @@ rules:
       - create
       - delete
       - get
-      - list
       - patch
-      - watch
   - apiGroups:
       - apps
     resources:
       - replicasets
     verbs:
       - get
+  # Services are addressed by name for create/delete only.
   - apiGroups:
       - ""
     resources:
       - services
+    verbs:
+      - create
+      - delete
+  # The generated CA Secret is only created and deleted by name; the gateway
+  # never reads Secrets, so it must not hold cluster-wide Secret read access.
+  - apiGroups:
+      - ""
+    resources:
       - secrets
     verbs:
       - create
       - delete
-      - get
-      - list
-      - watch
   - apiGroups:
       - networking.k8s.io
     resources:
@@ -191,7 +195,4 @@ rules:
     verbs:
       - create
       - delete
-      - get
-      - list
-      - watch
   {{- end }}
