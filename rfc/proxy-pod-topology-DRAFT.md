@@ -659,7 +659,29 @@ pods run, the supervisor is ready, sandboxes report available. There is no
 in-band signal. Mitigation should be active rather than documentary: a startup
 probe that verifies a denied egress path is actually denied, failing the sandbox
 if the fence is not real. Documentation alone is insufficient for a control
-whose failure mode is invisible.
+whose failure mode is invisible. This active negative-egress probe (and the
+CI coverage on a policy-enforcing CNI that would exercise it) is still
+outstanding and tracked as follow-up.
+
+**Supervisor liveness after startup.** A related but distinct failure: the
+supervisor Deployment becoming unavailable *after* the sandbox reaches Ready.
+The workload's `wait-for-proxy` init container only gates startup, and the agent
+pod's own Ready condition cannot see the separate supervisor. This is now
+mitigated: the driver folds supervisor Deployment availability into sandbox
+status, so a sandbox whose supervisor has no available replica falls back to
+`Provisioning` (Ready condition `False`, transient reason
+`DependenciesNotReady`) rather than staying Ready with a dead egress path, and
+recovers to `Ready` once the supervisor Deployment is available again.
+
+**Confused-deputy via image-baked launch environment.** In `combined` topology
+the supervisor shares the workload's container and inherits the workload image's
+environment. Honoring image-baked `OPENSHELL_PROXY_BIND_ADDR` or
+`OPENSHELL_PROXY_CA_*` there would let an untrusted image publish the
+credential-bearing policy proxy on the pod network or substitute an attacker CA.
+This is now mitigated: those launch variables are honored only by a standalone
+network supervisor (`proxy-pod`/`sidecar`, which runs the trusted supervisor
+image in a separate container); a combined supervisor ignores them, binding to
+the namespace-scoped veth IP and generating an ephemeral CA.
 
 **Feature-set surprise.** An operator selecting `proxy-pod` for its security
 properties may not anticipate that `openshell sandbox exec` and `connect` simply

@@ -533,6 +533,17 @@ If the agent cannot reach the gateway, check DNS to the headless Service, the
 agent egress NetworkPolicy DNS exception for kube-dns/CoreDNS, and the
 supervisor ingress NetworkPolicy allowing only that agent pod on port `3128`.
 
+A proxy-pod sandbox falls back to `Provisioning` (Ready condition `False`,
+reason `DependenciesNotReady`) when its supervisor Deployment has no available
+replica: the gateway folds supervisor Deployment availability into sandbox
+status so a sandbox never stays Ready while its policy-enforced egress path is
+down, and recovers to `Ready` once the supervisor does. If a previously-Ready
+sandbox drops to `Provisioning`, inspect the supervisor Deployment (`kubectl -n
+<sandbox-namespace> get deploy <os-sup-...>`) and its pod. Companion resource names are keyed on the
+immutable sandbox UUID, so the `os-sup-`/`os-svc-`/`os-ca-`/`os-eg-`/`os-ing-`
+suffix is stable per sandbox instance and distinct across instances even when
+sandbox names repeat.
+
 Inspect the relevant containers when sandbox registration or egress enforcement
 fails:
 

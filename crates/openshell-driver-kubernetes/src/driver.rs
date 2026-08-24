@@ -1265,22 +1265,34 @@ impl KubernetesComputeDriver {
         let selector = self.sandbox_lookup_selector(sandbox_id);
         let lp = ListParams::default().labels(&selector);
         match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.list(&lp)).await {
-            Ok(Ok(list)) => list.items.into_iter().next().map_or_else(
-                || {
+            Ok(Ok(list)) => {
+                let Some(obj) = list.items.into_iter().next() else {
                     debug!(sandbox_id = %sandbox_id, "Sandbox not found in Kubernetes");
-                    Ok(None)
-                },
-                |obj| {
-                    let ns = obj
-                        .metadata
-                        .namespace
-                        .clone()
-                        .unwrap_or_else(|| self.config.namespace.clone());
-                    Ok(sandbox_from_object(&ns, obj, self.config.topology)
-                        .ok()
-                        .map(|(_, s)| s))
-                },
-            ),
+                    return Ok(None);
+                };
+                let ns = obj
+                    .metadata
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| self.config.namespace.clone());
+                // Capture identity before `sandbox_from_object` consumes the object.
+                let cr_topology = topology_from_object(&obj, self.config.topology);
+                let cr_name = obj.metadata.name.clone().unwrap_or_default();
+                let cr_sandbox_id = sandbox_id_from_object(&obj).unwrap_or_default();
+                let Ok((_, mut sandbox)) = sandbox_from_object(&ns, obj, self.config.topology)
+                else {
+                    return Ok(None);
+                };
+                self.apply_proxy_pod_supervisor_readiness(
+                    &mut sandbox,
+                    cr_topology,
+                    &cr_name,
+                    &cr_sandbox_id,
+                    &ns,
+                )
+                .await;
+                Ok(Some(sandbox))
+            }
             Ok(Err(err)) => {
                 warn!(
                     sandbox_id = %sandbox_id,
@@ -1322,25 +1334,41 @@ impl KubernetesComputeDriver {
         .await
         {
             Ok(Ok(list)) => {
-                let mut sandboxes: Vec<Sandbox> = list
-                    .items
-                    .into_iter()
-                    .filter_map(|obj| {
-                        let name = obj.metadata.name.clone().unwrap_or_default();
-                        let ns = obj
-                            .metadata
-                            .namespace
-                            .clone()
-                            .unwrap_or_else(|| self.config.namespace.clone());
-                        match sandbox_from_object(&ns, obj, self.config.topology) {
-                            Ok((_, s)) => Some(s),
-                            Err(err) => {
-                                warn!(object_name = %name, error = %err, "skipping unrecognized Sandbox in list");
-                                None
-                            }
+                let mut sandboxes: Vec<Sandbox> = Vec::with_capacity(list.items.len());
+                for obj in list.items {
+                    let name = obj.metadata.name.clone().unwrap_or_default();
+                    let ns = obj
+                        .metadata
+                        .namespace
+                        .clone()
+                        .unwrap_or_else(|| self.config.namespace.clone());
+                    // Capture identity before `sandbox_from_object` consumes the
+                    // object so a proxy-pod sandbox's readiness can be checked
+                    // against its live supervisor Deployment.
+                    let cr_topology = topology_from_object(&obj, self.config.topology);
+                    let cr_name = obj.metadata.name.clone().unwrap_or_default();
+                    let sandbox_id = sandbox_id_from_object(&obj).unwrap_or_default();
+                    match sandbox_from_object(&ns, obj, self.config.topology) {
+                        Ok((_, mut sandbox)) => {
+                            // The agent pod's Ready condition does not reflect the
+                            // separate supervisor Deployment. Without this, a
+                            // sandbox whose supervisor died after startup would
+                            // stay Ready while policy-enforced egress is dead.
+                            self.apply_proxy_pod_supervisor_readiness(
+                                &mut sandbox,
+                                cr_topology,
+                                &cr_name,
+                                &sandbox_id,
+                                &ns,
+                            )
+                            .await;
+                            sandboxes.push(sandbox);
                         }
-                    })
-                    .collect();
+                        Err(err) => {
+                            warn!(object_name = %name, error = %err, "skipping unrecognized Sandbox in list");
+                        }
+                    }
+                }
                 sandboxes.sort_by(|left, right| {
                     left.name
                         .cmp(&right.name)
@@ -1629,7 +1657,7 @@ impl KubernetesComputeDriver {
             .name
             .as_deref()
             .unwrap_or(sandbox.name.as_str());
-        let names = proxy_pod_resource_names(cr_name);
+        let names = proxy_pod_resource_names(cr_name, &sandbox.id);
         let template_environment = spec
             .and_then(|spec| spec.template.as_ref())
             .map(|template| template.environment.clone())
@@ -1715,6 +1743,67 @@ impl KubernetesComputeDriver {
         )
         .await?;
         Ok(())
+    }
+
+    /// Downgrade a proxy-pod sandbox's readiness to `NotReady` when its
+    /// supervisor Deployment has no available replica. Shared by `get_sandbox`
+    /// and `list_sandboxes` so both the reconcile loop's status refresh and
+    /// direct queries reflect supervisor liveness. A no-op for other topologies.
+    async fn apply_proxy_pod_supervisor_readiness(
+        &self,
+        sandbox: &mut Sandbox,
+        topology: SupervisorTopology,
+        cr_name: &str,
+        sandbox_id: &str,
+        namespace: &str,
+    ) {
+        if topology != SupervisorTopology::ProxyPod || sandbox_id.is_empty() {
+            return;
+        }
+        let names = proxy_pod_resource_names(cr_name, sandbox_id);
+        if self
+            .proxy_pod_supervisor_unavailable(namespace, &names.supervisor_deployment)
+            .await
+        {
+            mark_supervisor_unavailable(sandbox);
+        }
+    }
+
+    /// Report whether a proxy-pod sandbox's supervisor Deployment currently has
+    /// no available replica. A missing Deployment counts as unavailable; a
+    /// transient API error does not, so readiness never flaps on an API blip.
+    async fn proxy_pod_supervisor_unavailable(
+        &self,
+        namespace: &str,
+        deployment_name: &str,
+    ) -> bool {
+        let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+        match tokio::time::timeout(KUBE_API_TIMEOUT, deployments.get_opt(deployment_name)).await {
+            Ok(Ok(Some(deployment))) => {
+                let available = deployment
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.available_replicas)
+                    .unwrap_or(0);
+                available < 1
+            }
+            Ok(Ok(None)) => true,
+            Ok(Err(err)) => {
+                warn!(
+                    deployment = %deployment_name,
+                    error = %err,
+                    "Could not determine proxy-pod supervisor availability; leaving readiness unchanged"
+                );
+                false
+            }
+            Err(_elapsed) => {
+                warn!(
+                    deployment = %deployment_name,
+                    "Timed out checking proxy-pod supervisor availability; leaving readiness unchanged"
+                );
+                false
+            }
+        }
     }
 
     /// Repair proxy-pod companions for every existing Sandbox CR. A gateway
@@ -1808,11 +1897,16 @@ impl KubernetesComputeDriver {
             status: None,
             workspace: annotation_or_label(obj, LABEL_SANDBOX_WORKSPACE).unwrap_or_default(),
         };
+        if sandbox.id.is_empty() {
+            return Err(KubernetesDriverError::Message(format!(
+                "sandbox CR {cr_name} has no sandbox id; cannot derive companion names"
+            )));
+        }
         let (sandbox_uid, sandbox_gid, _annotations) =
             self.resolve_sandbox_identity_in_namespace(&namespace).await;
         let params =
             self.build_sandbox_pod_params(&sandbox, &namespace, &cr_name, sandbox_uid, sandbox_gid);
-        let names = proxy_pod_resource_names(&cr_name);
+        let names = proxy_pod_resource_names(&cr_name, &sandbox.id);
         let deployment_owner_ref = proxy_pod_owner_reference(obj, sandbox_api_version, true)?;
         let dependent_owner_ref = proxy_pod_owner_reference(obj, sandbox_api_version, false)?;
         // A fresh CA is generated but only used if the Secret is missing;
@@ -1849,12 +1943,13 @@ impl KubernetesComputeDriver {
     /// start/stop RPC.
     /// Scale a proxy-pod sandbox's supervisor Deployment.
     ///
-    /// `cr_name` is the Sandbox CR resource name, which is unique per sandbox in
-    /// every workspace mode (shared prefixes it with the workspace); the bare
-    /// sandbox name is not. `namespace` is the sandbox's resolved namespace.
+    /// `cr_name` is the Sandbox CR resource name (cosmetic in the companion
+    /// names); `sandbox_id` is the immutable UUID the companion names are keyed
+    /// on. `namespace` is the sandbox's resolved namespace.
     async fn scale_proxy_pod_supervisor(
         &self,
         cr_name: &str,
+        sandbox_id: &str,
         namespace: &str,
         topology: SupervisorTopology,
         replicas: u32,
@@ -1862,7 +1957,7 @@ impl KubernetesComputeDriver {
         if topology != SupervisorTopology::ProxyPod {
             return Ok(());
         }
-        let names = proxy_pod_resource_names(cr_name);
+        let names = proxy_pod_resource_names(cr_name, sandbox_id);
         let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
         let patch = serde_json::json!({"spec": {"replicas": replicas}});
         match tokio::time::timeout(
@@ -1913,7 +2008,7 @@ impl KubernetesComputeDriver {
         // stop. A later start or delete reconciles the replica count.
         if stopped.is_ok()
             && let Err(err) = self
-                .scale_proxy_pod_supervisor(&kube_name, &namespace, topology, 0)
+                .scale_proxy_pod_supervisor(&kube_name, sandbox_id, &namespace, topology, 0)
                 .await
         {
             warn!(
@@ -1991,7 +2086,7 @@ impl KubernetesComputeDriver {
         // Propagate scale-up failure: the agent pod cannot itself retry a
         // Deployment scale, so a swallowed error would wedge the sandbox in
         // Starting with a supervisor stuck at zero replicas.
-        self.scale_proxy_pod_supervisor(&kube_name, &namespace, topology, 1)
+        self.scale_proxy_pod_supervisor(&kube_name, sandbox_id, &namespace, topology, 1)
             .await?;
         Ok(())
     }
@@ -3023,7 +3118,7 @@ fn apply_supervisor_sideload_with_params(
             "--workdir".to_string(),
             driver_mounts::DEFAULT_WORKSPACE_ROOT.to_string(),
         ];
-        command.extend(upstream_proxy_cli_args(params));
+        command.extend(upstream_proxy_cli_args(params, true));
         container.insert("command".to_string(), serde_json::json!(command));
 
         // Force the supervisor to run as root (UID 0). Sandbox images may set
@@ -3090,7 +3185,18 @@ fn apply_supervisor_sideload(
     apply_supervisor_sideload_with_params(pod_template, &params);
 }
 
-fn upstream_proxy_cli_args(params: &SandboxPodParams<'_>) -> Vec<String> {
+/// Build the `--upstream-proxy*` CLI arguments for a network supervisor.
+///
+/// `include_credentials` gates the arguments that depend on the mounted proxy
+/// credential file. Sidecar topology mounts that Secret and passes `true`;
+/// proxy-pod topology does not mount it (yet) and passes `false`, so it still
+/// routes egress through the operator's corporate proxy (URL, `no_proxy`, CONNECT
+/// mode) without referencing an auth file that would not exist in the
+/// supervisor pod.
+fn upstream_proxy_cli_args(
+    params: &SandboxPodParams<'_>,
+    include_credentials: bool,
+) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(url) = params.https_proxy {
         args.extend(["--upstream-proxy".to_string(), url.to_string()]);
@@ -3098,14 +3204,14 @@ fn upstream_proxy_cli_args(params: &SandboxPodParams<'_>) -> Vec<String> {
     if let Some(list) = params.no_proxy {
         args.extend(["--upstream-no-proxy".to_string(), list.to_string()]);
     }
-    if has_upstream_proxy_credentials(params) {
+    if include_credentials && has_upstream_proxy_credentials(params) {
         args.extend([
             "--upstream-proxy-auth-file".to_string(),
             openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH.to_string(),
         ]);
-    }
-    if params.proxy_auth_allow_insecure {
-        args.push("--upstream-proxy-auth-allow-insecure".to_string());
+        if params.proxy_auth_allow_insecure {
+            args.push("--upstream-proxy-auth-allow-insecure".to_string());
+        }
     }
     if params.proxy_connect_by_hostname {
         args.push("--upstream-proxy-connect-by-hostname".to_string());
@@ -3162,25 +3268,42 @@ struct ProxyPodResourceNames {
     supervisor_ingress_network_policy: String,
 }
 
-fn proxy_pod_resource_names(sandbox_name: &str) -> ProxyPodResourceNames {
+/// Derive the companion resource names for a sandbox.
+///
+/// `cr_name` is cosmetic (readability in `kubectl get`); uniqueness comes from
+/// `sandbox_id`, the immutable per-instance UUID. Keying the suffix on the UUID
+/// (not the truncatable CR name) means two distinct sandbox instances never
+/// collide, and a new sandbox that reuses a name while an old instance's
+/// dependents are still being garbage-collected gets its own distinct names
+/// rather than binding to the stale objects.
+fn proxy_pod_resource_names(cr_name: &str, sandbox_id: &str) -> ProxyPodResourceNames {
     ProxyPodResourceNames {
-        supervisor_deployment: dns_label_name("os-sup", sandbox_name),
-        service: dns_label_name("os-svc", sandbox_name),
-        proxy_ca_secret: dns_label_name("os-ca", sandbox_name),
-        agent_egress_network_policy: dns_label_name("os-eg", sandbox_name),
-        supervisor_ingress_network_policy: dns_label_name("os-ing", sandbox_name),
+        supervisor_deployment: dns_label_name("os-sup", cr_name, sandbox_id),
+        service: dns_label_name("os-svc", cr_name, sandbox_id),
+        proxy_ca_secret: dns_label_name("os-ca", cr_name, sandbox_id),
+        agent_egress_network_policy: dns_label_name("os-eg", cr_name, sandbox_id),
+        supervisor_ingress_network_policy: dns_label_name("os-ing", cr_name, sandbox_id),
     }
 }
 
-fn dns_label_name(prefix: &str, name: &str) -> String {
+fn dns_label_name(prefix: &str, readable: &str, unique_key: &str) -> String {
+    // FNV-1a over the immutable unique key (sandbox UUID) rather than the
+    // readable name. A 64-bit suffix makes collisions between distinct sandbox
+    // instances negligible, where the previous 32-bit hash of a truncatable
+    // name had a deterministic collision path. Fall back to the readable name
+    // only when no unique key is available.
+    let key = if unique_key.is_empty() {
+        readable
+    } else {
+        unique_key
+    };
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in name.as_bytes() {
+    for byte in key.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    let suffix_hash = hash & 0xffff_ffff;
-    let suffix = format!("{suffix_hash:08x}");
-    let mut sanitized = name
+    let suffix = format!("{hash:016x}");
+    let mut sanitized = readable
         .chars()
         .map(|c| {
             let c = c.to_ascii_lowercase();
@@ -3364,7 +3487,7 @@ fn supervisor_sidecar_container(
         .as_array_mut()
         .expect("network supervisor command is an array")
         .extend(
-            upstream_proxy_cli_args(params)
+            upstream_proxy_cli_args(params, true)
                 .into_iter()
                 .map(serde_json::Value::String),
         );
@@ -3787,7 +3910,7 @@ fn apply_supervisor_proxy_pod_topology(
 
     apply_proxy_pod_affinity(spec, params.sandbox_id, params.proxy_pod_affinity);
 
-    let names = proxy_pod_resource_names(params.cr_name);
+    let names = proxy_pod_resource_names(params.cr_name, params.sandbox_id);
     let service_dns = proxy_pod_service_dns(&names.service, params.namespace);
 
     let volumes = spec
@@ -5152,10 +5275,68 @@ where
 {
     match tokio::time::timeout(KUBE_API_TIMEOUT, api.create(&PostParams::default(), obj)).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(KubeError::Api(err))) if err.code == 409 => Ok(()),
+        Ok(Err(KubeError::Api(err))) if err.code == 409 => {
+            verify_companion_ownership(api, obj, description).await
+        }
         Ok(Err(err)) => Err(KubernetesDriverError::from_kube(err)),
         Err(_elapsed) => Err(KubernetesDriverError::Message(format!(
             "timed out after {}s creating {description}",
+            KUBE_API_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+/// On an `AlreadyExists` conflict, confirm the existing object belongs to the
+/// same sandbox instance before treating the create as idempotent. A companion
+/// is owner-referenced to its Sandbox CR, whose UID is per-instance, so an
+/// object owned by a different CR UID is a stale leftover from a prior instance
+/// (or an unrelated object). Adopting it would give the new sandbox a
+/// mis-selecting egress policy or an unreachable supervisor, so we fail closed.
+async fn verify_companion_ownership<K>(
+    api: &Api<K>,
+    obj: &K,
+    description: &str,
+) -> Result<(), KubernetesDriverError>
+where
+    K: kube::Resource + Clone + std::fmt::Debug + serde::Serialize + DeserializeOwned + Sync,
+    <K as kube::Resource>::DynamicType: Default,
+{
+    let name = obj.meta().name.clone().unwrap_or_default();
+    let expected_uids: HashSet<&str> = obj
+        .meta()
+        .owner_references
+        .iter()
+        .flatten()
+        .map(|owner| owner.uid.as_str())
+        .collect();
+    // Without an owner reference to compare against we cannot prove identity;
+    // there is nothing to verify, so accept (companions always carry one).
+    if expected_uids.is_empty() {
+        return Ok(());
+    }
+    match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(&name)).await {
+        Ok(Ok(existing)) => {
+            let same_instance = existing
+                .meta()
+                .owner_references
+                .iter()
+                .flatten()
+                .any(|owner| expected_uids.contains(owner.uid.as_str()));
+            if same_instance {
+                Ok(())
+            } else {
+                Err(KubernetesDriverError::Message(format!(
+                    "{description} {name} already exists but is owned by a different sandbox \
+                     instance; refusing to adopt a stale companion"
+                )))
+            }
+        }
+        // Raced with garbage collection: the conflicting object is already gone,
+        // so a later reconcile pass will recreate it cleanly.
+        Ok(Err(KubeError::Api(err))) if err.code == 404 => Ok(()),
+        Ok(Err(err)) => Err(KubernetesDriverError::from_kube(err)),
+        Err(_elapsed) => Err(KubernetesDriverError::Message(format!(
+            "timed out after {}s verifying ownership of {description} {name}",
             KUBE_API_TIMEOUT.as_secs()
         ))),
     }
@@ -5274,6 +5455,17 @@ fn proxy_pod_supervisor_deployment(
             proxy_pod_ca_tls_volume_mount(false),
         ]
     });
+    // Route egress through the operator's corporate upstream proxy, matching
+    // sidecar topology. Credentials are excluded because the proxy-pod
+    // supervisor does not mount the auth Secret.
+    container["command"]
+        .as_array_mut()
+        .expect("network supervisor command is an array")
+        .extend(
+            upstream_proxy_cli_args(params, false)
+                .into_iter()
+                .map(serde_json::Value::String),
+        );
     if !params.supervisor_image_pull_policy.is_empty() {
         container["imagePullPolicy"] = serde_json::json!(params.supervisor_image_pull_policy);
     }
@@ -5857,6 +6049,39 @@ fn platform_config_struct(template: &SandboxTemplate, key: &str) -> Option<serde
 /// conditions below instead of waiting forever. The agent pod's
 /// `wait-for-proxy` init container is what makes that safe: the pod does not
 /// become Ready until its paired supervisor is accepting connections.
+/// Force a proxy-pod sandbox's `Ready` condition to `False` because its
+/// supervisor Deployment has no available replica. The agent pod's own Ready
+/// condition (which the CR carries) cannot see the separate supervisor, so
+/// without this the sandbox would report Ready while policy-enforced egress is
+/// dead.
+fn mark_supervisor_unavailable(sandbox: &mut Sandbox) {
+    // `DependenciesNotReady` is on the gateway's transient-reason allowlist, so
+    // the sandbox becomes `Provisioning` (recoverable) rather than terminal
+    // `Error`: readiness returns to `Ready` once the supervisor Deployment does.
+    const REASON: &str = "DependenciesNotReady";
+    const MESSAGE: &str = "proxy-pod network supervisor Deployment has no available replica";
+    let Some(status) = sandbox.status.as_mut() else {
+        return;
+    };
+    if let Some(ready) = status
+        .conditions
+        .iter_mut()
+        .find(|condition| condition.r#type == "Ready")
+    {
+        ready.status = "False".to_string();
+        ready.reason = REASON.to_string();
+        ready.message = MESSAGE.to_string();
+    } else {
+        status.conditions.push(SandboxCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: REASON.to_string(),
+            message: MESSAGE.to_string(),
+            last_transition_time: String::new(),
+        });
+    }
+}
+
 fn status_from_object(obj: &DynamicObject, topology: SupervisorTopology) -> Option<SandboxStatus> {
     let status = obj.data.get("status")?;
     let status_obj = status.as_object()?;
@@ -7850,7 +8075,7 @@ mod tests {
             &params,
         );
 
-        let names = proxy_pod_resource_names("example-sandbox");
+        let names = proxy_pod_resource_names(params.cr_name, params.sandbox_id);
         let service_dns = proxy_pod_service_dns(&names.service, "agents");
         let agent = &pod_template["spec"]["containers"][0];
 
@@ -8045,7 +8270,7 @@ mod tests {
             host_gateway_ip: "172.17.0.1",
             ..SandboxPodParams::default()
         };
-        let names = proxy_pod_resource_names(params.sandbox_name);
+        let names = proxy_pod_resource_names(params.cr_name, params.sandbox_id);
         let owner_ref = serde_json::json!({
             "apiVersion": "agents.x-k8s.io/v1beta1",
             "kind": "Sandbox",
@@ -8181,7 +8406,7 @@ mod tests {
             ..SandboxPodParams::default()
         };
         proxy_pod_agent_egress_network_policy(
-            &proxy_pod_resource_names("example-sandbox"),
+            &proxy_pod_resource_names(params.cr_name, params.sandbox_id),
             &params,
             serde_json::json!({}),
         )
@@ -8226,7 +8451,7 @@ mod tests {
     /// owner-reference GC then masks on delete but not on stop/start.
     #[test]
     fn proxy_pod_supervisor_inherits_workload_node_placement() {
-        let names = proxy_pod_resource_names("ws--dev");
+        let names = proxy_pod_resource_names("ws--dev", "sandbox-1");
         let params = SandboxPodParams {
             topology: SupervisorTopology::ProxyPod,
             supervisor_image: "supervisor:latest",
@@ -8256,6 +8481,57 @@ mod tests {
         let pod_spec = &dep["spec"]["template"]["spec"];
         assert_eq!(pod_spec["nodeSelector"]["pool"], "gpu");
         assert_eq!(pod_spec["tolerations"][0]["key"], "gpu");
+    }
+
+    /// The proxy-pod supervisor must route egress through the operator's
+    /// corporate upstream proxy, matching sidecar topology, or all permitted
+    /// traffic fails (or bypasses the required monitoring route).
+    #[test]
+    fn proxy_pod_supervisor_forwards_to_upstream_proxy() {
+        let names = proxy_pod_resource_names("ws--dev", "sandbox-1");
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::ProxyPod,
+            supervisor_image: "supervisor:latest",
+            namespace: "agents",
+            sandbox_id: "sandbox-1",
+            sandbox_name: "dev",
+            proxy_uid: 2000,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            https_proxy: Some("http://corp-proxy.example.com:3128"),
+            no_proxy: Some("10.0.0.0/8,.svc"),
+            ..SandboxPodParams::default()
+        };
+        let dep = serde_json::to_value(proxy_pod_supervisor_deployment(
+            &names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &params,
+            &KubernetesPodDriverConfig::default(),
+            &ProxyPodPlacement::default(),
+            serde_json::json!({}),
+        ))
+        .unwrap();
+        let command = dep["spec"]["template"]["spec"]["containers"][0]["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        let joined = command.join(" ");
+        assert!(
+            joined.contains("--upstream-proxy http://corp-proxy.example.com:3128"),
+            "supervisor command must forward to the upstream proxy: {joined}"
+        );
+        assert!(
+            joined.contains("--upstream-no-proxy 10.0.0.0/8,.svc"),
+            "supervisor command must carry no_proxy: {joined}"
+        );
+        // Credentials are not mounted into the supervisor pod, so no auth-file arg.
+        assert!(
+            !joined.contains("--upstream-proxy-auth-file"),
+            "proxy-pod must not reference an unmounted auth file: {joined}"
+        );
     }
 
     /// The supervisor must also honor the public `platform_config` placement the
@@ -8314,7 +8590,7 @@ mod tests {
         };
         let placement = ProxyPodPlacement::from_template(Some(&template));
 
-        let names = proxy_pod_resource_names("ws--dev");
+        let names = proxy_pod_resource_names("ws--dev", "sandbox-1");
         let params = SandboxPodParams {
             topology: SupervisorTopology::ProxyPod,
             supervisor_image: "supervisor:latest",
@@ -8434,7 +8710,7 @@ mod tests {
             false,
             &params,
         );
-        let names = proxy_pod_resource_names("team-a--dev");
+        let names = proxy_pod_resource_names(params.cr_name, params.sandbox_id);
         let service_dns = proxy_pod_service_dns(&names.service, "agents");
         let agent = &pod_template["spec"]["containers"][0];
         assert_eq!(
@@ -8453,13 +8729,14 @@ mod tests {
     }
 
     #[test]
-    fn proxy_pod_resource_names_disambiguate_by_cr_name() {
-        // In shared mode two workspaces may hold a sandbox named `dev`, giving
-        // CR names `workspace-a--dev` and `workspace-b--dev`. Companion names
-        // must derive from the CR name so they do not collide; the bare
-        // sandbox name would.
-        let a = proxy_pod_resource_names("workspace-a--dev");
-        let b = proxy_pod_resource_names("workspace-b--dev");
+    fn proxy_pod_resource_names_disambiguate_by_sandbox_id() {
+        // Distinct sandbox instances get distinct companion names even when
+        // their CR names are identical, because uniqueness is keyed on the
+        // immutable per-instance UUID rather than the CR name.
+        let a =
+            proxy_pod_resource_names("workspace-a--dev", "11111111-1111-1111-1111-111111111111");
+        let b =
+            proxy_pod_resource_names("workspace-a--dev", "22222222-2222-2222-2222-222222222222");
         assert_ne!(a.supervisor_deployment, b.supervisor_deployment);
         assert_ne!(a.service, b.service);
         assert_ne!(a.proxy_ca_secret, b.proxy_ca_secret);
@@ -8468,6 +8745,34 @@ mod tests {
             a.supervisor_ingress_network_policy,
             b.supervisor_ingress_network_policy
         );
+    }
+
+    #[test]
+    fn proxy_pod_resource_names_are_stable_for_an_instance() {
+        // The same sandbox id yields the same names across calls (create,
+        // reconcile, scale all recompute them independently).
+        let first = proxy_pod_resource_names("ws--dev", "abc-123");
+        let second = proxy_pod_resource_names("ws--dev", "abc-123");
+        assert_eq!(first.supervisor_deployment, second.supervisor_deployment);
+    }
+
+    #[test]
+    fn proxy_pod_resource_names_avoid_truncation_collision() {
+        // Two CR names that collided under the old 32-bit name hash — a shared
+        // 48-char prefix that truncates identically — now differ because the
+        // suffix is a 64-bit hash of the distinct sandbox UUIDs.
+        let long = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let a = proxy_pod_resource_names(
+            &format!("{long}-955pct6t1ohlwg"),
+            "11111111-1111-1111-1111-111111111111",
+        );
+        let b = proxy_pod_resource_names(
+            &format!("{long}-uw6jys21qzazvy"),
+            "22222222-2222-2222-2222-222222222222",
+        );
+        assert_ne!(a.supervisor_deployment, b.supervisor_deployment);
+        assert!(a.supervisor_deployment.len() <= MAX_KUBE_NAME_LEN);
+        assert!(b.supervisor_deployment.len() <= MAX_KUBE_NAME_LEN);
     }
 
     #[test]
@@ -8491,6 +8796,56 @@ mod tests {
                 "{topology}"
             );
         }
+    }
+
+    #[test]
+    fn mark_supervisor_unavailable_forces_not_ready() {
+        let mut sandbox = Sandbox {
+            id: "id".to_string(),
+            name: "dev".to_string(),
+            namespace: "agents".to_string(),
+            spec: None,
+            status: Some(SandboxStatus {
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: String::new(),
+                    message: String::new(),
+                    last_transition_time: String::new(),
+                }],
+                ..SandboxStatus::default()
+            }),
+            workspace: "default".to_string(),
+        };
+        mark_supervisor_unavailable(&mut sandbox);
+        let ready = sandbox
+            .status
+            .unwrap()
+            .conditions
+            .into_iter()
+            .find(|condition| condition.r#type == "Ready")
+            .unwrap();
+        assert_eq!(ready.status, "False");
+        // Must be a transient reason so the gateway maps it to a recoverable
+        // Provisioning phase rather than terminal Error.
+        assert_eq!(ready.reason, "DependenciesNotReady");
+    }
+
+    #[test]
+    fn mark_supervisor_unavailable_adds_condition_when_absent() {
+        let mut sandbox = Sandbox {
+            id: "id".to_string(),
+            name: "dev".to_string(),
+            namespace: "agents".to_string(),
+            spec: None,
+            status: Some(SandboxStatus::default()),
+            workspace: "default".to_string(),
+        };
+        mark_supervisor_unavailable(&mut sandbox);
+        let conditions = sandbox.status.unwrap().conditions;
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].r#type, "Ready");
+        assert_eq!(conditions[0].status, "False");
     }
 
     #[test]
@@ -8582,7 +8937,7 @@ mod tests {
 
         let command = wait["command"].as_array().unwrap();
         assert_eq!(command[1], "wait-for-tcp");
-        let names = proxy_pod_resource_names("example-sandbox");
+        let names = proxy_pod_resource_names(params.cr_name, params.sandbox_id);
         let service_dns = proxy_pod_service_dns(&names.service, "agents");
         assert_eq!(command[2], format!("{service_dns}:3128"));
         assert_eq!(wait["securityContext"]["runAsNonRoot"], true);
