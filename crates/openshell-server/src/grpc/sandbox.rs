@@ -1217,7 +1217,15 @@ pub(super) async fn handle_exec_sandbox(
         .supervisor_sessions
         .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
         .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+        .map_err(|e| {
+            // Preserve the original code: a sessionless topology returns
+            // FailedPrecondition (terminal), which the CLI must not retry as it
+            // would a transient Unavailable.
+            Status::new(
+                e.code(),
+                format!("supervisor relay failed: {}", e.message()),
+            )
+        })?;
 
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
@@ -1330,7 +1338,15 @@ pub(super) async fn handle_forward_tcp(
             std::time::Duration::from_secs(15),
         )
         .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+        .map_err(|e| {
+            // Preserve the original code: a sessionless topology returns
+            // FailedPrecondition (terminal), which the CLI must not retry as it
+            // would a transient Unavailable.
+            Status::new(
+                e.code(),
+                format!("supervisor relay failed: {}", e.message()),
+            )
+        })?;
 
     let sandbox_id = sandbox.object_id().to_string();
     let (tx, rx) = mpsc::channel::<Result<TcpForwardFrame, Status>>(256);
@@ -1646,7 +1662,15 @@ pub(super) async fn handle_exec_sandbox_interactive(
         .supervisor_sessions
         .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
         .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+        .map_err(|e| {
+            // Preserve the original code: a sessionless topology returns
+            // FailedPrecondition (terminal), which the CLI must not retry as it
+            // would a transient Unavailable.
+            Status::new(
+                e.code(),
+                format!("supervisor relay failed: {}", e.message()),
+            )
+        })?;
 
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
