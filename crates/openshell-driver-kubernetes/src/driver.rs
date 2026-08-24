@@ -1429,54 +1429,13 @@ impl KubernetesComputeDriver {
             .await;
 
         let cr_name = self.config.kube_resource_name(workspace, name);
-        let params = SandboxPodParams {
-            default_image: &self.config.default_image,
-            image_pull_policy: &self.config.image_pull_policy,
-            image_pull_secrets: &self.config.image_pull_secrets,
-            supervisor_image: &self.config.supervisor_image,
-            supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
-            supervisor_sideload_method: self.config.supervisor_sideload_method,
-            topology: self.config.topology,
-            proxy_uid: match self.config.topology {
-                SupervisorTopology::ProxyPod => self.config.proxy_pod.proxy_uid,
-                SupervisorTopology::Combined | SupervisorTopology::Sidecar => {
-                    self.config.sidecar.proxy_uid
-                }
-            },
-            process_binary_aware_network_policy: self
-                .config
-                .sidecar
-                .process_binary_aware_network_policy,
-            https_proxy: self.config.https_proxy.as_deref(),
-            no_proxy: self.config.no_proxy.as_deref(),
-            proxy_auth_secret_name: self.config.proxy_auth_secret_name.as_deref(),
-            proxy_auth_secret_key: self.config.proxy_auth_secret_key.as_deref(),
-            proxy_auth_allow_insecure: self.config.proxy_auth_allow_insecure == Some(true),
-            proxy_connect_by_hostname: self.config.proxy_connect_by_hostname == Some(true),
-            proxy_pod_affinity: self.config.proxy_pod.affinity,
-            proxy_pod_dns_peers: &self.config.proxy_pod.dns_peers,
-            namespace: &target_namespace,
-            service_account_name: &self.config.service_account_name,
-            sandbox_id: &sandbox.id,
-            sandbox_name: &sandbox.name,
-            cr_name: &cr_name,
-            grpc_endpoint: &self.config.grpc_endpoint,
-            ssh_socket_path: self.ssh_socket_path(),
-            client_tls_secret_name: &self.config.client_tls_secret_name,
-            host_gateway_ip: &self.config.host_gateway_ip,
-            enable_user_namespaces: self.config.enable_user_namespaces,
-            app_armor_profile: self.config.app_armor_profile.as_ref(),
-            workspace_default_storage_size: &self.config.workspace_default_storage_size,
-            workspace_storage_class: &self.config.workspace_storage_class,
-            default_runtime_class_name: &self.config.default_runtime_class_name,
-            sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
-            provider_spiffe_enabled: self.config.provider_spiffe_enabled(),
-            provider_spiffe_workload_api_socket_path: &self
-                .config
-                .provider_spiffe_workload_api_socket_path,
-            sandbox_uid: resolved_user_id,
-            sandbox_gid: resolved_group_id,
-        };
+        let params = self.build_sandbox_pod_params(
+            sandbox,
+            &target_namespace,
+            &cr_name,
+            resolved_user_id,
+            resolved_group_id,
+        );
         validate_proxy_identity(&params)?;
 
         let data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
@@ -1591,6 +1550,68 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
+    /// Assemble the `SandboxPodParams` from gateway config for a sandbox. Shared
+    /// by the create path and the proxy-pod companion reconciliation path so both
+    /// render identical companions.
+    #[allow(clippy::similar_names)]
+    fn build_sandbox_pod_params<'a>(
+        &'a self,
+        sandbox: &'a Sandbox,
+        target_namespace: &'a str,
+        cr_name: &'a str,
+        sandbox_uid: u32,
+        sandbox_gid: u32,
+    ) -> SandboxPodParams<'a> {
+        SandboxPodParams {
+            default_image: &self.config.default_image,
+            image_pull_policy: &self.config.image_pull_policy,
+            image_pull_secrets: &self.config.image_pull_secrets,
+            supervisor_image: &self.config.supervisor_image,
+            supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
+            supervisor_sideload_method: self.config.supervisor_sideload_method,
+            topology: self.config.topology,
+            proxy_uid: match self.config.topology {
+                SupervisorTopology::ProxyPod => self.config.proxy_pod.proxy_uid,
+                SupervisorTopology::Combined | SupervisorTopology::Sidecar => {
+                    self.config.sidecar.proxy_uid
+                }
+            },
+            process_binary_aware_network_policy: self
+                .config
+                .sidecar
+                .process_binary_aware_network_policy,
+            https_proxy: self.config.https_proxy.as_deref(),
+            no_proxy: self.config.no_proxy.as_deref(),
+            proxy_auth_secret_name: self.config.proxy_auth_secret_name.as_deref(),
+            proxy_auth_secret_key: self.config.proxy_auth_secret_key.as_deref(),
+            proxy_auth_allow_insecure: self.config.proxy_auth_allow_insecure == Some(true),
+            proxy_connect_by_hostname: self.config.proxy_connect_by_hostname == Some(true),
+            proxy_pod_affinity: self.config.proxy_pod.affinity,
+            proxy_pod_dns_peers: &self.config.proxy_pod.dns_peers,
+            namespace: target_namespace,
+            service_account_name: &self.config.service_account_name,
+            sandbox_id: &sandbox.id,
+            sandbox_name: &sandbox.name,
+            cr_name,
+            grpc_endpoint: &self.config.grpc_endpoint,
+            ssh_socket_path: self.ssh_socket_path(),
+            client_tls_secret_name: &self.config.client_tls_secret_name,
+            host_gateway_ip: &self.config.host_gateway_ip,
+            enable_user_namespaces: self.config.enable_user_namespaces,
+            app_armor_profile: self.config.app_armor_profile.as_ref(),
+            workspace_default_storage_size: &self.config.workspace_default_storage_size,
+            workspace_storage_class: &self.config.workspace_storage_class,
+            default_runtime_class_name: &self.config.default_runtime_class_name,
+            sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
+            provider_spiffe_enabled: self.config.provider_spiffe_enabled(),
+            provider_spiffe_workload_api_socket_path: &self
+                .config
+                .provider_spiffe_workload_api_socket_path,
+            sandbox_uid,
+            sandbox_gid,
+        }
+    }
+
     async fn create_proxy_pod_resources(
         &self,
         sandbox: &Sandbox,
@@ -1620,18 +1641,6 @@ impl KubernetesComputeDriver {
             proxy_pod_owner_reference(sandbox_cr, sandbox_api_version, false)?;
         let (ca_cert_pem, ca_key_pem) = generate_proxy_pod_ca()?;
 
-        let secret = proxy_pod_ca_secret(
-            &names,
-            params,
-            dependent_owner_ref.clone(),
-            &ca_cert_pem,
-            &ca_key_pem,
-        );
-        let service = proxy_pod_supervisor_service(&names, params, dependent_owner_ref.clone());
-        let agent_egress =
-            proxy_pod_agent_egress_network_policy(&names, params, dependent_owner_ref.clone());
-        let supervisor_ingress =
-            proxy_pod_supervisor_ingress_network_policy(&names, params, dependent_owner_ref);
         // Give the supervisor the workload's node placement so same-node
         // affinity resolves to a node the workload can also use. Both the
         // driver_config.pod placement and the public platform_config placement
@@ -1644,81 +1653,20 @@ impl KubernetesComputeDriver {
             .unwrap_or_default();
         let placement =
             ProxyPodPlacement::from_template(spec.and_then(|spec| spec.template.as_ref()));
-        let supervisor_deployment = proxy_pod_supervisor_deployment(
+        let companions = build_proxy_pod_companions(
             &names,
+            params,
             &template_environment,
             &spec_environment,
-            params,
             &pod_driver_config,
             &placement,
             deployment_owner_ref,
+            dependent_owner_ref,
+            &ca_cert_pem,
+            &ca_key_pem,
         );
-
-        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), params.namespace);
-        let services: Api<Service> = Api::namespaced(self.client.clone(), params.namespace);
-        let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), params.namespace);
-        let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), params.namespace);
-
-        tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            secrets.create(&PostParams::default(), &secret),
-        )
-        .await
-        .map_err(|_| {
-            KubernetesDriverError::Message(format!(
-                "timed out after {}s creating proxy-pod CA secret",
-                KUBE_API_TIMEOUT.as_secs()
-            ))
-        })?
-        .map_err(KubernetesDriverError::from_kube)?;
-        tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            services.create(&PostParams::default(), &service),
-        )
-        .await
-        .map_err(|_| {
-            KubernetesDriverError::Message(format!(
-                "timed out after {}s creating proxy-pod service",
-                KUBE_API_TIMEOUT.as_secs()
-            ))
-        })?
-        .map_err(KubernetesDriverError::from_kube)?;
-        tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            policies.create(&PostParams::default(), &agent_egress),
-        )
-        .await
-        .map_err(|_| {
-            KubernetesDriverError::Message(format!(
-                "timed out after {}s creating proxy-pod agent egress NetworkPolicy",
-                KUBE_API_TIMEOUT.as_secs()
-            ))
-        })?
-        .map_err(KubernetesDriverError::from_kube)?;
-        tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            policies.create(&PostParams::default(), &supervisor_ingress),
-        )
-        .await
-        .map_err(|_| {
-            KubernetesDriverError::Message(format!(
-                "timed out after {}s creating proxy-pod supervisor ingress NetworkPolicy",
-                KUBE_API_TIMEOUT.as_secs()
-            ))
-        })?
-        .map_err(KubernetesDriverError::from_kube)?;
-        tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            deployments.create(&PostParams::default(), &supervisor_deployment),
-        )
-        .await
-        .map_err(|_| {
-            KubernetesDriverError::Message(format!(
-                "timed out after {}s creating proxy-pod supervisor deployment",
-                KUBE_API_TIMEOUT.as_secs()
-            ))
-        })?
-        .map_err(KubernetesDriverError::from_kube)?;
+        self.apply_proxy_pod_companions(params.namespace, &companions)
+            .await?;
 
         info!(
             sandbox_id = %sandbox.id,
@@ -1728,6 +1676,164 @@ impl KubernetesComputeDriver {
             "Created proxy-pod supervisor resources"
         );
         Ok(())
+    }
+
+    /// Idempotently apply a proxy-pod companion set. Each object is created only
+    /// if absent (an `AlreadyExists` conflict is treated as success), so this is
+    /// safe to run from both the create path and the restart reconciliation
+    /// path. Purely additive: an existing CA Secret keeps its key material (no
+    /// rotation) and an existing supervisor Deployment keeps its replica count
+    /// (a stopped sandbox is not restarted).
+    async fn apply_proxy_pod_companions(
+        &self,
+        namespace: &str,
+        companions: &ProxyPodCompanions,
+    ) -> Result<(), KubernetesDriverError> {
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
+        let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+
+        create_companion_if_absent(&secrets, &companions.secret, "proxy-pod CA secret").await?;
+        create_companion_if_absent(&services, &companions.service, "proxy-pod service").await?;
+        create_companion_if_absent(
+            &policies,
+            &companions.agent_egress,
+            "proxy-pod agent egress NetworkPolicy",
+        )
+        .await?;
+        create_companion_if_absent(
+            &policies,
+            &companions.supervisor_ingress,
+            "proxy-pod supervisor ingress NetworkPolicy",
+        )
+        .await?;
+        create_companion_if_absent(
+            &deployments,
+            &companions.supervisor_deployment,
+            "proxy-pod supervisor deployment",
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Repair proxy-pod companions for every existing Sandbox CR. A gateway
+    /// crash between the CR create and its companion creates leaves a persisted
+    /// CR with a partial topology that ordinary reconciliation never repairs,
+    /// because the CR already exists. Runs on each `watch_sandboxes` call
+    /// (gateway start and watch re-establishment). Best-effort: failures are
+    /// logged, not fatal.
+    async fn reconcile_proxy_pod_companions(&self) {
+        if self.config.topology != SupervisorTopology::ProxyPod {
+            return;
+        }
+        let lookup_api = match self
+            .supported_sandbox_api_for_lookup(self.client.clone())
+            .await
+        {
+            Ok(api) => api,
+            Err(err) => {
+                warn!(error = %err, "Skipping proxy-pod companion reconciliation: sandbox API unavailable");
+                return;
+            }
+        };
+        let api_version = format!("{SANDBOX_GROUP}/{}", lookup_api.resource.version);
+        let lp = ListParams::default().labels(&openshell_sandbox_label_selector());
+        let list = match tokio::time::timeout(KUBE_API_TIMEOUT, lookup_api.api.list(&lp)).await {
+            Ok(Ok(list)) => list,
+            Ok(Err(err)) => {
+                warn!(error = %err, "Skipping proxy-pod companion reconciliation: list failed");
+                return;
+            }
+            Err(_elapsed) => {
+                warn!("Skipping proxy-pod companion reconciliation: list timed out");
+                return;
+            }
+        };
+
+        let mut checked = 0usize;
+        let mut failed = 0usize;
+        for obj in list.items {
+            if !is_openshell_managed(&obj)
+                || topology_from_object(&obj, self.config.topology) != SupervisorTopology::ProxyPod
+            {
+                continue;
+            }
+            checked += 1;
+            if let Err(err) = self
+                .ensure_proxy_pod_companions_for_cr(&obj, &api_version)
+                .await
+            {
+                failed += 1;
+                warn!(
+                    cr_name = ?obj.metadata.name,
+                    error = %err,
+                    "Failed to reconcile proxy-pod companions"
+                );
+            }
+        }
+        if checked > 0 {
+            info!(
+                checked,
+                failed, "Reconciled proxy-pod companions for existing sandboxes"
+            );
+        }
+    }
+
+    /// Ensure the companions for a single Sandbox CR exist, reconstructing the
+    /// render inputs from the CR itself. Placement (node selector, tolerations,
+    /// runtime class) and the log level are read back from the CR's rendered
+    /// agent pod so a repaired supervisor lands where the workload can pair with
+    /// it. Application is idempotent, so present companions are left untouched.
+    #[allow(clippy::similar_names)]
+    async fn ensure_proxy_pod_companions_for_cr(
+        &self,
+        obj: &DynamicObject,
+        sandbox_api_version: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        let cr_name =
+            obj.metadata.name.clone().ok_or_else(|| {
+                KubernetesDriverError::Message("sandbox CR has no name".to_string())
+            })?;
+        let namespace = obj
+            .metadata
+            .namespace
+            .clone()
+            .unwrap_or_else(|| self.config.namespace.clone());
+        let sandbox = Sandbox {
+            id: sandbox_id_from_object(obj).unwrap_or_default(),
+            name: annotation_or_label(obj, LABEL_SANDBOX_NAME).unwrap_or_default(),
+            namespace: namespace.clone(),
+            spec: None,
+            status: None,
+            workspace: annotation_or_label(obj, LABEL_SANDBOX_WORKSPACE).unwrap_or_default(),
+        };
+        let (sandbox_uid, sandbox_gid, _annotations) =
+            self.resolve_sandbox_identity_in_namespace(&namespace).await;
+        let params =
+            self.build_sandbox_pod_params(&sandbox, &namespace, &cr_name, sandbox_uid, sandbox_gid);
+        let names = proxy_pod_resource_names(&cr_name);
+        let deployment_owner_ref = proxy_pod_owner_reference(obj, sandbox_api_version, true)?;
+        let dependent_owner_ref = proxy_pod_owner_reference(obj, sandbox_api_version, false)?;
+        // A fresh CA is generated but only used if the Secret is missing;
+        // create-if-absent keeps an existing CA rather than rotating it.
+        let (ca_cert_pem, ca_key_pem) = generate_proxy_pod_ca()?;
+        let placement = proxy_pod_placement_from_cr(obj);
+        let spec_environment = proxy_pod_log_level_env_from_cr(obj);
+        let companions = build_proxy_pod_companions(
+            &names,
+            &params,
+            &std::collections::HashMap::new(),
+            &spec_environment,
+            &KubernetesPodDriverConfig::default(),
+            &placement,
+            deployment_owner_ref,
+            dependent_owner_ref,
+            &ca_cert_pem,
+            &ca_key_pem,
+        );
+        self.apply_proxy_pod_companions(&namespace, &companions)
+            .await
     }
 
     /// Scale a sandbox's paired supervisor `Deployment`.
@@ -2120,9 +2226,11 @@ impl KubernetesComputeDriver {
         }
     }
 
-    // Kept `async` to match the gRPC handler signature in `grpc.rs`, which awaits this method.
-    #[allow(clippy::unused_async)]
     pub async fn watch_sandboxes(&self) -> Result<WatchStream, String> {
+        // Repair any proxy-pod companions left partial by a gateway crash
+        // between the CR create and its companion creates. Runs on gateway start
+        // and on every watch re-establishment.
+        self.reconcile_proxy_pod_companions().await;
         if self.config.is_multi_namespace() {
             self.watch_sandboxes_cluster_wide().await
         } else {
@@ -4971,6 +5079,151 @@ fn proxy_pod_supervisor_service(
             ]
         }
     }))
+}
+
+/// The set of Kubernetes objects that back one proxy-pod sandbox alongside its
+/// Sandbox CR. All are owner-referenced to the CR for garbage collection.
+struct ProxyPodCompanions {
+    secret: Secret,
+    service: Service,
+    agent_egress: NetworkPolicy,
+    supervisor_ingress: NetworkPolicy,
+    supervisor_deployment: Deployment,
+}
+
+/// Render the full companion set from already-resolved inputs. Shared by the
+/// create path (inputs from the sandbox spec) and the reconciliation path
+/// (inputs reconstructed from the CR) so both produce identical objects.
+#[allow(clippy::too_many_arguments)]
+fn build_proxy_pod_companions(
+    names: &ProxyPodResourceNames,
+    params: &SandboxPodParams<'_>,
+    template_environment: &std::collections::HashMap<String, String>,
+    spec_environment: &std::collections::HashMap<String, String>,
+    pod_driver_config: &KubernetesPodDriverConfig,
+    placement: &ProxyPodPlacement,
+    deployment_owner_ref: serde_json::Value,
+    dependent_owner_ref: serde_json::Value,
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
+) -> ProxyPodCompanions {
+    ProxyPodCompanions {
+        secret: proxy_pod_ca_secret(
+            names,
+            params,
+            dependent_owner_ref.clone(),
+            ca_cert_pem,
+            ca_key_pem,
+        ),
+        service: proxy_pod_supervisor_service(names, params, dependent_owner_ref.clone()),
+        agent_egress: proxy_pod_agent_egress_network_policy(
+            names,
+            params,
+            dependent_owner_ref.clone(),
+        ),
+        supervisor_ingress: proxy_pod_supervisor_ingress_network_policy(
+            names,
+            params,
+            dependent_owner_ref,
+        ),
+        supervisor_deployment: proxy_pod_supervisor_deployment(
+            names,
+            template_environment,
+            spec_environment,
+            params,
+            pod_driver_config,
+            placement,
+            deployment_owner_ref,
+        ),
+    }
+}
+
+/// Create a companion object, treating an `AlreadyExists` (409) conflict as
+/// success. This makes companion provisioning idempotent so it is safe to run
+/// repeatedly from the reconciliation path without clobbering existing objects.
+async fn create_companion_if_absent<K>(
+    api: &Api<K>,
+    obj: &K,
+    description: &str,
+) -> Result<(), KubernetesDriverError>
+where
+    K: kube::Resource + Clone + std::fmt::Debug + serde::Serialize + DeserializeOwned + Sync,
+    <K as kube::Resource>::DynamicType: Default,
+{
+    match tokio::time::timeout(KUBE_API_TIMEOUT, api.create(&PostParams::default(), obj)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(KubeError::Api(err))) if err.code == 409 => Ok(()),
+        Ok(Err(err)) => Err(KubernetesDriverError::from_kube(err)),
+        Err(_elapsed) => Err(KubernetesDriverError::Message(format!(
+            "timed out after {}s creating {description}",
+            KUBE_API_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+/// Reconstruct the supervisor's node placement from a Sandbox CR's rendered
+/// agent pod, so a reconciled supervisor lands where the workload can pair with
+/// it. The agent pod already carries the merged placement, so reading it back is
+/// both accurate and cluster-domain-agnostic.
+fn proxy_pod_placement_from_cr(obj: &DynamicObject) -> ProxyPodPlacement {
+    let Some(pod_spec) = obj
+        .data
+        .get("spec")
+        .and_then(|spec| spec.get("podTemplate"))
+        .and_then(|template| template.get("spec"))
+    else {
+        return ProxyPodPlacement::default();
+    };
+    ProxyPodPlacement {
+        runtime_class_name: pod_spec
+            .get("runtimeClassName")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        node_selector: pod_spec
+            .get("nodeSelector")
+            .filter(|value| value.as_object().is_some_and(|map| !map.is_empty()))
+            .cloned(),
+        tolerations: pod_spec
+            .get("tolerations")
+            .filter(|value| value.as_array().is_some_and(|list| !list.is_empty()))
+            .cloned(),
+    }
+}
+
+/// Read the log-level env back from a Sandbox CR's rendered agent pod so a
+/// reconciled supervisor keeps the same verbosity as the original.
+fn proxy_pod_log_level_env_from_cr(
+    obj: &DynamicObject,
+) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    let containers = obj
+        .data
+        .get("spec")
+        .and_then(|spec| spec.get("podTemplate"))
+        .and_then(|template| template.get("spec"))
+        .and_then(|spec| spec.get("containers"))
+        .and_then(serde_json::Value::as_array);
+    let Some(containers) = containers else {
+        return env;
+    };
+    for container in containers {
+        let Some(entries) = container.get("env").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for entry in entries {
+            if entry.get("name").and_then(serde_json::Value::as_str)
+                == Some(openshell_core::sandbox_env::LOG_LEVEL)
+                && let Some(value) = entry.get("value").and_then(serde_json::Value::as_str)
+            {
+                env.insert(
+                    openshell_core::sandbox_env::LOG_LEVEL.to_string(),
+                    value.to_string(),
+                );
+            }
+        }
+    }
+    env
 }
 
 fn proxy_pod_supervisor_deployment(
@@ -8089,6 +8342,68 @@ mod tests {
         assert_eq!(pod_spec["runtimeClassName"], "kata-containers");
         assert_eq!(pod_spec["nodeSelector"]["disktype"], "ssd");
         assert_eq!(pod_spec["tolerations"][0]["key"], "dedicated");
+    }
+
+    /// Companion reconciliation rebuilds a repaired supervisor's placement and
+    /// log level from the Sandbox CR's rendered agent pod, so it lands where the
+    /// workload can pair with it even after a crash lost the original spec.
+    #[test]
+    fn proxy_pod_placement_and_log_level_recovered_from_cr() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut obj = DynamicObject::new("ws--dev", &resource);
+        obj.data = serde_json::json!({
+            "spec": {
+                "podTemplate": {
+                    "spec": {
+                        "runtimeClassName": "kata-containers",
+                        "nodeSelector": {"disktype": "ssd"},
+                        "tolerations": [{"key": "dedicated", "operator": "Exists"}],
+                        "containers": [{
+                            "name": "agent",
+                            "env": [{
+                                "name": openshell_core::sandbox_env::LOG_LEVEL,
+                                "value": "debug"
+                            }]
+                        }]
+                    }
+                }
+            }
+        });
+
+        let placement = proxy_pod_placement_from_cr(&obj);
+        assert_eq!(
+            placement.runtime_class_name.as_deref(),
+            Some("kata-containers")
+        );
+        assert_eq!(placement.node_selector.unwrap()["disktype"], "ssd");
+        assert_eq!(placement.tolerations.unwrap()[0]["key"], "dedicated");
+
+        let env = proxy_pod_log_level_env_from_cr(&obj);
+        assert_eq!(
+            env.get(openshell_core::sandbox_env::LOG_LEVEL)
+                .map(String::as_str),
+            Some("debug")
+        );
+    }
+
+    /// An empty/absent pod template must not fabricate placement or env.
+    #[test]
+    fn proxy_pod_reconstruction_tolerates_missing_pod_template() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let obj = DynamicObject::new("ws--dev", &resource);
+        let placement = proxy_pod_placement_from_cr(&obj);
+        assert!(placement.runtime_class_name.is_none());
+        assert!(placement.node_selector.is_none());
+        assert!(placement.tolerations.is_none());
+        assert!(proxy_pod_log_level_env_from_cr(&obj).is_empty());
     }
 
     #[test]
