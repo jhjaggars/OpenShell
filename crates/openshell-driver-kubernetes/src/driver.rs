@@ -1648,6 +1648,7 @@ impl KubernetesComputeDriver {
                 self.teardown_proxy_pod_fence(
                     params.namespace,
                     params.cr_name,
+                    created.metadata.uid.as_deref(),
                     &sandbox.id,
                     DEFAULT_POD_TERMINATION_GRACE_PERIOD.saturating_add(KUBE_API_TIMEOUT),
                 )
@@ -1866,17 +1867,22 @@ impl KubernetesComputeDriver {
             self.proxy_pod_supervisor_availability(namespace, &names.supervisor_deployment)
                 .await
         };
-        // Only a definite `Unavailable` downgrades readiness. `Unknown` (GET
-        // error/timeout) leaves the CR's own readiness intact so a transient API
-        // blip never flaps a healthy sandbox to NotReady.
-        if availability == SupervisorAvailability::Unavailable {
+        // Fail closed: readiness is only `Ready` when the supervisor is
+        // *confirmed* available. The CR's own `Ready=True` reflects the agent
+        // pod, not the separate supervisor, so leaving it intact on `Unknown`
+        // (a GET error/timeout) would republish a possibly-dead-egress sandbox
+        // as Ready and could overwrite a prior `DependenciesNotReady`. Only a
+        // confirmed `Available` keeps `Ready`.
+        if availability != SupervisorAvailability::Available {
             mark_supervisor_unavailable(sandbox);
         }
     }
 
     /// Tri-state availability of a proxy-pod sandbox's supervisor Deployment. A
-    /// missing Deployment is `Unavailable`; a transient API error is `Unknown`,
-    /// so readiness never flaps on an API blip.
+    /// missing Deployment is `Unavailable`; a transient API error is `Unknown`.
+    /// Callers fail closed (treat non-`Available` as not ready), so `Unknown` is
+    /// kept distinct only so a definite absence and an undeterminable check read
+    /// the same to readiness without conflating them in logs.
     async fn proxy_pod_supervisor_availability(
         &self,
         namespace: &str,
@@ -1930,12 +1936,10 @@ impl KubernetesComputeDriver {
     /// via `spawn_proxy_pod_periodic_reconcile`. Best-effort: failures are
     /// logged, not fatal.
     ///
-    /// Returns whether this gateway currently manages any proxy-pod sandbox.
-    /// `watch_sandboxes` uses that to keep periodic reconciliation and the
-    /// supervisor Deployment watch running during a `retainCompanionRbac`
-    /// migration (config topology no longer proxy-pod, but proxy-pod sandboxes
-    /// created before the switch still exist and are still owned by this gateway).
-    async fn reconcile_proxy_pod_companions(&self) -> bool {
+    /// Whether background upkeep (periodic reconcile, readiness watch) stays
+    /// scheduled is decided from configuration in `watch_sandboxes`, not from
+    /// this pass — a transient discovery failure here must never disable it.
+    async fn reconcile_proxy_pod_companions(&self) {
         // Driven by each CR's persisted creation-time topology, not the
         // gateway's current config: a gateway whose Helm topology was changed to
         // `combined` must still reconcile sandboxes that were created as
@@ -1948,7 +1952,7 @@ impl KubernetesComputeDriver {
             Ok(api) => api,
             Err(err) => {
                 warn!(error = %err, "Skipping proxy-pod companion reconciliation: sandbox API unavailable");
-                return false;
+                return;
             }
         };
         let api_version = format!("{SANDBOX_GROUP}/{}", lookup_api.resource.version);
@@ -1959,11 +1963,11 @@ impl KubernetesComputeDriver {
             Ok(Ok(list)) => list,
             Ok(Err(err)) => {
                 warn!(error = %err, "Skipping proxy-pod companion reconciliation: list failed");
-                return false;
+                return;
             }
             Err(_elapsed) => {
                 warn!("Skipping proxy-pod companion reconciliation: list timed out");
-                return false;
+                return;
             }
         };
 
@@ -2004,8 +2008,6 @@ impl KubernetesComputeDriver {
         // means a gateway crash between CR deletion and fence teardown leaves it
         // behind. Delete any whose sandbox CR no longer exists.
         self.reap_orphaned_egress_fences(&live_sandbox_ids).await;
-
-        checked > 0
     }
 
     /// Delete agent egress `NetworkPolicy` objects whose Sandbox CR is gone.
@@ -2518,6 +2520,9 @@ impl KubernetesComputeDriver {
         let delete_api = self
             .supported_agent_sandbox_api(self.client.clone(), &obj_namespace)
             .await?;
+        // Capture the UID before it is moved into the delete preconditions; the
+        // post-delete fence teardown re-checks that this exact CR is gone.
+        let cr_uid = preconditions.uid.clone();
         let dp = DeleteParams::default().preconditions(preconditions);
         // Delete the Sandbox CR. Owner-referenced companions (supervisor
         // Deployment, Service, CA Secret, supervisor-ingress NetworkPolicy) are
@@ -2567,8 +2572,14 @@ impl KubernetesComputeDriver {
         // NetworkPolicy. A 409/404 (`Ok(false)`) means a successor owns the name,
         // so we must not touch its fence.
         if matches!(deleted, Ok(true)) && topology == SupervisorTopology::ProxyPod {
-            self.teardown_proxy_pod_fence(&obj_namespace, &kube_name, sandbox_id, stop_timeout)
-                .await;
+            self.teardown_proxy_pod_fence(
+                &obj_namespace,
+                &kube_name,
+                cr_uid.as_deref(),
+                sandbox_id,
+                stop_timeout,
+            )
+            .await;
         }
         deleted
     }
@@ -2599,6 +2610,40 @@ impl KubernetesComputeDriver {
         }
     }
 
+    /// Whether the specific Sandbox CR we deleted — addressed by its Kubernetes
+    /// UID — is actually gone, not merely marked for deletion. A DELETE the API
+    /// server accepts only sets `deletionTimestamp`; finalizers or an in-flight
+    /// controller can keep the CR (and recreate its workload pod) afterward, so
+    /// pod-absence alone is not proof the fence is safe to drop.
+    ///
+    /// `Some(true)`: the CR is absent, or a *different*-UID object now holds the
+    /// name (our CR is gone; a successor owns its own separately-named fence).
+    /// `Some(false)`: the same-UID CR is still present (still terminating) — the
+    /// workload can reappear, so keep the fence. `None`: undeterminable.
+    async fn deleted_cr_is_gone(
+        &self,
+        namespace: &str,
+        cr_name: &str,
+        cr_uid: Option<&str>,
+    ) -> Option<bool> {
+        let api = self
+            .supported_agent_sandbox_api(self.client.clone(), namespace)
+            .await
+            .ok()?;
+        match tokio::time::timeout(KUBE_API_TIMEOUT, api.api.get_opt(cr_name)).await {
+            Ok(Ok(None)) => Some(true),
+            Ok(Ok(Some(obj))) => Some(obj.metadata.uid.as_deref() != cr_uid),
+            Ok(Err(err)) => {
+                warn!(cr = %cr_name, error = %err, "Could not confirm Sandbox CR deletion");
+                None
+            }
+            Err(_elapsed) => {
+                warn!(cr = %cr_name, "Timed out confirming Sandbox CR deletion");
+                None
+            }
+        }
+    }
+
     /// Delete a proxy-pod sandbox's egress `NetworkPolicy`, but only once its
     /// workload pod is confirmed gone, so the fence outlives a pod that ignores
     /// `SIGTERM`. Waits up to `stop_timeout` for the pod to disappear and RETAINS
@@ -2608,6 +2653,7 @@ impl KubernetesComputeDriver {
         &self,
         namespace: &str,
         cr_name: &str,
+        cr_uid: Option<&str>,
         sandbox_id: &str,
         stop_timeout: Duration,
     ) {
@@ -2634,6 +2680,24 @@ impl KubernetesComputeDriver {
             }
             tokio::time::sleep(poll.min(deadline.saturating_duration_since(now))).await;
             poll = next_stop_poll_interval(poll);
+        }
+
+        // The accepted DELETE only set `deletionTimestamp`; a finalizer or an
+        // in-flight controller reconciliation can still recreate the workload
+        // after the pod-absence check above. Confirm THIS CR (by UID) is actually
+        // gone immediately before removing the fence; retain it otherwise so a
+        // reappearing workload never gets default-allow egress (reconciliation
+        // reaps the fence once the CR is truly absent).
+        match self.deleted_cr_is_gone(namespace, cr_name, cr_uid).await {
+            Some(true) => {}
+            Some(false) => {
+                warn!(sandbox_id = %sandbox_id, "Leaving egress fence: Sandbox CR still terminating (deletionTimestamp set, finalizers pending)");
+                return;
+            }
+            None => {
+                warn!(sandbox_id = %sandbox_id, "Leaving egress fence: Sandbox CR deletion unconfirmed");
+                return;
+            }
         }
 
         let names = proxy_pod_resource_names(cr_name, sandbox_id);
@@ -2673,10 +2737,17 @@ impl KubernetesComputeDriver {
     pub async fn watch_sandboxes(&self) -> Result<WatchStream, String> {
         // Repair any proxy-pod companions left partial by a gateway crash
         // between the CR create and its companion creates. Runs on gateway start
-        // and on every watch re-establishment. Its return value reports whether
-        // this gateway currently owns any proxy-pod sandbox.
-        let manages_proxy_pod = self.reconcile_proxy_pod_companions().await
-            || self.config.topology == SupervisorTopology::ProxyPod;
+        // and on every watch re-establishment.
+        self.reconcile_proxy_pod_companions().await;
+        // Whether to keep periodic repair and the shared-mode supervisor
+        // Deployment readiness watch running. Determined from configuration —
+        // never from a runtime sandbox list — so a transient discovery failure
+        // cannot disable upkeep for a whole watch session. During a migration
+        // away from proxy-pod, `retain_companion_management` (rendered from Helm
+        // `retainCompanionRbac`) keeps it on until the last proxy-pod sandbox is
+        // deleted.
+        let manages_proxy_pod = self.config.topology == SupervisorTopology::ProxyPod
+            || self.config.proxy_pod.retain_companion_management;
         if self.config.is_multi_namespace() {
             self.watch_sandboxes_cluster_wide(manages_proxy_pod).await
         } else {
@@ -6681,14 +6752,14 @@ async fn proxy_pod_supervisor_availability(
             warn!(
                 deployment = %deployment_name,
                 error = %err,
-                "Could not determine proxy-pod supervisor availability; leaving readiness unchanged"
+                "Could not determine proxy-pod supervisor availability; treating supervisor as not ready"
             );
             SupervisorAvailability::Unknown
         }
         Err(_elapsed) => {
             warn!(
                 deployment = %deployment_name,
-                "Timed out checking proxy-pod supervisor availability; leaving readiness unchanged"
+                "Timed out checking proxy-pod supervisor availability; treating supervisor as not ready"
             );
             SupervisorAvailability::Unknown
         }
@@ -6716,9 +6787,13 @@ async fn sandbox_from_object_with_supervisor_readiness(
     let (kube_name, mut sandbox) = sandbox_from_object(namespace, obj, fallback_topology)?;
     if cr_topology == SupervisorTopology::ProxyPod && !sandbox_id.is_empty() {
         let names = proxy_pod_resource_names(&cr_name, &sandbox_id);
+        // Fail closed: keep `Ready` only when the supervisor is confirmed
+        // available. `Unavailable` and `Unknown` (a GET error/timeout) both
+        // downgrade to `Provisioning`, so a watch event never republishes a
+        // sandbox as `Ready` while its policy-enforced egress path may be down.
         if proxy_pod_supervisor_availability(client, &cr_namespace, &names.supervisor_deployment)
             .await
-            == SupervisorAvailability::Unavailable
+            != SupervisorAvailability::Available
         {
             mark_supervisor_unavailable(&mut sandbox);
         }
