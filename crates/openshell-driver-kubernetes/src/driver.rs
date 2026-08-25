@@ -120,6 +120,20 @@ const DEFAULT_POD_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(30);
 const STOP_INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const STOP_MAX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// After confirming the Sandbox CR is gone, the fence teardown waits out this
+/// quiescence window (re-checking pod absence each interval) before deleting the
+/// egress fence. It lets an in-flight controller reconciliation that read the CR
+/// before deletion settle: if such a reconcile creates a dangling-ownerReference
+/// workload Pod, the recheck sees it and retains the fence. A healthy controller
+/// converges within its informer resync well inside this window.
+const FENCE_QUIESCE_WINDOW: Duration = Duration::from_secs(6);
+const FENCE_QUIESCE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Backoff before re-establishing a supervisor Deployment watch that ended, so a
+/// rare stream end does not silently drop fast readiness for the remainder of a
+/// sandbox watch's lifetime.
+const DEPLOYMENT_WATCH_REESTABLISH_BACKOFF: Duration = Duration::from_secs(2);
+
 const SANDBOX_GROUP: &str = "agents.x-k8s.io";
 const SANDBOX_VERSION_V1BETA1: &str = "v1beta1";
 const SANDBOX_VERSION_V1ALPHA1: &str = "v1alpha1";
@@ -516,7 +530,13 @@ impl KubernetesComputeDriver {
         config
             .validate_proxy_uid()
             .map_err(KubernetesDriverError::Precondition)?;
-        if config.topology == SupervisorTopology::ProxyPod {
+        // Validate DNS peers whenever this gateway may build proxy-pod
+        // companions: the configured topology is proxy-pod, or a migration is
+        // retaining companion management for pre-existing proxy-pod sandboxes
+        // (whose supervisor could be reconstructed with these peers).
+        if config.topology == SupervisorTopology::ProxyPod
+            || config.proxy_pod.retain_companion_management
+        {
             config
                 .proxy_pod
                 .validate_dns_peers()
@@ -1527,6 +1547,7 @@ impl KubernetesComputeDriver {
             &cr_name,
             resolved_user_id,
             resolved_group_id,
+            self.config.topology,
         );
         validate_proxy_identity(&params)?;
 
@@ -1676,6 +1697,12 @@ impl KubernetesComputeDriver {
         cr_name: &'a str,
         sandbox_uid: u32,
         sandbox_gid: u32,
+        // The topology to render for. Normally the gateway's configured topology,
+        // but companion reconstruction passes the CR's *persisted* topology so a
+        // proxy-pod sandbox is rebuilt with proxy-pod parameters (its supervisor
+        // UID, not the sidecar UID) even after the gateway's configured topology
+        // has been migrated away from proxy-pod.
+        topology: SupervisorTopology,
     ) -> SandboxPodParams<'a> {
         SandboxPodParams {
             default_image: &self.config.default_image,
@@ -1684,8 +1711,8 @@ impl KubernetesComputeDriver {
             supervisor_image: &self.config.supervisor_image,
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
-            topology: self.config.topology,
-            proxy_uid: match self.config.topology {
+            topology,
+            proxy_uid: match topology {
                 SupervisorTopology::ProxyPod => self.config.proxy_pod.proxy_uid,
                 SupervisorTopology::Combined | SupervisorTopology::Sidecar => {
                     self.config.sidecar.proxy_uid
@@ -2145,8 +2172,19 @@ impl KubernetesComputeDriver {
         }
         let (sandbox_uid, sandbox_gid, _annotations) =
             self.resolve_sandbox_identity_in_namespace(&namespace).await;
-        let params =
-            self.build_sandbox_pod_params(&sandbox, &namespace, &cr_name, sandbox_uid, sandbox_gid);
+        // This path only reconstructs proxy-pod companions (the caller filters to
+        // proxy-pod CRs), so render with proxy-pod parameters regardless of the
+        // gateway's currently-configured topology — otherwise a migrated
+        // combined/sidecar gateway would rebuild the supervisor with the sidecar
+        // UID instead of the proxy-pod supervisor UID.
+        let params = self.build_sandbox_pod_params(
+            &sandbox,
+            &namespace,
+            &cr_name,
+            sandbox_uid,
+            sandbox_gid,
+            SupervisorTopology::ProxyPod,
+        );
         let names = proxy_pod_resource_names(&cr_name, &sandbox.id);
         let deployment_owner_ref = proxy_pod_owner_reference(obj, sandbox_api_version, true)?;
         let dependent_owner_ref = proxy_pod_owner_reference(obj, sandbox_api_version, false)?;
@@ -2700,6 +2738,22 @@ impl KubernetesComputeDriver {
             }
         }
 
+        // Even with the CR gone, a controller reconcile that read the CR before
+        // its deletion could still create a dangling-ownerReference workload Pod
+        // (Kubernetes permits references to a missing owner; GC orphan-collects it
+        // later). Wait out a short quiescence window, re-confirming pod absence,
+        // so such a stale Pod is observed and the fence retained rather than
+        // deleted out from under it. A healthy controller converges well within
+        // this window; anything still lingering is left for the reconciler.
+        let quiesce_deadline = tokio::time::Instant::now() + FENCE_QUIESCE_WINDOW;
+        while tokio::time::Instant::now() < quiesce_deadline {
+            tokio::time::sleep(FENCE_QUIESCE_INTERVAL).await;
+            if self.workload_pod_absent(namespace, pod_name).await != Some(true) {
+                warn!(sandbox_id = %sandbox_id, "Leaving egress fence: workload pod reappeared during quiescence (stale controller reconcile)");
+                return;
+            }
+        }
+
         let names = proxy_pod_resource_names(cr_name, sandbox_id);
         let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
         match tokio::time::timeout(
@@ -2780,11 +2834,21 @@ impl KubernetesComputeDriver {
         // migration); otherwise it holds a stream that never yields. This is the
         // single-namespace (shared workspace) path, so the watch is namespaced
         // and needs no cluster-wide Deployment enumeration.
-        let mut deployment_stream = proxy_pod_supervisor_deployment_stream(
-            manages_proxy_pod,
-            Api::namespaced(self.watch_client.clone(), &namespace),
-            self.proxy_pod_supervisor_selector(),
-        );
+        // Keep the watch inputs so the task can re-establish the Deployment watch
+        // after a recoverable end, rather than losing fast readiness for the rest
+        // of the sandbox watch's lifetime.
+        let deployment_watch: Option<(Api<Deployment>, String)> = manages_proxy_pod.then(|| {
+            (
+                Api::namespaced(self.watch_client.clone(), &namespace),
+                self.proxy_pod_supervisor_selector(),
+            )
+        });
+        let mut deployment_stream = match &deployment_watch {
+            Some((api, selector)) => {
+                proxy_pod_supervisor_deployment_stream(true, api.clone(), selector.clone())
+            }
+            None => futures::stream::pending().boxed(),
+        };
         let (tx, rx) = mpsc::channel(256);
         self.spawn_proxy_pod_periodic_reconcile(tx.clone(), manages_proxy_pod);
 
@@ -2887,19 +2951,30 @@ impl KubernetesComputeDriver {
                                 break;
                             }
                         }
-                        // The supervisor Deployment watch is a readiness
-                        // optimization, not the source of truth: get/list and the
-                        // periodic reconcile still fold in supervisor availability.
-                        // Degrade to reconcile-only rather than tearing down the
-                        // sandbox watch (e.g. a migration that did not retain the
-                        // Deployment RBAC would otherwise fail the whole stream).
-                        Ok(None) => {
-                            warn!("Supervisor Deployment watch ended; readiness falls back to reconcile");
-                            deployment_stream = futures::stream::pending().boxed();
-                        }
+                        // kube's watcher self-heals transient errors and keeps
+                        // yielding (it re-lists and re-watches with backoff), so
+                        // keep polling the same stream instead of disabling the
+                        // watch. The watch is only an optimization anyway —
+                        // get/list and the periodic reconcile still fold in
+                        // supervisor availability — so a persistent error (e.g. a
+                        // migration without the Deployment RBAC) just backs off and
+                        // logs; it never tears down the sandbox watch.
                         Err(err) => {
-                            warn!(error = %err, "Supervisor Deployment watch failed; readiness falls back to reconcile");
-                            deployment_stream = futures::stream::pending().boxed();
+                            warn!(error = %err, "Supervisor Deployment watch error; retrying");
+                        }
+                        // A watcher stream should not end; if it does, re-establish
+                        // it after a short backoff so fast readiness is not lost for
+                        // the rest of this sandbox watch's lifetime.
+                        Ok(None) => {
+                            if let Some((api, selector)) = &deployment_watch {
+                                warn!("Supervisor Deployment watch ended; re-establishing");
+                                tokio::time::sleep(DEPLOYMENT_WATCH_REESTABLISH_BACKOFF).await;
+                                deployment_stream = proxy_pod_supervisor_deployment_stream(
+                                    true, api.clone(), selector.clone(),
+                                );
+                            } else {
+                                deployment_stream = futures::stream::pending().boxed();
+                            }
                         }
                     },
                     () = tx.closed() => break,
