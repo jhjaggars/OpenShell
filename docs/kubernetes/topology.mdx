@@ -367,6 +367,37 @@ supervisor:
     affinity: disabled
 ```
 
+On OpenShift (and any cluster whose DNS is not the upstream
+`kube-system`/`kube-dns` convention) you must also declare the cluster DNS peer
+and grant the built-in `nonroot-v2` SCC — otherwise the agent pod cannot resolve
+its supervisor Service and the supervisor pod is inadmissible:
+
+```yaml
+supervisor:
+  topology: proxy-pod
+  proxyPod:
+    proxyUid: 1337
+    affinity: disabled
+    # OpenShift runs cluster DNS in openshift-dns on container port 5353, not
+    # kube-system/53. Without this the agent egress NetworkPolicy denies DNS.
+    dnsPeers:
+      - namespaceLabels:
+          kubernetes.io/metadata.name: openshift-dns
+        podLabels:
+          dns.operator.openshift.io/daemonset-dns: default
+        port: 5353
+sandboxServiceAccount:
+  openshift:
+    # restricted-v2 rejects the driver's explicit non-root UIDs; nonroot-v2
+    # accepts them. Supported only with shared workspace mode.
+    nonrootSCC: true
+```
+
+Changing `supervisor.topology` away from proxy-pod while proxy-pod sandboxes
+still exist removes the RBAC those sandboxes need for lifecycle and cleanup. Set
+`supervisor.proxyPod.retainCompanionRbac=true` during such a migration and leave
+it set until every proxy-pod sandbox has been deleted.
+
 Leave `topology` unset, or set it to `combined`, to keep the original
 single-container supervisor path. For Helm installs, leave
 `supervisor.topology` unset or set it to `combined`.

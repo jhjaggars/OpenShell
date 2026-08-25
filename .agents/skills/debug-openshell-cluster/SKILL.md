@@ -569,6 +569,15 @@ kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-supervisor-networ
 kubectl -n <sandbox-namespace> logs <sandbox-pod> -c agent --tail=200
 ```
 
+In `proxy-pod` topology the network supervisor is NOT a container in the sandbox
+pod — it runs in the separate per-sandbox supervisor `Deployment`. Get its logs
+from that pod instead; the sandbox pod has only the workload `agent` container:
+
+```bash
+kubectl -n <sandbox-namespace> logs deploy/<os-sup-...> --tail=200
+kubectl -n <sandbox-namespace> logs <sandbox-pod> -c agent --tail=200
+```
+
 #### Corporate upstream proxy
 
 When the deployment routes sandbox egress through a corporate HTTP forward
