@@ -52,7 +52,9 @@ rules:
   # the gateway never deletes companions itself, so no `delete` verbs are
   # granted. `get` supports crash-recovery reconciliation (verifying an existing
   # companion's owner before adopting it) and, on deployments, the readiness and
-  # ServiceAccount-bootstrap owner-chain checks. `patch` on deployments scales
+  # ServiceAccount-bootstrap owner-chain checks. `list` and `watch` on
+  # deployments back the supervisor Deployment watch that refreshes sandbox
+  # readiness when supervisor availability changes. `patch` on deployments scales
   # the paired supervisor on stop/start. The gateway never reads Secret contents,
   # so Secrets get `create` only. These permissions render only when the
   # Kubernetes driver is configured for proxy-pod topology.
@@ -63,7 +65,9 @@ rules:
     verbs:
       - create
       - get
+      - list
       - patch
+      - watch
   - apiGroups:
       - apps
     resources:

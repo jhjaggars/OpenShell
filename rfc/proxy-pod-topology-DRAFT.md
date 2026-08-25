@@ -196,7 +196,9 @@ Because the supervisor pod is created by a `Deployment`, its owner chain is
 `Pod → ReplicaSet → Deployment → Sandbox` rather than `Pod → Sandbox`. Gateway
 ServiceAccount bootstrap must walk that chain to authenticate the supervisor,
 validating each link's UID, which is why the topology needs `apps/replicasets:
-get` and `apps/deployments: get` in the sandbox `Role`.
+get` and `apps/deployments: get` in the sandbox `Role`. The topology also watches
+supervisor Deployments to keep readiness current, so the `Role` additionally
+grants `apps/deployments: list` and `watch`.
 
 ### Privilege model
 
@@ -654,11 +656,17 @@ through `exec`, SSH, upload, and sync, which this topology removes by design. A
 run would fail broadly on absent capabilities and produce no signal about the
 fence. `proxy-pod` needs a capability-scoped suite asserting what the topology
 actually promises: egress denial, proxied egress, DNS, CA trust, and resource
-GC. Until that exists the `test:e2e` gate on this work is unsatisfiable.
+GC. The capability-scoped `proxy_pod` suite now exists (`mise run
+e2e:kubernetes:proxy-pod`) and runs in branch CI as `kubernetes-proxy-pod-e2e`.
+Because CI's kind cluster uses a non-enforcing CNI, that job exercises the
+control-plane contract — companion creation, readiness, and sessionless relay
+rejection — but not the CNI-enforced egress isolation. The enforcement assertions
+(egress denial and proxied egress) still need a policy-enforcing CNI in CI and
+remain tracked as follow-up.
 
-**Phase 5 — graduation.** Ship experimental. Graduate once the scoped suite runs
-in CI on at least one policy-enforcing CNI, and the OpenShift path is validated
-end to end.
+**Phase 5 — graduation.** Ship experimental. Graduate once the scoped suite's
+enforcement assertions run in CI on at least one policy-enforcing CNI, and the
+OpenShift path is validated end to end.
 
 ## Risks
 
@@ -681,7 +689,11 @@ mitigated: the driver folds supervisor Deployment availability into sandbox
 status, so a sandbox whose supervisor has no available replica falls back to
 `Provisioning` (Ready condition `False`, transient reason
 `DependenciesNotReady`) rather than staying Ready with a dead egress path, and
-recovers to `Ready` once the supervisor Deployment is available again.
+recovers to `Ready` once the supervisor Deployment is available again. The driver
+watches supervisor Deployments and pushes a refreshed status within seconds of an
+availability change, so readiness does not lag behind the supervisor until the
+next query or reconcile sweep; `get`/`list` queries and the periodic reconcile
+fold in the same check as a backstop.
 
 **Confused-deputy via image-baked launch environment.** In `combined` topology
 the supervisor shares the workload's container and inherits the workload image's

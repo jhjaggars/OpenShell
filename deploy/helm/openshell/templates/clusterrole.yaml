@@ -156,7 +156,9 @@ rules:
   # by garbage collection when it is deleted, so no `delete` verbs are granted —
   # a compromised gateway must not be able to delete cluster resources. `get`
   # supports crash-recovery reconciliation and, on deployments, readiness and
-  # the ServiceAccount-bootstrap owner-chain check. `patch` on deployments scales
+  # the ServiceAccount-bootstrap owner-chain check. `list` and `watch` on
+  # deployments back the supervisor Deployment watch that refreshes sandbox
+  # readiness when supervisor availability changes. `patch` on deployments scales
   # the supervisor on stop/start. The gateway never reads Secret contents, so
   # Secrets get `create` only (no cluster-wide Secret read).
   - apiGroups:
@@ -166,7 +168,9 @@ rules:
     verbs:
       - create
       - get
+      - list
       - patch
+      - watch
   - apiGroups:
       - apps
     resources:

@@ -106,6 +106,14 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
 /// API server is unreachable or slow.
 const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Interval at which a proxy-pod gateway re-runs companion reconciliation while
+/// its sandbox watch is established. `reconcile_proxy_pod_companions` otherwise
+/// runs only at watch establishment, so a stop-time supervisor scale-down that
+/// failed transiently (or an egress fence orphaned by a crash) would persist
+/// until the next re-establishment. The periodic sweep bounds that window
+/// without depending on the watch dropping.
+const PROXY_POD_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Kubernetes defaults pod termination to 30 seconds when the pod template
 /// omits `terminationGracePeriodSeconds`.
 const DEFAULT_POD_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(30);
@@ -1101,6 +1109,17 @@ impl KubernetesComputeDriver {
         openshell_sandbox_selector_for(&self.config.gateway_id)
     }
 
+    /// Label selector matching this gateway's proxy-pod supervisor Deployments.
+    /// Scopes the supervisor Deployment watch to this gateway's supervisors so a
+    /// Deployment availability change can be turned into a sandbox readiness
+    /// refresh without observing unrelated Deployments.
+    fn proxy_pod_supervisor_selector(&self) -> String {
+        format!(
+            "{},{LABEL_SANDBOX_ROLE}={SANDBOX_ROLE_SUPERVISOR}",
+            self.openshell_sandbox_selector()
+        )
+    }
+
     async fn supported_sandbox_api_version(&self, client: Client) -> Result<&'static str, String> {
         self.sandbox_api_version
             .get_or_try_init(
@@ -1816,11 +1835,46 @@ impl KubernetesComputeDriver {
         proxy_pod_supervisor_unavailable(&self.client, namespace, deployment_name).await
     }
 
+    /// Spawn a periodic proxy-pod companion reconciliation bound to a sandbox
+    /// watch's lifetime. `reconcile_proxy_pod_companions` otherwise runs only at
+    /// watch establishment, which leaves a transiently-failed supervisor
+    /// scale-down (or a crash-orphaned egress fence) uncorrected until the watch
+    /// re-establishes. The periodic sweep bounds that window to
+    /// `PROXY_POD_RECONCILE_INTERVAL`.
+    ///
+    /// Only proxy-pod gateways schedule it. The task exits when the watch stream
+    /// consumer drops its receiver (observed through `tx.closed()`), so each new
+    /// watch establishment replaces the previous reconcile task rather than
+    /// accumulating one.
+    fn spawn_proxy_pod_periodic_reconcile(
+        &self,
+        tx: mpsc::Sender<Result<WatchSandboxesEvent, KubernetesDriverError>>,
+    ) {
+        if self.config.topology != SupervisorTopology::ProxyPod {
+            return;
+        }
+        let driver = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(PROXY_POD_RECONCILE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // The first tick fires immediately; discard it because
+            // `watch_sandboxes` already reconciled before establishing the watch.
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => driver.reconcile_proxy_pod_companions().await,
+                    () = tx.closed() => break,
+                }
+            }
+        });
+    }
+
     /// Repair proxy-pod companions for every existing Sandbox CR. A gateway
     /// crash between the CR create and its companion creates leaves a persisted
     /// CR with a partial topology that ordinary reconciliation never repairs,
     /// because the CR already exists. Runs on each `watch_sandboxes` call
-    /// (gateway start and watch re-establishment). Best-effort: failures are
+    /// (gateway start and watch re-establishment) and periodically thereafter
+    /// via `spawn_proxy_pod_periodic_reconcile`. Best-effort: failures are
     /// logged, not fatal.
     async fn reconcile_proxy_pod_companions(&self) {
         // Driven by each CR's persisted creation-time topology, not the
@@ -2563,6 +2617,9 @@ impl KubernetesComputeDriver {
         let topology = self.config.topology;
         // Plain client for supervisor Deployment readiness checks inside the task.
         let client = self.client.clone();
+        // Owned driver handle for CR lookups triggered by supervisor Deployment
+        // changes (proxy-pod readiness refresh).
+        let driver = self.clone();
         let agent_sandbox_api = self
             .supported_agent_sandbox_api(self.watch_client.clone(), &self.config.namespace)
             .await?;
@@ -2570,7 +2627,16 @@ impl KubernetesComputeDriver {
         let watcher_config = watcher::Config::default().labels(&openshell_sandbox_label_selector());
         let mut sandbox_stream = watcher::watcher(agent_sandbox_api.api, watcher_config).boxed();
         let mut event_stream = watcher::watcher(event_api, watcher::Config::default()).boxed();
+        // Watch supervisor Deployments so proxy-pod readiness reflects supervisor
+        // availability within seconds. Non-proxy-pod gateways never observe
+        // supervisors, so they hold a stream that never yields.
+        let mut deployment_stream = proxy_pod_supervisor_deployment_stream(
+            topology,
+            Api::namespaced(self.watch_client.clone(), &namespace),
+            self.proxy_pod_supervisor_selector(),
+        );
         let (tx, rx) = mpsc::channel(256);
+        self.spawn_proxy_pod_periodic_reconcile(tx.clone());
 
         tokio::spawn(async move {
             let mut sandbox_name_to_id = std::collections::HashMap::<String, String>::new();
@@ -2665,6 +2731,23 @@ impl KubernetesComputeDriver {
                             break;
                         }
                     },
+                    result = deployment_stream.try_next() => match result {
+                        Ok(Some(event)) => {
+                            if !handle_supervisor_deployment_event(&driver, &tx, event).await {
+                                break;
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = tx.send(Err(KubernetesDriverError::Message(
+                                "supervisor deployment watcher stream ended".to_string()
+                            ))).await;
+                            break;
+                        }
+                        Err(err) => {
+                            let _ = tx.send(Err(KubernetesDriverError::Message(err.to_string()))).await;
+                            break;
+                        }
+                    },
                     () = tx.closed() => break,
                 }
             }
@@ -2677,6 +2760,9 @@ impl KubernetesComputeDriver {
         let topology = self.config.topology;
         // Plain client for supervisor Deployment readiness checks inside the task.
         let client = self.client.clone();
+        // Owned driver handle for CR lookups triggered by supervisor Deployment
+        // changes (proxy-pod readiness refresh).
+        let driver = self.clone();
         let sandbox_api_version = self
             .supported_sandbox_api_version(self.watch_client.clone())
             .await?;
@@ -2685,7 +2771,16 @@ impl KubernetesComputeDriver {
         let selector = self.openshell_sandbox_selector();
         let watcher_config = watcher::Config::default().labels(&selector);
         let mut sandbox_stream = watcher::watcher(cluster_api.api, watcher_config).boxed();
+        // Watch supervisor Deployments cluster-wide so proxy-pod readiness
+        // reflects supervisor availability within seconds. Non-proxy-pod
+        // gateways hold a stream that never yields.
+        let mut deployment_stream = proxy_pod_supervisor_deployment_stream(
+            topology,
+            Api::all(self.watch_client.clone()),
+            self.proxy_pod_supervisor_selector(),
+        );
         let (tx, rx) = mpsc::channel(256);
+        self.spawn_proxy_pod_periodic_reconcile(tx.clone());
         let default_namespace = self.config.namespace.clone();
 
         tokio::spawn(async move {
@@ -2747,12 +2842,46 @@ impl KubernetesComputeDriver {
                             break;
                         }
                     },
+                    result = deployment_stream.try_next() => match result {
+                        Ok(Some(event)) => {
+                            if !handle_supervisor_deployment_event(&driver, &tx, event).await {
+                                break;
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = tx.send(Err(KubernetesDriverError::Message(
+                                "supervisor deployment watcher stream ended".to_string()
+                            ))).await;
+                            break;
+                        }
+                        Err(err) => {
+                            let _ = tx.send(Err(KubernetesDriverError::Message(err.to_string()))).await;
+                            break;
+                        }
+                    },
                     () = tx.closed() => break,
                 }
             }
         });
 
         Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+}
+
+/// A supervisor Deployment watch scoped to `selector`, or a stream that never
+/// yields for non-proxy-pod topologies (which manage no supervisor Deployments).
+/// Boxing both arms to one type lets the watch loop poll a single branch
+/// unconditionally.
+fn proxy_pod_supervisor_deployment_stream(
+    topology: SupervisorTopology,
+    deployments: Api<Deployment>,
+    selector: String,
+) -> Pin<Box<dyn Stream<Item = Result<Event<Deployment>, watcher::Error>> + Send>> {
+    if topology == SupervisorTopology::ProxyPod {
+        let config = watcher::Config::default().labels(&selector);
+        watcher::watcher(deployments, config).boxed()
+    } else {
+        futures::stream::pending().boxed()
     }
 }
 
@@ -6478,6 +6607,77 @@ async fn sandbox_from_object_with_supervisor_readiness(
         }
     }
     Ok((kube_name, sandbox))
+}
+
+/// The `openshell.ai/sandbox-id` a supervisor Deployment belongs to, or `None`
+/// when the label is absent or empty (not an OpenShell-managed supervisor).
+fn supervisor_deployment_sandbox_id(deployment: &Deployment) -> Option<String> {
+    deployment
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
+        .filter(|id| !id.is_empty())
+        .cloned()
+}
+
+/// Push a refreshed sandbox status in response to a supervisor Deployment
+/// change so proxy-pod readiness reflects supervisor availability within seconds
+/// instead of waiting for the reconcile sweep. `get_sandbox` re-reads the CR and
+/// folds in live supervisor availability. Returns `false` only when the watch
+/// consumer has gone away, signalling the caller to stop.
+async fn emit_supervisor_readiness_refresh(
+    driver: &KubernetesComputeDriver,
+    tx: &mpsc::Sender<Result<WatchSandboxesEvent, KubernetesDriverError>>,
+    deployment: &Deployment,
+) -> bool {
+    let Some(sandbox_id) = supervisor_deployment_sandbox_id(deployment) else {
+        return true;
+    };
+    match driver.get_sandbox(&sandbox_id).await {
+        Ok(Some(sandbox)) => {
+            let event = WatchSandboxesEvent {
+                payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                    WatchSandboxesSandboxEvent {
+                        sandbox: Some(sandbox),
+                    },
+                )),
+            };
+            tx.send(Ok(event)).await.is_ok()
+        }
+        // The CR is already gone; the sandbox watch emits its own Deleted event.
+        Ok(None) => true,
+        Err(err) => {
+            warn!(
+                sandbox_id = %sandbox_id,
+                error = %err,
+                "Failed to refresh sandbox status after supervisor Deployment change"
+            );
+            true
+        }
+    }
+}
+
+/// Turn one supervisor Deployment watch event into sandbox status refreshes.
+/// Returns `false` when the watch consumer has gone away.
+async fn handle_supervisor_deployment_event(
+    driver: &KubernetesComputeDriver,
+    tx: &mpsc::Sender<Result<WatchSandboxesEvent, KubernetesDriverError>>,
+    event: Event<Deployment>,
+) -> bool {
+    match event {
+        Event::Applied(deployment) | Event::Deleted(deployment) => {
+            emit_supervisor_readiness_refresh(driver, tx, &deployment).await
+        }
+        Event::Restarted(deployments) => {
+            for deployment in deployments {
+                if !emit_supervisor_readiness_refresh(driver, tx, &deployment).await {
+                    return false;
+                }
+            }
+            true
+        }
+    }
 }
 
 /// Desired supervisor replica count from a Sandbox CR's operating state: `1`
@@ -11288,6 +11488,42 @@ mod tests {
             sel.contains(&format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}")),
             "selector must include managed-by: {sel}"
         );
+    }
+
+    #[test]
+    fn supervisor_deployment_sandbox_id_reads_label() {
+        let deployment = Deployment {
+            metadata: ObjectMeta {
+                labels: Some(BTreeMap::from([(
+                    LABEL_SANDBOX_ID.to_string(),
+                    "sb-77".to_string(),
+                )])),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            supervisor_deployment_sandbox_id(&deployment),
+            Some("sb-77".to_string())
+        );
+    }
+
+    #[test]
+    fn supervisor_deployment_sandbox_id_none_when_missing_or_empty() {
+        let no_labels = Deployment::default();
+        assert_eq!(supervisor_deployment_sandbox_id(&no_labels), None);
+
+        let empty = Deployment {
+            metadata: ObjectMeta {
+                labels: Some(BTreeMap::from([(
+                    LABEL_SANDBOX_ID.to_string(),
+                    String::new(),
+                )])),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(supervisor_deployment_sandbox_id(&empty), None);
     }
 
     #[test]

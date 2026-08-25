@@ -76,6 +76,7 @@ tests:
       supervisor.topology: proxy-pod
     asserts:
       # No delete: companions are garbage-collected with the Sandbox CR.
+      # list + watch back the supervisor Deployment readiness watch.
       - contains:
           path: rules
           content:
@@ -86,7 +87,9 @@ tests:
             verbs:
               - create
               - get
+              - list
               - patch
+              - watch
 
   - it: grants ReplicaSet get for proxy-pod supervisor token bootstrap
     template: templates/role.yaml

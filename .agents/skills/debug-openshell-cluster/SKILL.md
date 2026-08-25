@@ -536,8 +536,12 @@ NetworkPolicy — the workload's egress fence — carries no owner reference and
 deleted by the gateway only after the workload pod is gone, so a pod that ignores
 SIGTERM cannot regain direct egress during its grace period; reconciliation reaps
 any fence orphaned by a gateway crash (hence `delete`/`list` on networkpolicies).
-If a deleted sandbox leaves an `os-eg-...` NetworkPolicy behind, check that the
-gateway's reconcile ran and that the workload pod actually terminated. Do not
+Reconciliation runs at watch establishment and then periodically (~30s) while the
+sandbox watch is up, so a transiently-failed stop-time supervisor scale-down or a
+crash-orphaned fence is corrected without waiting for the watch to drop. If a
+deleted sandbox leaves an `os-eg-...` NetworkPolicy behind, or a stopped
+sandbox's `os-sup-...` Deployment keeps a replica, check that the gateway's
+reconcile ran and that the workload pod actually terminated. Do not
 change `supervisor.topology` away from proxy-pod while proxy-pod sandboxes still
 exist: their companion RBAC and reconciliation are gated on the rendered
 topology, so start/stop and crash-recovery for those sandboxes stop working until
@@ -550,7 +554,11 @@ A proxy-pod sandbox falls back to `Provisioning` (Ready condition `False`,
 reason `DependenciesNotReady`) when its supervisor Deployment has no available
 replica: the gateway folds supervisor Deployment availability into sandbox
 status so a sandbox never stays Ready while its policy-enforced egress path is
-down, and recovers to `Ready` once the supervisor does. If a previously-Ready
+down, and recovers to `Ready` once the supervisor does. The gateway watches
+supervisor Deployments (hence `list`/`watch` on `apps/deployments`) and pushes a
+refreshed status within seconds of an availability change; direct `get`/`list`
+queries and the periodic reconcile fold in the same check, so a stale watch never
+leaves readiness wrong for long. If a previously-Ready
 sandbox drops to `Provisioning`, inspect the supervisor Deployment (`kubectl -n
 <sandbox-namespace> get deploy <os-sup-...>`) and its pod. Companion resource names are keyed on the
 immutable sandbox UUID, so the `os-sup-`/`os-svc-`/`os-ca-`/`os-eg-`/`os-ing-`
