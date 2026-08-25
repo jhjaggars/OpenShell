@@ -1678,6 +1678,12 @@ pub(super) async fn handle_exec_sandbox_interactive(
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
+    // A sessionless topology (e.g. proxy-pod) has no in-sandbox supervisor to
+    // relay to. Reject from the durable status on every replica, so a follower
+    // returns the terminal FailedPrecondition immediately instead of waiting out
+    // the relay-open timeout and returning retryable Unavailable.
+    reject_if_sessionless(&sandbox)?;
+
     let (channel_id, relay_rx) = state
         .supervisor_sessions
         .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))

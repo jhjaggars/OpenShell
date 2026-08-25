@@ -3987,14 +3987,25 @@ fn ensure_supervisor_not_ready_status(status: &mut Option<SandboxStatus>, sandbo
 /// avoids adding a field to the public `Sandbox` message.
 pub const SUPERVISOR_SESSION_CONDITION: &str = "SupervisorSession";
 
+/// Reason marking a `SupervisorSession=False` condition as a permanent property
+/// of the topology (no in-sandbox supervisor) rather than a transient
+/// disconnect. Only this reason is treated as durably sessionless.
+pub const SUPERVISOR_SESSION_NOT_APPLICABLE_REASON: &str = "NotApplicable";
+
 /// Whether a stored sandbox status marks the sandbox as having no supervisor
-/// session (via the durable `SupervisorSession=False` condition). Lets any
-/// gateway replica reject relay-backed RPCs from durable state, not only the
-/// reconciler lease holder that populates the in-memory sessionless set.
+/// session (via the durable `SupervisorSession=False` condition with reason
+/// `NotApplicable`). Lets any gateway replica reject relay-backed RPCs from
+/// durable state, not only the reconciler lease holder that populates the
+/// in-memory sessionless set. The reason is required so a future driver that
+/// reports `SupervisorSession=False` for a *transient* disconnect is not given
+/// a terminal relay rejection.
 pub fn sandbox_status_is_sessionless(status: &SandboxStatus) -> bool {
     status.conditions.iter().any(|condition| {
         condition.r#type == SUPERVISOR_SESSION_CONDITION
             && condition.status.eq_ignore_ascii_case("false")
+            && condition
+                .reason
+                .eq_ignore_ascii_case(SUPERVISOR_SESSION_NOT_APPLICABLE_REASON)
     })
 }
 
@@ -4028,7 +4039,7 @@ fn ensure_no_supervisor_session_status(status: &mut Option<SandboxStatus>, sandb
         SandboxCondition {
             r#type: SUPERVISOR_SESSION_CONDITION.to_string(),
             status: "False".to_string(),
-            reason: "NotApplicable".to_string(),
+            reason: SUPERVISOR_SESSION_NOT_APPLICABLE_REASON.to_string(),
             message: openshell_core::error::no_supervisor_session_message(),
             last_transition_time: String::new(),
         },
@@ -5707,6 +5718,34 @@ mod tests {
                 "{reason}"
             );
         }
+    }
+
+    #[test]
+    fn sessionless_requires_not_applicable_reason() {
+        let sessionless = SandboxStatus {
+            conditions: vec![SandboxCondition {
+                r#type: SUPERVISOR_SESSION_CONDITION.to_string(),
+                status: "False".to_string(),
+                reason: SUPERVISOR_SESSION_NOT_APPLICABLE_REASON.to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(sandbox_status_is_sessionless(&sessionless));
+
+        // SupervisorSession=False for a *transient* disconnect (any other reason)
+        // must NOT be treated as durably sessionless, or a future driver would
+        // get a terminal relay rejection during a temporary outage.
+        let transient = SandboxStatus {
+            conditions: vec![SandboxCondition {
+                r#type: SUPERVISOR_SESSION_CONDITION.to_string(),
+                status: "False".to_string(),
+                reason: "Disconnected".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!sandbox_status_is_sessionless(&transient));
     }
 
     #[test]
