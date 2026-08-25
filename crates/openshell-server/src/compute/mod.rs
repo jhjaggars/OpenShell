@@ -3991,7 +3991,7 @@ pub const SUPERVISOR_SESSION_CONDITION: &str = "SupervisorSession";
 /// session (via the durable `SupervisorSession=False` condition). Lets any
 /// gateway replica reject relay-backed RPCs from durable state, not only the
 /// reconciler lease holder that populates the in-memory sessionless set.
-pub(crate) fn sandbox_status_is_sessionless(status: &SandboxStatus) -> bool {
+pub fn sandbox_status_is_sessionless(status: &SandboxStatus) -> bool {
     status.conditions.iter().any(|condition| {
         condition.r#type == SUPERVISOR_SESSION_CONDITION
             && condition.status.eq_ignore_ascii_case("false")
