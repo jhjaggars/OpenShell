@@ -112,6 +112,23 @@ impl Drop for WatchSandboxStream {
 /// Fetch a sandbox by ID and authorize the caller in one step, returning
 /// `NOT_FOUND` for both missing and unauthorized sandboxes so that callers
 /// cannot distinguish the two cases (CWE-203).
+/// Reject a relay-backed RPC when the sandbox's topology has no in-sandbox
+/// supervisor session. Reads the durable `SupervisorSession=NotApplicable`
+/// condition from the stored status so this holds on every gateway replica —
+/// not only the reconciler lease holder that populates the in-memory set — and
+/// returns the terminal `FailedPrecondition` the CLI must not retry, instead of
+/// making the caller wait out a session that will never arrive.
+fn reject_if_sessionless(sandbox: &Sandbox) -> Result<(), Status> {
+    if let Some(status) = sandbox.status.as_ref()
+        && crate::compute::sandbox_status_is_sessionless(status)
+    {
+        return Err(Status::failed_precondition(
+            openshell_core::error::no_supervisor_session_message(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn fetch_and_authorize_sandbox(
     state: &Arc<ServerState>,
     principal: &crate::auth::principal::Principal,
@@ -1210,6 +1227,8 @@ pub(super) async fn handle_exec_sandbox(
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
+    reject_if_sessionless(&sandbox)?;
+
     // Open a relay channel through the supervisor session. Use a 15s
     // session-wait timeout, enough to cover a transient supervisor reconnect
     // while still failing quickly during normal operation.
@@ -1327,6 +1346,7 @@ pub(super) async fn handle_forward_tcp(
     if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
+    reject_if_sessionless(&sandbox)?;
 
     let connection_guard = acquire_forward_connection_guard(state, &init, &sandbox).await?;
     let (channel_id, relay_rx) = state
