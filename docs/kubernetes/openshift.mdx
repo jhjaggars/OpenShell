@@ -9,7 +9,7 @@ position: 6
 ---
 
 <Warning>
-The OpenShift install path is experimental. The default `combined` topology runs sandbox pods under the `privileged` SCC, and this guide installs the gateway with TLS disabled. Use only for evaluation on a private network. The lower-privilege `sidecar` and `proxy-pod` topologies instead run under the built-in `nonroot-v2` SCC (set `sandboxServiceAccount.openshift.nonrootSCC=true`) — see [Topology](/kubernetes/topology).
+The OpenShift install path is experimental. The default `combined` topology runs sandbox pods under the `privileged` SCC, and this guide installs the gateway with TLS disabled. Use only for evaluation on a private network. Only the `proxy-pod` topology runs sandbox pods under the built-in `nonroot-v2` SCC (set `sandboxServiceAccount.openshift.nonrootSCC=true`); the `sidecar` and `cni-sidecar` topologies still need a custom SCC (their network init container and root sidecar require added capabilities) — see [Topology](/kubernetes/topology).
 </Warning>
 
 OpenShift's [Security Context Constraints](https://docs.openshift.com/container-platform/latest/authentication/managing-security-context-constraints.html) reject the chart's default pod security settings. Installing on OpenShift requires precreating the namespace, granting the `privileged` SCC to the sandbox service account, and overriding a few chart values so the cluster admission controller can assign UIDs and FS groups itself.
@@ -45,7 +45,7 @@ Sandbox pods run under the `openshell-sandbox` service account in the `openshell
 oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell
 ```
 
-For the `sidecar` or `proxy-pod` topology, skip this grant and instead set `sandboxServiceAccount.openshift.nonrootSCC=true` when installing the chart, which binds the built-in `nonroot-v2` SCC. See [Topology](/kubernetes/topology) for the per-topology privilege model.
+For the `proxy-pod` topology, skip this grant and instead set `sandboxServiceAccount.openshift.nonrootSCC=true` when installing the chart, which binds the built-in `nonroot-v2` SCC. The `sidecar` and `cni-sidecar` topologies are *not* covered by `nonroot-v2` — their UID-0 network init container and default root sidecar need added capabilities, so they require a custom SCC. See [Topology](/kubernetes/topology) for the per-topology privilege model.
 
 ## Install the chart with OpenShift overrides
 
