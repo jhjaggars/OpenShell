@@ -125,6 +125,11 @@ const SANDBOX_POD_NAME_ANNOTATION: &str = "agents.x-k8s.io/pod-name";
 /// Deployment. Reading this annotation keeps status and lifecycle behavior tied
 /// to the topology the sandbox was actually created with.
 const ANNOTATION_SUPERVISOR_TOPOLOGY: &str = "openshell.ai/supervisor-topology";
+/// Records the name of the workload (agent) pod a proxy-pod egress fence guards.
+/// The fence has no owner reference, so on delete/reap the gateway must confirm
+/// that specific pod is gone before removing the fence — addressing it by name
+/// (a scoped `get`) rather than enumerating pods cluster-wide.
+const ANNOTATION_AGENT_POD_NAME: &str = "openshell.ai/agent-pod-name";
 const SANDBOX_SUSPENDED_CONDITION: &str = "Suspended";
 const SANDBOX_SUSPENDED_POD_NOT_OWNED_REASON: &str = "PodNotOwned";
 
@@ -1563,24 +1568,37 @@ impl KubernetesComputeDriver {
                     resource_version: None,
                 });
             }
-            let _ = tokio::time::timeout(
+            let cr_deleted = match tokio::time::timeout(
                 KUBE_API_TIMEOUT,
                 agent_sandbox_api.api.delete(created_name, &delete_params),
             )
-            .await;
+            .await
+            {
+                Ok(Ok(_)) => true,
+                Ok(Err(KubeError::Api(err))) if err.code == 404 => true,
+                _ => false,
+            };
             // The agent egress NetworkPolicy carries no owner reference, so GC
-            // will not collect it. The CR delete above may have raced a partially
-            // committed create and the controller may already have started the
-            // workload pod, so tear the fence down only after confirming the pod
-            // is gone (the same ordered-teardown invariant as delete_sandbox);
-            // if that cannot be confirmed the fence is retained for the reaper.
-            self.teardown_proxy_pod_fence(
-                params.namespace,
-                params.cr_name,
-                &sandbox.id,
-                DEFAULT_POD_TERMINATION_GRACE_PERIOD.saturating_add(KUBE_API_TIMEOUT),
-            )
-            .await;
+            // will not collect it. Only tear the fence down once the CR is
+            // confirmed gone AND the workload pod is gone: if the CR delete
+            // failed (never reached Kubernetes, timed out, precondition
+            // conflict), the surviving CR could still create an unfenced
+            // workload, so the fence must stay. A retained fence is reaped by
+            // reconciliation once its CR is truly absent.
+            if cr_deleted {
+                self.teardown_proxy_pod_fence(
+                    params.namespace,
+                    params.cr_name,
+                    &sandbox.id,
+                    DEFAULT_POD_TERMINATION_GRACE_PERIOD.saturating_add(KUBE_API_TIMEOUT),
+                )
+                .await;
+            } else {
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    "Sandbox CR deletion unconfirmed on rollback; retaining egress fence"
+                );
+            }
             return Err(err);
         }
 
@@ -1925,12 +1943,23 @@ impl KubernetesComputeDriver {
                 .as_deref()
                 .unwrap_or(&self.config.namespace)
                 .to_string();
+            // The guarded workload pod's name, recorded on the fence at creation.
+            let Some(pod_name) = policy
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(ANNOTATION_AGENT_POD_NAME))
+                .filter(|value| !value.is_empty())
+            else {
+                debug!(policy = %name, "Retaining orphaned egress fence: no recorded workload pod name");
+                continue;
+            };
             // The CR is gone, but background garbage collection may still be
             // terminating the workload pod. Only drop the fence once that pod is
             // confirmed absent; retain it (this sweep or a later one reaps it)
             // when absence cannot be confirmed, so a SIGTERM-ignoring workload
             // never regains direct egress.
-            if self.workload_pod_absent(&ns, &sandbox_id).await != Some(true) {
+            if self.workload_pod_absent(&ns, pod_name).await != Some(true) {
                 debug!(sandbox_id = %sandbox_id, policy = %name, "Retaining orphaned egress fence: workload pod not confirmed absent");
                 continue;
             }
@@ -2420,33 +2449,27 @@ impl KubernetesComputeDriver {
         deleted
     }
 
-    /// Report whether the workload (agent) pod for a sandbox is absent.
+    /// Report whether the named workload (agent) pod is absent.
     ///
-    /// Identifies the pod by its immutable `sandbox-id` + `agent` role labels
-    /// (not by name, so it works from the delete, rollback, and reconciliation
-    /// paths alike). `Some(true)` means no such pod exists, `Some(false)` that
-    /// one is still present, and `None` that the check could not be performed —
-    /// callers must retain the egress fence on `None` rather than guess.
-    async fn workload_pod_absent(&self, namespace: &str, sandbox_id: &str) -> Option<bool> {
-        if sandbox_id.is_empty() {
+    /// Uses a name-scoped `get` (not a label `list`) so it needs only `pods:get`,
+    /// never cluster-wide pod enumeration. The workload pod is named after its
+    /// Sandbox CR, and that name is stamped on the fence so every path (delete,
+    /// rollback, reaper) can address it exactly. `Some(true)` means the pod does
+    /// not exist, `Some(false)` that it is still present, and `None` that the
+    /// check could not be performed — callers must retain the fence on `None`.
+    async fn workload_pod_absent(&self, namespace: &str, pod_name: &str) -> Option<bool> {
+        if pod_name.is_empty() {
             return None;
         }
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
-        let selector =
-            format!("{LABEL_SANDBOX_ID}={sandbox_id},{LABEL_SANDBOX_ROLE}={SANDBOX_ROLE_AGENT}");
-        match tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            pods.list(&ListParams::default().labels(&selector)),
-        )
-        .await
-        {
-            Ok(Ok(list)) => Some(list.items.is_empty()),
+        match tokio::time::timeout(KUBE_API_TIMEOUT, pods.get_opt(pod_name)).await {
+            Ok(Ok(existing)) => Some(existing.is_none()),
             Ok(Err(err)) => {
-                warn!(sandbox_id = %sandbox_id, error = %err, "Could not list workload pod");
+                warn!(pod = %pod_name, error = %err, "Could not get workload pod");
                 None
             }
             Err(_elapsed) => {
-                warn!(sandbox_id = %sandbox_id, "Timed out listing workload pod");
+                warn!(pod = %pod_name, "Timed out getting workload pod");
                 None
             }
         }
@@ -2464,10 +2487,13 @@ impl KubernetesComputeDriver {
         sandbox_id: &str,
         stop_timeout: Duration,
     ) {
+        // The workload pod is named after its Sandbox CR (see the pod-name
+        // annotation the controller sets, which equals the CR name).
+        let pod_name = cr_name;
         let deadline = tokio::time::Instant::now() + stop_timeout;
         let mut poll = STOP_INITIAL_POLL_INTERVAL;
         loop {
-            match self.workload_pod_absent(namespace, sandbox_id).await {
+            match self.workload_pod_absent(namespace, pod_name).await {
                 Some(true) => break,
                 // Could not confirm, or pod still present: never drop the fence on
                 // a guess. Retain it; reconciliation reaps it once the pod is gone.
@@ -5503,59 +5529,73 @@ fn build_proxy_pod_companions(
 /// for it. On an `AlreadyExists` conflict, fetch the existing policy and confirm
 /// its enforcement fields (`spec`) and `sandbox-id` label match what we intended
 /// to create; fail closed on any mismatch so a stale or altered policy is never
-/// treated as a valid fence.
+/// treated as a valid fence. If the conflicting policy has vanished by the time
+/// we read it (409 then 404), the fence is *absent* — never treat that as
+/// provisioned; retry the create so the workload is never left at default-allow.
 async fn create_or_validate_egress_fence(
     api: &Api<NetworkPolicy>,
     expected: &NetworkPolicy,
 ) -> Result<(), KubernetesDriverError> {
     const DESC: &str = "proxy-pod agent egress NetworkPolicy";
-    match tokio::time::timeout(
-        KUBE_API_TIMEOUT,
-        api.create(&PostParams::default(), expected),
-    )
-    .await
-    {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(KubeError::Api(err))) if err.code == 409 => {
-            let name = expected.metadata.name.clone().unwrap_or_default();
-            let existing = match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(&name)).await {
-                Ok(Ok(existing)) => existing,
-                // Vanished after the conflict; a later reconcile recreates it.
-                Ok(Err(KubeError::Api(err))) if err.code == 404 => return Ok(()),
-                Ok(Err(err)) => return Err(KubernetesDriverError::from_kube(err)),
-                Err(_elapsed) => {
-                    return Err(KubernetesDriverError::Message(format!(
-                        "timed out after {}s validating {DESC} {name}",
-                        KUBE_API_TIMEOUT.as_secs()
-                    )));
+    const MAX_ATTEMPTS: usize = 4;
+    for _ in 0..MAX_ATTEMPTS {
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            api.create(&PostParams::default(), expected),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(KubeError::Api(err))) if err.code == 409 => {
+                let name = expected.metadata.name.clone().unwrap_or_default();
+                let existing = match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(&name)).await {
+                    Ok(Ok(existing)) => existing,
+                    // Conflicting policy vanished after the 409: the fence is now
+                    // absent. Loop back and re-create it rather than reporting a
+                    // non-existent boundary as provisioned.
+                    Ok(Err(KubeError::Api(err))) if err.code == 404 => continue,
+                    Ok(Err(err)) => return Err(KubernetesDriverError::from_kube(err)),
+                    Err(_elapsed) => {
+                        return Err(KubernetesDriverError::Message(format!(
+                            "timed out after {}s validating {DESC} {name}",
+                            KUBE_API_TIMEOUT.as_secs()
+                        )));
+                    }
+                };
+                let expected_sandbox_id = expected
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(LABEL_SANDBOX_ID));
+                let existing_sandbox_id = existing
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(LABEL_SANDBOX_ID));
+                if existing.spec == expected.spec && existing_sandbox_id == expected_sandbox_id {
+                    return Ok(());
                 }
-            };
-            let expected_sandbox_id = expected
-                .metadata
-                .labels
-                .as_ref()
-                .and_then(|labels| labels.get(LABEL_SANDBOX_ID));
-            let existing_sandbox_id = existing
-                .metadata
-                .labels
-                .as_ref()
-                .and_then(|labels| labels.get(LABEL_SANDBOX_ID));
-            if existing.spec == expected.spec && existing_sandbox_id == expected_sandbox_id {
-                Ok(())
-            } else {
-                Err(KubernetesDriverError::Message(format!(
+                return Err(KubernetesDriverError::Message(format!(
                     "{DESC} {name} already exists but its enforcement does not match the intended \
                      fence (selector, egress rules, or sandbox-id differ); refusing to treat it \
                      as provisioned"
-                )))
+                )));
+            }
+            Ok(Err(err)) => return Err(KubernetesDriverError::from_kube(err)),
+            Err(_elapsed) => {
+                return Err(KubernetesDriverError::Message(format!(
+                    "timed out after {}s creating {DESC}",
+                    KUBE_API_TIMEOUT.as_secs()
+                )));
             }
         }
-        Ok(Err(err)) => Err(KubernetesDriverError::from_kube(err)),
-        Err(_elapsed) => Err(KubernetesDriverError::Message(format!(
-            "timed out after {}s creating {DESC}",
-            KUBE_API_TIMEOUT.as_secs()
-        ))),
     }
+    // Exhausted retries always re-creating/re-reading a vanishing fence: fail
+    // closed rather than proceed without a boundary.
+    Err(KubernetesDriverError::Message(format!(
+        "{DESC} could not be provisioned after {MAX_ATTEMPTS} attempts (create/verify kept racing \
+         a vanishing policy)"
+    )))
 }
 
 async fn create_companion_if_absent<K>(
@@ -6004,6 +6044,12 @@ fn proxy_pod_agent_egress_network_policy(
             "name": names.agent_egress_network_policy,
             "namespace": params.namespace,
             "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_AGENT, params.gateway_id),
+            // Record the guarded workload pod's name so delete/reap can confirm
+            // it is gone by a scoped `get`, never a cluster-wide pod list. The
+            // agent pod is named after its Sandbox CR (== cr_name).
+            "annotations": {
+                ANNOTATION_AGENT_POD_NAME: params.cr_name,
+            },
         },
         "spec": {
             "podSelector": {

@@ -45,7 +45,7 @@ rules:
       - pods
     verbs:
       - get
-  {{- if eq (.Values.supervisor.topology | default "combined") "proxy-pod" }}
+  {{- if or (eq (.Values.supervisor.topology | default "combined") "proxy-pod") .Values.supervisor.proxyPod.retainCompanionRbac }}
   # Proxy-pod topology creates one supervisor Deployment, one supervisor
   # Service, and one CA Secret per sandbox, all owner-referenced to the Sandbox
   # CR so Kubernetes garbage collection removes them when the CR is deleted —
@@ -97,14 +97,6 @@ rules:
       - create
       - delete
       - get
-      - list
-  # `list` on pods lets ordered fence teardown and orphan reaping confirm the
-  # workload pod is gone (by sandbox-id label) before removing its egress fence.
-  - apiGroups:
-      - ""
-    resources:
-      - pods
-    verbs:
       - list
   {{- end }}
 {{- end }}

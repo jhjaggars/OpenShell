@@ -147,7 +147,7 @@ rules:
       - update
   {{- end }}
   {{- end }}
-  {{- if and (ne $workspaceMode "shared") (eq (.Values.supervisor.topology | default "combined") "proxy-pod") }}
+  {{- if and (ne $workspaceMode "shared") (or (eq (.Values.supervisor.topology | default "combined") "proxy-pod") .Values.supervisor.proxyPod.retainCompanionRbac) }}
   # Proxy-pod topology creates a supervisor Deployment, Service, CA Secret, and
   # NetworkPolicy pair per sandbox in the sandbox's namespace. In managed and
   # operator modes that namespace is per-workspace, so these permissions must be
@@ -200,13 +200,5 @@ rules:
       - create
       - delete
       - get
-      - list
-  # `list` on pods lets ordered fence teardown and orphan reaping confirm the
-  # workload pod is gone (by sandbox-id label) before removing its egress fence.
-  - apiGroups:
-      - ""
-    resources:
-      - pods
-    verbs:
       - list
   {{- end }}
