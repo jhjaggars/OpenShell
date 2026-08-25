@@ -196,9 +196,13 @@ Because the supervisor pod is created by a `Deployment`, its owner chain is
 `Pod → ReplicaSet → Deployment → Sandbox` rather than `Pod → Sandbox`. Gateway
 ServiceAccount bootstrap must walk that chain to authenticate the supervisor,
 validating each link's UID, which is why the topology needs `apps/replicasets:
-get` and `apps/deployments: get` in the sandbox `Role`. The topology also watches
-supervisor Deployments to keep readiness current, so the `Role` additionally
-grants `apps/deployments: list` and `watch`.
+get` and `apps/deployments: get` in the sandbox `Role`. In shared
+(single-namespace) mode the topology also watches supervisor Deployments to keep
+readiness current, so the namespaced `Role` additionally grants
+`apps/deployments: list` and `watch`. Managed and operator modes omit those verbs
+from the `ClusterRole` — a cluster-wide Deployment informer would be broad
+enumeration a compromised gateway could abuse — and fold readiness in through
+get/list and the periodic reconcile instead.
 
 ### Privilege model
 

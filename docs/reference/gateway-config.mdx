@@ -554,6 +554,16 @@ process_binary_aware_network_policy = true
 proxy_uid = 1337
 # Same-node workload/supervisor placement: disabled, preferred, or required.
 affinity = "disabled"
+# Cluster DNS peers the agent-egress NetworkPolicy allows. Empty (default) uses
+# the upstream kube-system/kube-dns and kube-system/coredns conventions, which
+# do NOT match OpenShift (cluster DNS runs in openshift-dns) or NodeLocal
+# DNSCache. Each entry sets namespace_labels, pod_labels, or both, plus the DNS
+# pod port (OpenShift's dns-default listens on 5353). An agent pod with no
+# matching DNS peer cannot resolve its own paired supervisor Service.
+[[openshell.drivers.kubernetes.proxy_pod.dns_peers]]
+port = 5353
+namespace_labels = { "kubernetes.io/metadata.name" = "openshift-dns" }
+pod_labels = { "dns.operator.openshift.io/daemonset-dns" = "default" }
 ```
 
 In managed workspace mode, the Kubernetes driver copies each explicitly named

@@ -229,13 +229,16 @@ controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
 deployments. The proxy-pod gateway Role follows least privilege: the supervisor
 Deployment, Service, CA Secret, and supervisor-ingress NetworkPolicy are
 owner-referenced to the Sandbox CR and garbage-collected with it, so the gateway
-holds no `delete` on them (Deployment create/get/list/patch/watch, Service
+holds no `delete` on them (Deployment create/get/patch, Service
 create/get, Secret create only, plus get on the ReplicaSet for the owner-chain
-check). Deployment `list`/`watch` back a supervisor Deployment watch that pushes
-a refreshed sandbox status within seconds of a supervisor availability change,
-and a periodic reconcile (alongside the one at watch establishment) corrects
-supervisor replica drift and reaps orphaned fences without waiting for the watch
-to drop. The agent egress NetworkPolicy — the workload's egress fence — carries
+check). In shared (single-namespace) mode the namespaced Role also grants
+Deployment `list`/`watch`, backing a supervisor Deployment watch that pushes a
+refreshed sandbox status within seconds of a supervisor availability change;
+managed and operator modes deliberately omit those verbs to avoid cluster-wide
+Deployment enumeration, folding readiness in through get/list instead. A periodic
+reconcile (alongside the one at watch establishment) corrects supervisor replica
+drift and reaps orphaned fences without waiting for the watch to drop. The agent
+egress NetworkPolicy — the workload's egress fence — carries
 no owner reference so it can outlive the workload pod during deletion; the gateway
 manages its lifecycle directly and holds create/get/delete/list on NetworkPolicies
 for ordered teardown and orphan reaping.

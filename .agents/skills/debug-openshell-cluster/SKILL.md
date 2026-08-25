@@ -523,12 +523,18 @@ should have `openshell.ai/sandbox-role=agent`; the supervisor pod should have
 a sandbox JWT. For supervisor pods, the gateway validates the
 `Pod -> ReplicaSet -> Deployment -> Sandbox` owner chain, so missing
 `apps/replicasets get` RBAC can also break bootstrap. Helm renders the
-Deployment, ReplicaSet, Service, Secret, and NetworkPolicy RBAC only when
-`supervisor.topology=proxy-pod`, and scopes it by workspace mode: `shared` grants
-it through the namespaced Role, while `managed` and `operator` grant it through
-the ClusterRole (the sandbox namespace is per-workspace). If those resources fail
-with forbidden errors, confirm both the rendered `gateway.toml` and Helm values
-use proxy-pod topology and that the workspace mode's Role/ClusterRole was applied.
+Deployment, ReplicaSet, Service, Secret, and NetworkPolicy RBAC when
+`supervisor.topology=proxy-pod` (or when `supervisor.proxyPod.retainCompanionRbac=true`
+during a migration away from proxy-pod), and scopes it by workspace mode:
+`shared` grants it through the namespaced Role, while `managed` and `operator`
+grant it through the ClusterRole (the sandbox namespace is per-workspace).
+`list`/`watch` on `apps/deployments` are granted only through the namespaced Role
+(shared mode): the supervisor-readiness Deployment watch runs only in shared
+mode, and managed/operator modes deliberately avoid cluster-wide Deployment
+enumeration, folding readiness in through get/list and the periodic reconcile
+instead. If those resources fail with forbidden errors, confirm both the rendered
+`gateway.toml` and Helm values use proxy-pod topology (or retainCompanionRbac)
+and that the workspace mode's Role/ClusterRole was applied.
 Companion cleanup is split: the owner-referenced Deployment, Service, CA Secret,
 and supervisor-ingress NetworkPolicy are garbage-collected with the Sandbox CR
 (the gateway holds no `delete` on them and no Secret read). The agent egress
@@ -541,11 +547,13 @@ sandbox watch is up, so a transiently-failed stop-time supervisor scale-down or 
 crash-orphaned fence is corrected without waiting for the watch to drop. If a
 deleted sandbox leaves an `os-eg-...` NetworkPolicy behind, or a stopped
 sandbox's `os-sup-...` Deployment keeps a replica, check that the gateway's
-reconcile ran and that the workload pod actually terminated. Do not
-change `supervisor.topology` away from proxy-pod while proxy-pod sandboxes still
-exist: their companion RBAC and reconciliation are gated on the rendered
-topology, so start/stop and crash-recovery for those sandboxes stop working until
-they are deleted or the topology is restored.
+reconcile ran and that the workload pod actually terminated. When changing `supervisor.topology` away from proxy-pod while proxy-pod
+sandboxes still exist, set `supervisor.proxyPod.retainCompanionRbac=true` and
+leave it set until every such sandbox is deleted. The driver keeps managing them
+by their persisted creation-time topology, so with the flag their companion RBAC,
+periodic reconciliation, and readiness watch all keep working. Without it the RBAC
+is removed and start/stop and crash-recovery for those sandboxes stop working
+until the topology is restored.
 If the agent cannot reach the gateway, check DNS to the headless Service, the
 agent egress NetworkPolicy DNS exception for kube-dns/CoreDNS, and the
 supervisor ingress NetworkPolicy allowing only that agent pod on port `3128`.
@@ -554,11 +562,12 @@ A proxy-pod sandbox falls back to `Provisioning` (Ready condition `False`,
 reason `DependenciesNotReady`) when its supervisor Deployment has no available
 replica: the gateway folds supervisor Deployment availability into sandbox
 status so a sandbox never stays Ready while its policy-enforced egress path is
-down, and recovers to `Ready` once the supervisor does. The gateway watches
-supervisor Deployments (hence `list`/`watch` on `apps/deployments`) and pushes a
-refreshed status within seconds of an availability change; direct `get`/`list`
-queries and the periodic reconcile fold in the same check, so a stale watch never
-leaves readiness wrong for long. If a previously-Ready
+down, and recovers to `Ready` once the supervisor does. In shared mode the
+gateway also watches supervisor Deployments (hence `list`/`watch` on
+`apps/deployments` in the namespaced Role) and pushes a refreshed status within
+seconds of an availability change; managed/operator modes and every mode's
+direct `get`/`list` queries and periodic reconcile fold in the same check, so
+readiness is never wrong for long even without the watch. If a previously-Ready
 sandbox drops to `Provisioning`, inspect the supervisor Deployment (`kubectl -n
 <sandbox-namespace> get deploy <os-sup-...>`) and its pod. Companion resource names are keyed on the
 immutable sandbox UUID, so the `os-sup-`/`os-svc-`/`os-ca-`/`os-eg-`/`os-ing-`
