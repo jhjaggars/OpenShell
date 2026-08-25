@@ -229,6 +229,22 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\.proxy_pod\].*?affinity\s*=\s*"preferred"'
 
+  - it: renders retain_companion_management from retainCompanionRbac
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.proxyPod.retainCompanionRbac: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.proxy_pod\].*?retain_companion_management\s*=\s*true'
+
+  - it: defaults retain_companion_management to false
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.proxy_pod\].*?retain_companion_management\s*=\s*false'
+
   - it: renders process binary aware network policy under [openshell.drivers.kubernetes.sidecar]
     template: templates/gateway-config.yaml
     set:

@@ -317,6 +317,20 @@ pub struct KubernetesProxyPodConfig {
     /// DNS elsewhere must override this or the agent pod cannot resolve any
     /// name, including its own paired supervisor `Service`.
     pub dns_peers: Vec<ProxyPodDnsPeer>,
+    /// Keep managing existing proxy-pod sandboxes after the configured topology
+    /// has been switched away from `proxy-pod`.
+    ///
+    /// The driver already manages each sandbox by its persisted creation-time
+    /// topology, but background upkeep — periodic companion reconciliation and
+    /// the shared-mode supervisor `Deployment` readiness watch — is gated on
+    /// whether this gateway manages proxy-pod sandboxes at all. When the
+    /// configured topology is not `proxy-pod`, that would otherwise be inferred
+    /// from a runtime sandbox list, which a transient discovery failure could
+    /// answer "none" and freeze for a whole watch session. Set this true during
+    /// a `retainCompanionRbac` migration (the Helm chart renders it from
+    /// `supervisor.proxyPod.retainCompanionRbac`) to keep that upkeep running
+    /// deterministically until every proxy-pod sandbox is deleted.
+    pub retain_companion_management: bool,
 }
 
 impl Default for KubernetesProxyPodConfig {
@@ -325,6 +339,7 @@ impl Default for KubernetesProxyPodConfig {
             proxy_uid: DEFAULT_PROXY_UID,
             affinity: ProxyPodAffinity::Disabled,
             dns_peers: default_proxy_pod_dns_peers(),
+            retain_companion_management: false,
         }
     }
 }
@@ -1149,6 +1164,17 @@ mod tests {
         let cfg = KubernetesProxyPodConfig::default();
         assert_eq!(cfg.dns_peers.len(), 2);
         cfg.validate_dns_peers().unwrap();
+    }
+
+    #[test]
+    fn proxy_pod_retain_companion_management_defaults_off_and_parses() {
+        // Absent from config → off (a non-migrating gateway).
+        assert!(!KubernetesProxyPodConfig::default().retain_companion_management);
+        // Present and unknown-field-strict: the field parses when rendered.
+        let cfg: KubernetesProxyPodConfig =
+            serde_json::from_value(serde_json::json!({"retain_companion_management": true}))
+                .unwrap();
+        assert!(cfg.retain_companion_management);
     }
 
     #[test]

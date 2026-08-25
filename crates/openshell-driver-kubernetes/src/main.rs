@@ -186,6 +186,16 @@ struct Args {
     )]
     proxy_pod_dns_peers: Option<String>,
 
+    /// Keep managing existing proxy-pod sandboxes (periodic reconcile and the
+    /// shared-mode supervisor Deployment readiness watch) after the configured
+    /// topology has been switched away from proxy-pod. Set during a
+    /// `retainCompanionRbac` migration.
+    #[arg(
+        long = "proxy-pod-retain-companion-management",
+        env = "OPENSHELL_K8S_PROXY_POD_RETAIN_COMPANION_MANAGEMENT"
+    )]
+    proxy_pod_retain_companion_management: bool,
+
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
@@ -293,6 +303,7 @@ async fn main() -> Result<()> {
                 proxy_uid: args.proxy_pod_proxy_uid,
                 affinity: args.proxy_pod_affinity,
                 dns_peers: proxy_pod_dns_peers,
+                retain_companion_management: args.proxy_pod_retain_companion_management,
             },
             https_proxy: args.https_proxy,
             no_proxy: args.no_proxy,

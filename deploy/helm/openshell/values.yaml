@@ -65,12 +65,15 @@ supervisor:
     processBinaryAwareNetworkPolicy: true
   proxyPod:
     # -- Render the proxy-pod companion, fence, and pod-inspection RBAC even when
-    # supervisor.topology is not proxy-pod. Set this true as a migration mode when
-    # switching a gateway away from proxy-pod while proxy-pod sandboxes still
-    # exist: the driver keeps managing them by their persisted creation-time
-    # topology, and without this flag their RBAC would be removed, breaking
-    # readiness, stop/start, repair, and safe fence cleanup. Leave it true until
-    # all proxy-pod sandboxes have been deleted, then remove it.
+    # supervisor.topology is not proxy-pod, and tell the gateway to keep running
+    # background upkeep (periodic companion reconciliation and the shared-mode
+    # supervisor Deployment readiness watch) for those sandboxes. Set this true
+    # as a migration mode when switching a gateway away from proxy-pod while
+    # proxy-pod sandboxes still exist: the driver keeps managing them by their
+    # persisted creation-time topology, and without this flag their RBAC and
+    # upkeep would stop, breaking readiness, stop/start, repair, and safe fence
+    # cleanup. Renders `proxy_pod.retain_companion_management` in gateway.toml.
+    # Leave it true until all proxy-pod sandboxes have been deleted, then remove it.
     retainCompanionRbac: false
     # -- UID for the network supervisor in proxy-pod topology. The configured
     # UID must not match the sandbox UID.
