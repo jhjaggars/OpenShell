@@ -63,6 +63,36 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
 | `server.disableTls=true` | Runs the gateway over plaintext HTTP for simpler evaluation. |
 | `podSecurityContext.fsGroup=null` / `securityContext.runAsUser=null` | Clear the chart's hardcoded UID and fsGroup so OpenShift's SCC admission can assign them. |
 
+The command above installs the default `combined` topology, which needs the
+`privileged` SCC granted above.
+
+### Proxy-pod topology on OpenShift
+
+To run the least-privilege `proxy-pod` topology instead, skip the `privileged`
+grant and install with the proxy-pod overrides. This binds the built-in
+`nonroot-v2` SCC and declares OpenShift's cluster DNS peers, which the agent pod
+needs to resolve its paired supervisor Service (OpenShift runs DNS in
+`openshift-dns` on container port `5353`, not `kube-system`/`53`, so the default
+peers do not match and are [required](/kubernetes/topology) to be set):
+
+```shell
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set server.disableTls=true \
+  --set podSecurityContext.fsGroup=null \
+  --set securityContext.runAsUser=null \
+  --set supervisor.topology=proxy-pod \
+  --set sandboxServiceAccount.openshift.nonrootSCC=true \
+  --set 'supervisor.proxyPod.dnsPeers[0].namespaceLabels.kubernetes\.io/metadata\.name=openshift-dns' \
+  --set 'supervisor.proxyPod.dnsPeers[0].podLabels.dns\.operator\.openshift\.io/daemonset-dns=default' \
+  --set supervisor.proxyPod.dnsPeers[0].port=5353
+```
+
+Proxy-pod also requires a cluster CNI that enforces Kubernetes NetworkPolicies
+(OpenShift's default OVN-Kubernetes does). See [Topology](/kubernetes/topology)
+for the full proxy-pod contract and tradeoffs.
+
 ## Wait for the gateway to be ready
 
 ```shell
