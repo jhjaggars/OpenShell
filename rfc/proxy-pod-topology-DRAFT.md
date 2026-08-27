@@ -20,37 +20,45 @@ originating issue before it moves out of draft.
 
 ## Summary
 
-This RFC proposes `proxy-pod`, a Kubernetes supervisor topology that moves
-network enforcement out of the sandbox pod entirely and
-into a paired, per-sandbox supervisor `Deployment`. The sandbox pod runs the
-agent image directly — no supervisor binary, no gateway credentials, no
-privileged init container, no shared process namespace. Egress is fenced by two
-per-sandbox Kubernetes `NetworkPolicy` objects rather than by pod-local nftables
-rules.
+This RFC proposes `proxy-pod`, a Kubernetes supervisor topology that moves the
+**network proxy** out of the sandbox pod into a paired, per-sandbox supervisor
+`Deployment`, while **keeping the process supervisor in the sandbox pod**. The
+sandbox pod runs the OpenShell process supervisor (`--mode=process`) alongside
+the workload, so filesystem policy, process/binary identity, SSH, `connect`,
+`exec`, upload/download, file sync, and provider injection all keep working. Only
+the credential-bearing L4/L7 network proxy lives in the separate pod. Egress is
+confined by two per-sandbox Kubernetes `NetworkPolicy` objects rather than by
+pod-local nftables rules, so the sandbox pod needs **no `NET_ADMIN`/`SYS_ADMIN`,
+no privileged init container, no shared node component** — and, via a
+privilege-drop knob copied from `cni-sidecar`, can run entirely non-root under a
+stock SCC.
 
-The tradeoff is explicit and large: `proxy-pod` is a **network-only** topology.
-Filesystem policy, process and binary identity controls, SSH, `connect`, `exec`,
-upload/download, file sync, and dynamic provider environment injection are all
-unavailable, because there is no OpenShell supervisor in the workload pod. In
-exchange, the sandbox pod's security context reduces to `runAsNonRoot` with all
-Linux capabilities dropped, which is the least-privileged sandbox pod any
-OpenShell topology produces.
+> **Revision note.** An earlier design of this RFC (retained below under
+> [Superseded design](#superseded-design-network-only-no-in-pod-supervisor))
+> moved the *entire* supervisor into the separate pod, leaving the sandbox pod
+> with no supervisor at all. That maximized isolation but gave up SSH/exec/sync,
+> filesystem/process policy, and provider injection — too much for most users.
+> This revision keeps those features by leaving the process supervisor in the
+> sandbox pod and moving only the network proxy out. The OpenShift enablement
+> (DNS peers, `nonroot-v2` SCC), the `NetworkPolicy` fence, the companion
+> `Deployment`/`Service`/`Secret` set, and the readiness/lifecycle machinery are
+> all carried forward unchanged from that work; the changes are confined to what
+> now runs in the sandbox pod and to the credential it holds.
 
-The RFC also proposes the changes needed to run this topology on OpenShift, all
-validated against a live OpenShift 4.22 / OVN-Kubernetes cluster. Two were
-required and unmet by the original implementation: the DNS egress peers in the
-generated `NetworkPolicy` are hardcoded to upstream Kubernetes conventions —
-both the namespace/pod selectors and the port — that do not hold on OpenShift,
-and the driver's explicit non-root proxy UID is rejected by the `restricted-v2`
-SCC. The first needs a configuration surface; the second is satisfied by the
-built-in `nonroot-v2` SCC and needs a gated Helm grant, not a custom SCC.
+Compared with the in-pod `sidecar`/`cni-sidecar` topologies, this delivers the
+same interactive feature set with the network half in its own pod (its own
+failure domain, its own Kata VM, and provider credentials never co-resident with
+the workload) and confinement by `NetworkPolicy` instead of nftables — no
+privileged init container and no node-level DaemonSet. The one new cost versus
+the network-only design is that the sandbox pod again holds a gateway
+credential; this RFC proposes **scoping that credential down** (a
+process-supervisor `caller_kind` that cannot read provider secrets or mint
+upstream credentials) so the sensitive capabilities stay only in the proxy pod.
 
-Validation confirmed the security model works as designed on OpenShift —
-unproxied egress denied, proxied egress policy-evaluated, resources
-garbage-collected — and surfaced two adoption blockers, both since fixed and
-re-verified: sandboxes never left the `Provisioning` phase because readiness
-was gated on a supervisor session this topology cannot have, and the workload
-container had no way to be given a long-running command.
+The OpenShift enablement is validated against a live OpenShift 4.x /
+OVN-Kubernetes cluster: configurable DNS egress peers (the hardcoded upstream
+`kube-system`/port-53 selectors do not hold on OpenShift), and a gated
+`nonroot-v2` grant rather than a custom SCC.
 
 ## Motivation
 
@@ -80,11 +88,17 @@ OpenShell expresses its egress fence as `NetworkPolicy` instead of nftables, the
 enforcement moves to machinery the cluster already runs and already trusts, and
 the sandbox pod needs no privilege whatsoever.
 
-The cost is that a supervisor outside the pod cannot supervise processes inside
-it. Filesystem policy, binary identity, and the interactive session paths all
-depend on the supervisor sharing the workload's namespaces. `proxy-pod` gives
-those up deliberately. It is the right choice when the alternative is not a
-richer topology but no OpenShell at all.
+The features that depend on the supervisor sharing the workload's namespaces —
+filesystem policy, binary identity, and the interactive session paths — do **not**
+have to be given up to get there. They only require the *process* supervisor to
+share those namespaces; they do not require the *network* proxy to. So this RFC
+keeps the process supervisor in the sandbox pod (exactly where `sidecar` keeps
+it) and moves only the network proxy out. The sandbox pod still needs the modest
+privileges the process supervisor uses (and a knob to drop them), but never the
+network-setup privileges (`NET_ADMIN`/`SYS_ADMIN`/nftables) — those move to the
+proxy pod, and the fence becomes `NetworkPolicy`. The result runs on clusters
+that permit no in-pod *network* privilege while still delivering the full
+interactive contract.
 
 OpenShift is the concrete case driving this now. OpenShell's current OpenShift
 guidance requires granting sandbox pods the `privileged` SCC and is documented
@@ -100,10 +114,15 @@ grant.
 - **Replacing `combined`, `sidecar`, or `cni-sidecar`.** All remain. `combined`
   stays the default and the only topology providing the full supervisor
   contract. `proxy-pod` is for clusters that cannot accept in-pod privilege.
-- **Restoring the removed supervisor features.** Filesystem policy, process and
-  binary controls, SSH/`connect`, `exec`, upload/download, sync, and dynamic
-  provider injection are out of scope for this topology by construction. A
-  RuntimeClass does not restore them.
+- **Re-implementing the supervisor features.** Filesystem policy, process and
+  binary controls, SSH/`connect`, `exec`, upload/download, sync, and provider
+  injection are *preserved* by keeping the process supervisor in the sandbox pod
+  — they reuse the existing `--mode=process` / `sidecar` code paths unchanged.
+  This RFC does not build new implementations of them; it only relocates the
+  network proxy and the fence.
+- **A zero-supervisor sandbox pod.** Moving the *entire* supervisor out (the
+  superseded design) is explicitly not the proposal; whether to retain it as a
+  separate maximal-isolation variant is an open question.
 - **Working without `NetworkPolicy` enforcement.** The topology has no fallback
   fence. On a cluster whose CNI ignores `NetworkPolicy`, the generated policies
   are declarative only and the workload can bypass the proxy freely. This RFC
@@ -115,7 +134,193 @@ grant.
 - **Per-sandbox supervisor autoscaling or sharing.** The pairing is strictly
   1:1. A shared proxy serving many sandboxes is a different design.
 
-## Proposal
+## Proposed design: in-pod process supervisor, out-of-pod network proxy
+
+This is the authoritative design. The [Superseded design](#superseded-design-network-only-no-in-pod-supervisor)
+section that follows describes the earlier network-only variant; its
+per-sandbox companion set, `NetworkPolicy` fence lifecycle, configurable DNS
+peers, and OpenShift DNS analysis are all reused here and are not repeated. The
+deltas below are what changes.
+
+### Overview
+
+```mermaid
+flowchart TB
+  subgraph Namespace["Sandbox namespace"]
+    subgraph AgentPod["Agent pod — role=agent"]
+      Proc["openshell-sandbox --mode=process<br/>process/binary policy, Landlock,<br/>SSH + exec/forward/sync relays<br/>runAsNonRoot (knob), no NET_ADMIN"]
+      Workload["Agent workload"]
+    end
+    Deployment["Supervisor Deployment (1 replica)"]
+    subgraph SupervisorPod["Supervisor pod — role=supervisor"]
+      Proxy["openshell-sandbox --mode=network<br/>:3128 policy-enforced proxy<br/>provider creds, inference, TLS intercept"]
+    end
+    Service["Headless Service"]
+    EgressNP["NetworkPolicy: agent egress<br/>proxy:3128 + DNS + gateway"]
+    IngressNP["NetworkPolicy: supervisor ingress"]
+  end
+  Gateway["OpenShell Gateway"]
+  External["External services"]
+
+  Proc --> Workload
+  Proc -->|"scoped gateway session:<br/>relays, policy, logs"| Gateway
+  Workload -->|"HTTP(S)_PROXY"| Service --> Proxy
+  Proxy -->|"gateway session:<br/>creds, inference, forwarding"| Gateway
+  Proxy -->|"policy-enforced egress"| External
+```
+
+The single `openshell-sandbox` binary already runs its network and process
+halves independently by `--mode`; this is exactly the split `sidecar` uses, but
+with the network half in a **separate pod** and the fence expressed as
+`NetworkPolicy`. Crucially, **nothing crosses the pod boundary except workload
+egress → proxy** (plain TCP + a trusted CA). The process supervisor stays whole
+in the sandbox pod and owns its relays and gateway session **locally**, so none
+of `sidecar`'s cross-container coupling (the peer-credentialed control socket,
+the abstract SSH relay socket, the shared PID namespace, the loopback redirect)
+is needed — those are the parts that would not survive a pod boundary, and this
+design never reaches for them.
+
+### What runs where
+
+| | Agent pod (`role=agent`) | Supervisor pod (`role=supervisor`) |
+|---|---|---|
+| Process | `openshell-sandbox --mode=process` + workload | `openshell-sandbox --mode=network` |
+| Enforces | filesystem/Landlock, process/binary identity, seccomp, privilege drop | L4/L7 network policy, TLS interception, credential injection, inference routing |
+| Relays (SSH/exec/forward/sync) | **served locally** (has the workload's namespaces) | none |
+| Gateway session | scoped process-supervisor session (see credential model) | full network session |
+| Provider credentials | **never** | yes (isolated here) |
+| Egress path | direct to gateway (session); workload children via `HTTP_PROXY` → proxy pod | policy-approved internet |
+| Privilege | process caps (`SYS_PTRACE`,`DAC_READ_SEARCH`; `SETUID`/`SETGID` if root privilege-drop) — droppable via knob; **no `NET_ADMIN`/`SYS_ADMIN`** | non-root `proxy_uid`, drops `ALL` |
+
+### Cross-pod egress transport
+
+The workload's children reach the proxy the same way the network-only design
+already does: injected `HTTP(S)_PROXY`/`NO_PROXY` env pointing at the paired
+headless `Service` on `:3128`, plus the per-sandbox CA trust bundle. This is
+advisory; the agent-egress `NetworkPolicy` is the real fence. A transparent
+loopback redirect (as `sidecar` does with nftables) is deliberately **not** used,
+because it would require `NET_ADMIN` in the sandbox pod — the privilege this
+topology exists to avoid. The process supervisor therefore skips its own netns
+creation (as it already does under `NETWORK_ENFORCEMENT_MODE`) and does not run
+an in-pod proxy; a new enforcement-mode value selects "process supervisor +
+remote proxy over the Service address," reusing the existing `PROXY_URL` /
+`configured_proxy_url` plumbing.
+
+### Credential model: a scoped process-supervisor credential
+
+This is the one real regression versus the network-only design (where the
+sandbox pod held no gateway identity at all), and the RFC proposes to bound it
+tightly. The sandbox pod's process supervisor needs a gateway session for its
+relays (`ConnectSupervisor`, `RelayStream`, `ReportMainProcessExit`), log push,
+config read, and token refresh. The sandbox credential is already a
+gateway-minted, Ed25519 **per-sandbox** JWT that can only act as its one sandbox
+— no cross-sandbox, no cluster-wide, no admin RPC. But today its authority is a
+fixed allowlist of all `sandbox`-callable RPCs, so it would also carry the two
+capabilities the process supervisor does **not** need and that are the only
+secret-bearing ones: `GetSandboxProviderEnvironment` (reads provider secrets) and
+`ExchangeProviderSubjectToken` (mints upstream credentials), plus
+`GetInferenceBundle` — all network-supervisor concerns.
+
+The RFC proposes adding a **`caller_kind` claim** to the sandbox JWT (mirroring
+the existing `ExtensionJwtClaims.caller_kind`), minting the agent-pod token as a
+`process`-kind credential, and rejecting those three RPCs for that kind at the
+existing authorization chokepoint plus per-handler guards. The result: a
+compromised agent pod can relay into / report on / renew **its own** sandbox, but
+**cannot read provider secrets or mint upstream credentials** — those stay
+exclusively in the proxy pod (a separate pod, and under Kata a separate VM). It
+cannot be made literally read-only (it must push its own logs, report its own
+exit, and refresh its own token), but "own-sandbox, control-plane-minimal, no
+provider/inference" is achievable and is the proposed target. The full-authority
+token is still minted for the proxy pod's network session.
+
+### NetworkPolicy delta
+
+The supervisor-ingress policy is unchanged. The agent-egress fence gains one
+peer: the **gateway endpoint**, because the in-pod process supervisor now opens
+its own gateway session (the network-only design's agent pod never talked to the
+gateway, so its fence allowed only proxy:3128 + DNS). This is a deliberate,
+documented widening of the agent's egress surface. Everything else — deny by
+default, proxy:3128, DNS peers — carries over.
+
+### Privilege model and the drop knob
+
+The sandbox pod needs only the **process** supervisor's privileges, never the
+network-setup ones. It reuses the `cni-sidecar`/`sidecar` privilege-drop pattern
+verbatim: a boolean knob (secure-by-default) where the strict mode runs the
+process supervisor with `SYS_PTRACE` + `DAC_READ_SEARCH` (for cross-UID `/proc`
+binary attribution) and — if the operator wants supervisor-managed root→sandbox
+privilege drop — as root with `SETUID`/`SETGID`; the relaxed mode drops those
+caps, runs non-root as the resolved sandbox UID, and downgrades to endpoint/L7
+policy without `policy.binaries` matching (network enforcement is remote anyway).
+`NET_ADMIN`/`NET_RAW`/`SYS_ADMIN` are never present in the sandbox pod under
+either mode. The proxy pod is always non-root (`proxy_uid`, drops `ALL`).
+
+### Session model and readiness
+
+Unlike the network-only design, this topology **has** an in-sandbox supervisor
+session, so it reports the `sidecar`/`combined` `SupervisorSessionModel`
+(`REQUIRED`), relays are available, and readiness derives from the live process
+supervisor session — not the `NONE` sessionless path. The separate proxy pod's
+availability is still folded into readiness (a sandbox with a dead proxy is
+`Provisioning`), reusing the network-only design's supervisor-`Deployment`
+readiness watch + reconcile. The `wait-for-proxy` init container and the
+companion lifecycle (create/reconcile/teardown, fence quiescence) carry over
+unchanged.
+
+### Feature availability vs. the alternatives
+
+| Capability | `sidecar`/`cni-sidecar` | network-only `proxy-pod` (superseded) | **this design** |
+|---|---|---|---|
+| Network + L7 policy | yes | yes | yes |
+| Filesystem / process / binary policy | yes | **no** | **yes** |
+| SSH / `exec` / upload / sync | yes | **no** | **yes** |
+| Provider injection | yes | **no** | **yes** |
+| Workload output in `openshell logs` | yes | **no** | **yes** |
+| Fence mechanism | nftables (in-pod) | `NetworkPolicy` | `NetworkPolicy` |
+| Privileged init container / node DaemonSet | yes / (cni: yes) | no / no | **no / no** |
+| Sandbox-pod network privilege (`NET_ADMIN`) | yes (init/sidecar) | none | **none** |
+| Provider creds co-resident with workload | yes (same pod) | n/a | **no (separate pod/VM)** |
+| Gateway credential in sandbox pod | yes (sidecar holds it) | **none** | scoped process-only |
+| Pods per sandbox | 1 | 2 | 2 |
+
+The niche this fills: **`sidecar`'s feature set, confined by `NetworkPolicy`
+instead of nftables (no privileged init, no node DaemonSet), with the network
+half — and all provider credentials — isolated in its own pod/VM.**
+
+### OpenShift SCC implication (changed)
+
+Because the sandbox pod now runs the process supervisor, the "admits under stock
+`nonroot-v2`" property depends on the drop knob. In **relaxed** mode the sandbox
+pod is non-root with `drop: [ALL]` and admits under `nonroot-v2` (or stock
+`restricted-v2` if UIDs are SCC-assigned). In **strict** (binary-aware) mode it
+needs the same minimal custom SCC `cni-sidecar`/`sidecar` use (adds
+`SYS_PTRACE` + `DAC_READ_SEARCH`, and `RunAsAny` if root privilege-drop is kept).
+The proxy pod continues to admit under `nonroot-v2`. The OpenShift DNS-peer and
+`nonroot-v2` analysis below still applies to the proxy pod verbatim.
+
+### Key tradeoffs to decide
+
+1. **Credential placement (accepted).** The sandbox pod holds a scoped
+   process-supervisor gateway credential. Recommended over the more complex
+   alternative of brokering all gateway access through the proxy pod (which would
+   re-introduce `sidecar`-style cross-pod relay bridging — the coupling this
+   design avoids). Recorded as an open question.
+2. **Enum shape.** Whether this replaces the `proxy-pod` value outright, or ships
+   as a distinct value with the network-only design retained as a maximal
+   isolation variant. Recommended: this becomes `proxy-pod`; retain the
+   network-only path only if a concrete zero-in-pod-supervisor use case appears.
+
+## Superseded design (network-only, no in-pod supervisor)
+
+The sections below describe the earlier design that moved the entire supervisor
+out of the sandbox pod. They are retained because most of their machinery — the
+per-sandbox companion set, the `NetworkPolicy` fence and its lifecycle, the
+configurable DNS peers, the OpenShift `nonroot-v2` analysis, and the
+readiness/reconcile plumbing — is reused unchanged by the proposed design above.
+Where a section describes the *sandbox pod running no supervisor* (privilege
+model's agent row, credential isolation, "why relays cannot cross the pod
+boundary," the network-only feature tables), it is superseded by the
+corresponding subsection above.
 
 ### Topology overview
 
@@ -609,6 +814,38 @@ node-level DaemonSet. The two are complementary, not competing.
 
 ## Implementation plan
 
+### In-pod process supervisor pivot (proposed direction)
+
+The network-only work below (Phases 1–5) landed the companion set, the
+`NetworkPolicy` fence, OpenShift enablement, readiness/reconcile, and lifecycle —
+all reused as-is. The pivot builds on that:
+
+- **P1 — Supervisor runtime.** A new `SUPERVISOR_TOPOLOGY`/`NETWORK_ENFORCEMENT_MODE`
+  value that runs `--mode=process` in the agent pod with `ProcessEnforcementMode`
+  selectable (Full vs relaxed), its own gateway session (policy/logs/relays), and
+  child egress pointed at the remote proxy `Service` via `HTTP(S)_PROXY` (reuse
+  `PROXY_URL`/`configured_proxy_url`); skip in-pod netns/nftables.
+- **P2 — Scoped credential.** Add `caller_kind` to `SandboxJwtClaims`; mint the
+  agent-pod token as `process`-kind; reject `GetSandboxProviderEnvironment`,
+  `ExchangeProviderSubjectToken`, `GetInferenceBundle` for that kind at the
+  `multiplex` chokepoint + per-handler guards. Back-compat: absent `caller_kind`
+  = full authority.
+- **P3 — Driver topology.** Render the agent pod as the `sidecar` `--mode=process`
+  container **retaining** gateway creds (SA token/client-TLS/SPIFFE/endpoint) +
+  proxy CA trust + `wait-for-proxy` init; render the proxy pod from the existing
+  `proxy_pod_supervisor_deployment`/companions; add the gateway-egress rule to the
+  agent-egress `NetworkPolicy`; thread the new topology through the ~30 match/gate
+  sites with **sidecar-like** session model and **proxy-pod-like** companion
+  lifecycle.
+- **P4 — Privilege-drop knob + SCC.** Reuse the `cni-sidecar` pattern (config
+  field + effective-UID helper + capability branch + optional minimal SCC).
+- **P5 — Docs, tests, e2e, cluster validation.** Topology/OpenShift/gateway-config
+  docs; unit + helm tests; extend the `proxy_pod` e2e suite to assert the
+  recovered features (exec/sync work) and the scoped credential; validate on the
+  OVN-Kubernetes cluster.
+
+### Prior work (network-only design)
+
 **Phase 1 — rebase and correctness (done).** Rebase PR #2077 onto current
 `main`. Resolve the drift from multi-namespace gateway support (thread namespace
 through the supervisor owner-chain walk and the cleanup path) and from the
@@ -795,6 +1032,15 @@ non-default DNS deployments. Configuration handles every case with no new RBAC.
 
 ## Open questions
 
+- **Credential placement.** The proposed design puts a scoped process-supervisor
+  credential in the sandbox pod. Is the `caller_kind` scoping (no
+  provider/inference) sufficient, or is it worth the extra complexity of brokering
+  all gateway access through the proxy pod so the sandbox pod holds no gateway
+  credential at all (at the cost of re-introducing cross-pod relay bridging)?
+- **Enum shape.** Should the in-pod-process-supervisor design replace the
+  `proxy-pod` value, or ship as a distinct topology with the network-only
+  (zero-in-pod-supervisor) design retained as a separate maximal-isolation
+  variant? If distinct, what are they named?
 - Should a startup fence-verification probe be a **requirement** for graduating
   `proxy-pod` out of experimental, given that the failure mode of a
   non-enforcing CNI is silent?
