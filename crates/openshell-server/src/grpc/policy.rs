@@ -6963,6 +6963,7 @@ mod tests {
                 sandbox_id: sandbox_id.to_string(),
                 source: SandboxIdentitySource::BootstrapJwt {
                     issuer: "openshell-gateway:test".to_string(),
+                    caller_kind: crate::auth::principal::SandboxCallerKind::Full,
                 },
                 trust_domain: Some("openshell".to_string()),
             }));
@@ -7324,6 +7325,7 @@ mod tests {
                 sandbox_id: "test-sandbox".to_string(),
                 source: SandboxIdentitySource::BootstrapJwt {
                     issuer: "openshell-gateway:test".to_string(),
+                    caller_kind: crate::auth::principal::SandboxCallerKind::Full,
                 },
                 trust_domain: None,
             }));

@@ -364,6 +364,7 @@ mod tests {
             sandbox_id: sandbox_id.to_string(),
             source: SandboxIdentitySource::BootstrapJwt {
                 issuer: "openshell-gateway:test-gateway".to_string(),
+                caller_kind: crate::auth::principal::SandboxCallerKind::Full,
             },
             trust_domain: Some("openshell".to_string()),
         })
