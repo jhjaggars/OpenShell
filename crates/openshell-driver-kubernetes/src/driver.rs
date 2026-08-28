@@ -3555,6 +3555,12 @@ const SIDECAR_CONTROL_SOCKET: &str = openshell_core::container_paths::SIDECAR_CO
 // unlink and replace this relay endpoint after the trusted supervisor binds it.
 const SIDECAR_SSH_SOCKET_FILE: &str = "@openshell-sidecar-ssh";
 
+// Abstract socket for the proxy-pod agent's in-pod process supervisor. The agent
+// pod runs non-root, so it cannot create a filesystem socket under `/run`; an
+// abstract socket needs no writable directory and is scoped to the agent pod's
+// own network namespace. The gateway relay and SSH server share this process.
+const PROXY_POD_SSH_SOCKET_FILE: &str = "@openshell-proxy-pod-ssh";
+
 /// Shared TLS work directory. The network sidecar writes the proxy CA bundle
 /// here, while the agent container consumes it after sidecar bootstrap.
 const SIDECAR_TLS_VOLUME_NAME: &str = "openshell-supervisor-tls";
@@ -3626,8 +3632,24 @@ fn supervisor_image_volume(
 fn supervisor_init_container(
     supervisor_image: &str,
     supervisor_image_pull_policy: &str,
+    run_as: Option<(u32, u32)>,
 ) -> serde_json::Value {
     let installed_path = format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox");
+    // The copy-self init only writes the binary into the shared emptyDir. In
+    // root-capable topologies (combined/sidecar) it runs as UID 0. In the
+    // proxy-pod topology the pod runs under a non-root SCC (e.g. OpenShift
+    // nonroot-v2), so it must run as the sandbox uid/gid; the emptyDir is
+    // group-writable via the pod's fsGroup, so the non-root copy succeeds.
+    let security_context = match run_as {
+        None => serde_json::json!({ "runAsUser": 0 }),
+        Some((uid, gid)) => serde_json::json!({
+            "runAsUser": uid,
+            "runAsGroup": gid,
+            "runAsNonRoot": true,
+            "allowPrivilegeEscalation": false,
+            "capabilities": { "drop": ["ALL"] }
+        }),
+    };
     let mut spec = serde_json::json!({
         "name": SUPERVISOR_INIT_CONTAINER_NAME,
         "image": supervisor_image,
@@ -3636,7 +3658,7 @@ fn supervisor_init_container(
             "copy-self",
             installed_path,
         ],
-        "securityContext": {"runAsUser": 0},
+        "securityContext": security_context,
         "volumeMounts": [{
             "name": SUPERVISOR_VOLUME_NAME,
             "mountPath": SUPERVISOR_MOUNT_PATH,
@@ -3654,6 +3676,7 @@ fn apply_supervisor_binary_source(
     supervisor_image: &str,
     supervisor_image_pull_policy: &str,
     method: SupervisorSideloadMethod,
+    init_run_as: Option<(u32, u32)>,
 ) {
     let volumes = spec
         .entry("volumes")
@@ -3682,6 +3705,7 @@ fn apply_supervisor_binary_source(
             init_containers.push(supervisor_init_container(
                 supervisor_image,
                 supervisor_image_pull_policy,
+                init_run_as,
             ));
         }
     }
@@ -3712,6 +3736,7 @@ fn apply_supervisor_sideload_with_params(
         params.supervisor_image,
         params.supervisor_image_pull_policy,
         params.supervisor_sideload_method,
+        None,
     );
 
     // Find the agent container and add volume mount + command override
@@ -4214,6 +4239,7 @@ fn apply_supervisor_sidecar_topology(
         params.supervisor_image,
         params.supervisor_image_pull_policy,
         params.supervisor_sideload_method,
+        None,
     );
 
     let volumes = spec
@@ -4553,12 +4579,15 @@ fn apply_supervisor_proxy_pod_topology(
     }
 
     // The agent pod runs the process supervisor (`--mode=process`), so it needs
-    // the supervisor binary mounted just like combined/sidecar.
+    // the supervisor binary mounted just like combined/sidecar. Unlike those
+    // root-capable topologies, the proxy-pod agent pod runs under a non-root
+    // SCC, so the copy-self init container must run as the sandbox uid/gid.
     apply_supervisor_binary_source(
         spec,
         params.supervisor_image,
         params.supervisor_image_pull_policy,
         params.supervisor_sideload_method,
+        Some((params.sandbox_uid, params.sandbox_gid)),
     );
 
     let init_containers = spec
@@ -4670,6 +4699,15 @@ fn apply_supervisor_proxy_pod_topology(
                 env,
                 openshell_core::sandbox_env::PROXY_TLS_DIR,
                 SIDECAR_TLS_MOUNT_PATH,
+            );
+
+            // The default SSH relay socket lives under `/run`, whose parent the
+            // non-root agent cannot create. Use an abstract socket instead: it
+            // needs no writable directory and is scoped to this pod's netns.
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::SSH_SOCKET_PATH,
+                PROXY_POD_SSH_SOCKET_FILE,
             );
 
             // The workload's children egress through the remote proxy via these
@@ -6451,7 +6489,9 @@ fn proxy_pod_agent_egress_network_policy(
     // Permit the in-pod process supervisor's own gateway session (relays, policy,
     // log push, token bootstrap). The workload's children still reach only the
     // proxy on 3128; this rule is for the supervisor, not the workload.
-    egress.extend(proxy_pod_gateway_egress_rules(params.proxy_pod_gateway_peers));
+    egress.extend(proxy_pod_gateway_egress_rules(
+        params.proxy_pod_gateway_peers,
+    ));
 
     // Deliberately NO ownerReference: this egress policy is the workload's fence,
     // and it must outlive the workload pod during deletion. Owner-reference
@@ -9101,6 +9141,13 @@ mod tests {
             rendered_env(agent, openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY),
             Some("proxy-pod")
         );
+        // The non-root agent cannot create a filesystem SSH socket under `/run`,
+        // so the relay must use a netns-scoped abstract socket.
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SSH_SOCKET_PATH),
+            Some(PROXY_POD_SSH_SOCKET_FILE)
+        );
+        assert!(PROXY_POD_SSH_SOCKET_FILE.starts_with('@'));
         assert_eq!(
             rendered_env(agent, openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE),
             Some("proxy-pod")
@@ -9181,6 +9228,9 @@ mod tests {
             proxy_uid: 2200,
             sandbox_uid: 1500,
             sandbox_gid: 1600,
+            // Force the init-container sideload so the supervisor copy-self init
+            // is present; on OpenShift's nonroot SCC it must not run as root.
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
             ..SandboxPodParams::default()
         };
         let pod_template = sandbox_template_to_k8s(
@@ -9196,8 +9246,8 @@ mod tests {
 
         let containers = pod_template["spec"]["containers"].as_array().unwrap();
         let init_containers = pod_template["spec"]["initContainers"].as_array().unwrap();
-        // CA install, wait-for-proxy, and workspace seed.
-        assert_eq!(init_containers.len(), 3);
+        // Supervisor binary sideload, CA install, wait-for-proxy, workspace seed.
+        assert_eq!(init_containers.len(), 4);
         for container in containers.iter().chain(init_containers) {
             let security_context = &container["securityContext"];
             assert_ne!(
