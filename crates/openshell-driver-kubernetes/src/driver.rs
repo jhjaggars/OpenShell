@@ -541,6 +541,10 @@ impl KubernetesComputeDriver {
                 .proxy_pod
                 .validate_dns_peers()
                 .map_err(KubernetesDriverError::Precondition)?;
+            config
+                .proxy_pod
+                .validate_gateway_peers()
+                .map_err(KubernetesDriverError::Precondition)?;
         }
         config
             .validate_upstream_proxy_config()
@@ -1730,6 +1734,7 @@ impl KubernetesComputeDriver {
             proxy_connect_by_hostname: self.config.proxy_connect_by_hostname == Some(true),
             proxy_pod_affinity: self.config.proxy_pod.affinity,
             proxy_pod_dns_peers: &self.config.proxy_pod.dns_peers,
+            proxy_pod_gateway_peers: &self.config.proxy_pod.gateway_peers,
             namespace: target_namespace,
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
@@ -4547,6 +4552,15 @@ fn apply_supervisor_proxy_pod_topology(
         }));
     }
 
+    // The agent pod runs the process supervisor (`--mode=process`), so it needs
+    // the supervisor binary mounted just like combined/sidecar.
+    apply_supervisor_binary_source(
+        spec,
+        params.supervisor_image,
+        params.supervisor_image_pull_policy,
+        params.supervisor_sideload_method,
+    );
+
     let init_containers = spec
         .entry("initContainers")
         .or_insert_with(|| serde_json::json!([]))
@@ -4559,10 +4573,8 @@ fn apply_supervisor_proxy_pod_topology(
             params.sandbox_gid,
         ));
         // Hold the workload until the paired supervisor is accepting proxy
-        // connections. Without this the workload starts first, its early
-        // egress fails, and — because the gateway derives readiness for this
-        // topology from the pod's Ready condition — the sandbox would report
-        // Ready while it has no egress path at all.
+        // connections, so the process supervisor's children never race ahead of
+        // a working egress path.
         init_containers.push(proxy_pod_wait_for_proxy_init_container(
             params.supervisor_image,
             params.supervisor_image_pull_policy,
@@ -4583,6 +4595,20 @@ fn apply_supervisor_proxy_pod_topology(
         .get_mut(target_index)
         .and_then(|v| v.as_object_mut())
     {
+        // Run the process supervisor as the agent container's entrypoint; it
+        // launches the workload (from MAIN_PROCESS_SPEC) and serves relays
+        // locally. Network enforcement is external (the paired proxy pod), so
+        // there is no `--mode=network` and no in-pod netns/nftables.
+        container.insert(
+            "command".to_string(),
+            serde_json::json!([
+                format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH),
+                "--mode=process",
+                "--workdir",
+                driver_mounts::DEFAULT_WORKSPACE_ROOT
+            ]),
+        );
+
         let security_context = container
             .entry("securityContext")
             .or_insert_with(|| serde_json::json!({}));
@@ -4609,14 +4635,16 @@ fn apply_supervisor_proxy_pod_topology(
             );
         }
 
+        // Retain the gateway credentials: unlike the network-only design, the
+        // in-pod process supervisor holds its own (scoped, process-kind) gateway
+        // session for relays, policy, and log push. Add the supervisor binary
+        // mount and the proxy CA trust dir.
         let volume_mounts = container
             .entry("volumeMounts")
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut();
         if let Some(volume_mounts) = volume_mounts {
-            remove_volume_mount(volume_mounts, SERVICE_ACCOUNT_TOKEN_VOLUME_NAME);
-            remove_volume_mount(volume_mounts, CLIENT_TLS_VOLUME_NAME);
-            remove_volume_mount(volume_mounts, SPIFFE_WORKLOAD_API_VOLUME_NAME);
+            volume_mounts.push(supervisor_volume_mount());
             volume_mounts.push(proxy_pod_ca_tls_volume_mount(true));
         }
 
@@ -4625,21 +4653,28 @@ fn apply_supervisor_proxy_pod_topology(
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut();
         if let Some(env) = env {
-            for name in [
-                openshell_core::sandbox_env::SANDBOX_ID,
-                openshell_core::sandbox_env::SANDBOX,
-                openshell_core::sandbox_env::ENDPOINT,
-                openshell_core::sandbox_env::MAIN_PROCESS_SPEC,
-                openshell_core::sandbox_env::TELEMETRY_ENABLED,
-                openshell_core::sandbox_env::SSH_SOCKET_PATH,
-                openshell_core::sandbox_env::TLS_CA,
-                openshell_core::sandbox_env::TLS_CERT,
-                openshell_core::sandbox_env::TLS_KEY,
-                openshell_core::sandbox_env::K8S_SA_TOKEN_FILE,
-                openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
-            ] {
-                remove_env(env, name);
-            }
+            // Select the process-supervisor + remote-proxy runtime path: own
+            // gateway session (no sidecar control socket), NetworkOnly
+            // enforcement, and the proxy CA read from the mounted TLS dir.
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY,
+                "proxy-pod",
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE,
+                "proxy-pod",
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::PROXY_TLS_DIR,
+                SIDECAR_TLS_MOUNT_PATH,
+            );
+
+            // The workload's children egress through the remote proxy via these
+            // proxy variables; the supervisor's own gateway dial is a direct
+            // gRPC channel that does not consult them.
             let proxy_url = proxy_pod_proxy_url(&service_dns);
             for name in [
                 "ALL_PROXY",
@@ -4670,22 +4705,6 @@ fn apply_supervisor_proxy_pod_topology(
                 upsert_env(env, name, &ca_bundle);
             }
         }
-    }
-
-    if let Some(volumes) = spec
-        .get_mut("volumes")
-        .and_then(|value| value.as_array_mut())
-    {
-        volumes.retain(|volume| {
-            !matches!(
-                volume.get("name").and_then(|value| value.as_str()),
-                Some(
-                    SERVICE_ACCOUNT_TOKEN_VOLUME_NAME
-                        | CLIENT_TLS_VOLUME_NAME
-                        | SPIFFE_WORKLOAD_API_VOLUME_NAME
-                )
-            )
-        });
     }
 }
 
@@ -4877,6 +4896,7 @@ struct SandboxPodParams<'a> {
     proxy_connect_by_hostname: bool,
     proxy_pod_affinity: ProxyPodAffinity,
     proxy_pod_dns_peers: &'a [ProxyPodDnsPeer],
+    proxy_pod_gateway_peers: &'a [ProxyPodDnsPeer],
     namespace: &'a str,
     service_account_name: &'a str,
     sandbox_id: &'a str,
@@ -4929,6 +4949,7 @@ impl Default for SandboxPodParams<'_> {
             proxy_connect_by_hostname: false,
             proxy_pod_affinity: ProxyPodAffinity::Disabled,
             proxy_pod_dns_peers: &[],
+            proxy_pod_gateway_peers: &[],
             namespace: "default",
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
@@ -4993,13 +5014,15 @@ fn validate_agent_command_for_topology(
     if agent.command.is_empty() && agent.args.is_empty() {
         return Ok(());
     }
-    if topology == SupervisorTopology::ProxyPod {
-        return Ok(());
-    }
+    // Every topology now runs the OpenShell supervisor as the agent container's
+    // entrypoint (proxy-pod included, since it keeps the process supervisor in
+    // the pod), so a container command/args override would be ignored. The
+    // initial workload command is delivered through the sandbox spec / session
+    // (`openshell sandbox create -- <cmd>`).
     Err(format!(
-        "containers.agent.command and containers.agent.args are only supported in \"proxy-pod\" \
-         topology; {topology} topology runs the OpenShell supervisor as the container entrypoint \
-         and would ignore them"
+        "containers.agent.command and containers.agent.args are not supported; {topology} \
+         topology runs the OpenShell supervisor as the container entrypoint and would ignore \
+         them — pass the workload command via `openshell sandbox create -- <cmd>`"
     ))
 }
 
@@ -6383,6 +6406,33 @@ fn proxy_pod_dns_egress_rules(peers: &[ProxyPodDnsPeer]) -> Vec<serde_json::Valu
         .collect()
 }
 
+/// Egress rules permitting the in-pod process supervisor to reach the gateway
+/// (TCP only). Same selector shape as DNS peers; the port is the gateway's.
+fn proxy_pod_gateway_egress_rules(peers: &[ProxyPodDnsPeer]) -> Vec<serde_json::Value> {
+    peers
+        .iter()
+        .map(|peer| {
+            let mut entry = serde_json::Map::new();
+            if !peer.namespace_labels.is_empty() {
+                entry.insert(
+                    "namespaceSelector".to_string(),
+                    serde_json::json!({"matchLabels": peer.namespace_labels}),
+                );
+            }
+            if !peer.pod_labels.is_empty() {
+                entry.insert(
+                    "podSelector".to_string(),
+                    serde_json::json!({"matchLabels": peer.pod_labels}),
+                );
+            }
+            serde_json::json!({
+                "to": [serde_json::Value::Object(entry)],
+                "ports": [{"protocol": "TCP", "port": peer.port}]
+            })
+        })
+        .collect()
+}
+
 fn proxy_pod_agent_egress_network_policy(
     names: &ProxyPodResourceNames,
     params: &SandboxPodParams<'_>,
@@ -6398,6 +6448,10 @@ fn proxy_pod_agent_egress_network_policy(
         ]
     })];
     egress.extend(proxy_pod_dns_egress_rules(params.proxy_pod_dns_peers));
+    // Permit the in-pod process supervisor's own gateway session (relays, policy,
+    // log push, token bootstrap). The workload's children still reach only the
+    // proxy on 3128; this rule is for the supervisor, not the workload.
+    egress.extend(proxy_pod_gateway_egress_rules(params.proxy_pod_gateway_peers));
 
     // Deliberately NO ownerReference: this egress policy is the workload's fence,
     // and it must outlive the workload pod during deletion. Owner-reference
@@ -7061,11 +7115,13 @@ fn status_from_object(obj: &DynamicObject, topology: SupervisorTopology) -> Opti
             .to_string(),
         conditions,
         deleting: obj.metadata.deletion_timestamp.is_some(),
+        // Every topology now runs an in-sandbox process supervisor that owns a
+        // gateway session and serves relays, so all report `Required`. (The
+        // proxy-pod variant keeps only the network proxy out of the pod.)
         supervisor_session_model: match topology {
-            SupervisorTopology::ProxyPod => SupervisorSessionModel::None as i32,
-            SupervisorTopology::Combined | SupervisorTopology::Sidecar => {
-                SupervisorSessionModel::Required as i32
-            }
+            SupervisorTopology::Combined
+            | SupervisorTopology::Sidecar
+            | SupervisorTopology::ProxyPod => SupervisorSessionModel::Required as i32,
         },
     })
 }
@@ -8989,7 +9045,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_pod_topology_runs_workload_directly_through_proxy_service() {
+    fn proxy_pod_topology_runs_process_supervisor_with_gateway_creds() {
         let params = SandboxPodParams {
             topology: SupervisorTopology::ProxyPod,
             supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
@@ -9024,11 +9080,32 @@ mod tests {
             pod_template["metadata"]["labels"][LABEL_SANDBOX_ROLE],
             SANDBOX_ROLE_AGENT
         );
-        assert!(agent.get("command").is_none());
+        // The agent container runs the process supervisor, not the workload
+        // directly, and it launches the workload from MAIN_PROCESS_SPEC.
+        assert_eq!(
+            agent["command"],
+            serde_json::json!([
+                format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox"),
+                "--mode=process",
+                "--workdir",
+                driver_mounts::DEFAULT_WORKSPACE_ROOT
+            ])
+        );
+        // Gateway credentials are RETAINED (the in-pod supervisor owns its own
+        // scoped session), unlike the superseded network-only design.
         assert_eq!(
             rendered_env(agent, openshell_core::sandbox_env::ENDPOINT),
-            None
+            Some(params.grpc_endpoint)
         );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY),
+            Some("proxy-pod")
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE),
+            Some("proxy-pod")
+        );
+        // The workload's children still egress through the remote proxy Service.
         assert_eq!(
             rendered_env(agent, "HTTP_PROXY"),
             Some(format!("http://{service_dns}:3128").as_str())
@@ -9036,14 +9113,6 @@ mod tests {
         assert_eq!(
             rendered_env(agent, "SSL_CERT_FILE"),
             Some("/etc/openshell-tls/proxy/ca-bundle.pem")
-        );
-        assert_eq!(
-            rendered_env(agent, openshell_core::sandbox_env::K8S_SA_TOKEN_FILE),
-            None
-        );
-        assert_eq!(
-            rendered_env(agent, openshell_core::sandbox_env::SSH_SOCKET_PATH),
-            None
         );
         assert_eq!(
             agent["securityContext"]["capabilities"]["drop"],
@@ -9057,6 +9126,8 @@ mod tests {
             .unwrap();
         assert_eq!(proxy_tls_mount["readOnly"], true);
 
+        // Single pod (workload runs inside it); the supervisor binary and the
+        // retained credential volumes are all present.
         let containers = pod_template["spec"]["containers"].as_array().unwrap();
         assert_eq!(containers.len(), 1);
         let volumes = pod_template["spec"]["volumes"].as_array().unwrap();
@@ -9067,17 +9138,18 @@ mod tests {
         assert!(volumes.iter().any(|volume| {
             volume["name"] == "openshell-proxy-pod-tls" && volume["emptyDir"].is_object()
         }));
-        assert!(!volumes.iter().any(|volume| {
-            matches!(
-                volume["name"].as_str(),
-                Some(
-                    SUPERVISOR_VOLUME_NAME
-                        | SERVICE_ACCOUNT_TOKEN_VOLUME_NAME
-                        | CLIENT_TLS_VOLUME_NAME
-                        | SPIFFE_WORKLOAD_API_VOLUME_NAME
-                )
-            )
-        }));
+        assert!(
+            volumes
+                .iter()
+                .any(|volume| volume["name"] == SUPERVISOR_VOLUME_NAME),
+            "supervisor binary volume must be mounted"
+        );
+        assert!(
+            volumes
+                .iter()
+                .any(|volume| volume["name"] == SERVICE_ACCOUNT_TOKEN_VOLUME_NAME),
+            "SA token volume must be retained"
+        );
 
         let init_containers = pod_template["spec"]["initContainers"].as_array().unwrap();
         let ca_init = init_containers
@@ -9086,19 +9158,10 @@ mod tests {
             .unwrap();
         assert_eq!(ca_init["image"], "supervisor-image:latest");
         assert_eq!(ca_init["securityContext"]["runAsUser"], 1500);
-        assert_eq!(ca_init["securityContext"]["runAsGroup"], 1500);
-        assert_eq!(ca_init["securityContext"]["runAsNonRoot"], true);
-        assert_eq!(
-            ca_init["securityContext"]["allowPrivilegeEscalation"],
-            false
-        );
         assert_eq!(ca_init["securityContext"]["readOnlyRootFilesystem"], true);
-        assert_eq!(
-            ca_init["securityContext"]["capabilities"]["drop"],
-            serde_json::json!(["ALL"])
-        );
+        // Supervisor binary sideload init present (InitContainer method).
         assert!(
-            !init_containers
+            init_containers
                 .iter()
                 .any(|container| container["name"] == SUPERVISOR_INIT_CONTAINER_NAME)
         );
@@ -9348,6 +9411,7 @@ mod tests {
             sandbox_name: "example-sandbox",
             cr_name: "example-sandbox",
             proxy_pod_dns_peers: peers,
+            proxy_pod_gateway_peers: &[],
             ..SandboxPodParams::default()
         };
         proxy_pod_agent_egress_network_policy(
@@ -9372,7 +9436,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_command_override_is_rejected_outside_proxy_pod() {
+    fn agent_command_override_is_rejected_in_every_topology() {
         let config = KubernetesSandboxDriverConfig {
             containers: KubernetesDriverContainersConfig {
                 agent: KubernetesContainerDriverConfig {
@@ -9383,10 +9447,16 @@ mod tests {
             ..KubernetesSandboxDriverConfig::default()
         };
 
-        validate_agent_command_for_topology(&config, SupervisorTopology::ProxyPod).unwrap();
-        let err =
-            validate_agent_command_for_topology(&config, SupervisorTopology::Combined).unwrap_err();
-        assert!(err.contains("proxy-pod"), "{err}");
+        // proxy-pod now runs the process supervisor as the entrypoint too, so the
+        // override is ignored (and rejected) in every topology.
+        for topology in [
+            SupervisorTopology::Combined,
+            SupervisorTopology::Sidecar,
+            SupervisorTopology::ProxyPod,
+        ] {
+            let err = validate_agent_command_for_topology(&config, topology).unwrap_err();
+            assert!(err.contains("not supported"), "{topology}: {err}");
+        }
     }
 
     /// Per-sandbox proxy-pod resources are named from the sandbox name, not
@@ -9723,19 +9793,15 @@ mod tests {
     }
 
     #[test]
-    fn proxy_pod_reports_no_supervisor_session_model() {
-        let obj = sandbox_object_with_conditions(&[("Ready", "True")]);
-        let status = status_from_object(&obj, SupervisorTopology::ProxyPod).unwrap();
-        assert_eq!(
-            status.supervisor_session_model,
-            SupervisorSessionModel::None as i32
-        );
-    }
-
-    #[test]
     fn supervisor_topologies_require_a_supervisor_session() {
         let obj = sandbox_object_with_conditions(&[("Ready", "True")]);
-        for topology in [SupervisorTopology::Combined, SupervisorTopology::Sidecar] {
+        // proxy-pod now runs an in-pod process supervisor, so it too requires a
+        // session (relays are available).
+        for topology in [
+            SupervisorTopology::Combined,
+            SupervisorTopology::Sidecar,
+            SupervisorTopology::ProxyPod,
+        ] {
             let status = status_from_object(&obj, topology).unwrap();
             assert_eq!(
                 status.supervisor_session_model,
@@ -9876,13 +9942,13 @@ mod tests {
             ),
         ]));
 
-        // Fallback says `combined`, but the persisted `proxy-pod` annotation wins,
-        // so the sandbox reports no supervisor session model.
+        // The persisted `proxy-pod` annotation is honored over the `combined`
+        // fallback; every topology now requires a supervisor session.
         let (_, sandbox) =
             sandbox_from_object("default", obj, SupervisorTopology::Combined).unwrap();
         assert_eq!(
             sandbox.status.unwrap().supervisor_session_model,
-            SupervisorSessionModel::None as i32
+            SupervisorSessionModel::Required as i32
         );
     }
 

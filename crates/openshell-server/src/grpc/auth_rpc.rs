@@ -97,9 +97,21 @@ pub async fn handle_issue_sandbox_token(
 
     ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
 
-    let minted = issuer.mint(&sandbox.sandbox_id)?;
+    // A proxy-pod agent pod (role=agent) gets a scoped `Process`-kind token that
+    // cannot read provider secrets or mint upstream credentials; every other pod
+    // (combined/sidecar, or a proxy-pod supervisor pod) gets full authority.
+    let caller_kind = match &sandbox.source {
+        SandboxIdentitySource::K8sServiceAccount { sandbox_role, .. }
+            if sandbox_role.as_deref() == Some(crate::auth::k8s_sa::SANDBOX_ROLE_AGENT) =>
+        {
+            crate::auth::principal::SandboxCallerKind::Process
+        }
+        _ => crate::auth::principal::SandboxCallerKind::Full,
+    };
+    let minted = issuer.mint_with_caller_kind(&sandbox.sandbox_id, caller_kind)?;
     info!(
         sandbox_id = %sandbox.sandbox_id,
+        ?caller_kind,
         "issued gateway sandbox JWT"
     );
     Ok(Response::new(IssueSandboxTokenResponse {
@@ -148,7 +160,9 @@ pub async fn handle_refresh_sandbox_token(
 
     ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
 
-    let minted = issuer.mint(&sandbox.sandbox_id)?;
+    // Preserve the caller's authority across refresh: a process-kind token must
+    // not be upgraded to full authority by refreshing.
+    let minted = issuer.mint_with_caller_kind(&sandbox.sandbox_id, sandbox.caller_kind())?;
     let extension_credentials = if requested_extension_services.is_empty() {
         Vec::new()
     } else if !state
@@ -522,6 +536,7 @@ mod tests {
                 source: SandboxIdentitySource::K8sServiceAccount {
                     pod_name: "pod-a".to_string(),
                     pod_uid: "uid-a".to_string(),
+                    sandbox_role: None,
                 },
                 trust_domain: Some("openshell".to_string()),
             }));
@@ -545,6 +560,7 @@ mod tests {
                 source: SandboxIdentitySource::K8sServiceAccount {
                     pod_name: "pod-a".to_string(),
                     pod_uid: "uid-a".to_string(),
+                    sandbox_role: None,
                 },
                 trust_domain: Some("openshell".to_string()),
             }));
@@ -592,6 +608,7 @@ mod tests {
                 source: SandboxIdentitySource::K8sServiceAccount {
                     pod_name: "pod-a".to_string(),
                     pod_uid: "uid-a".to_string(),
+                    sandbox_role: None,
                 },
                 trust_domain: Some("openshell".to_string()),
             }));

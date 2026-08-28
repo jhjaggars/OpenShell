@@ -317,6 +317,14 @@ pub struct KubernetesProxyPodConfig {
     /// DNS elsewhere must override this or the agent pod cannot resolve any
     /// name, including its own paired supervisor `Service`.
     pub dns_peers: Vec<ProxyPodDnsPeer>,
+    /// Gateway peers the agent egress `NetworkPolicy` permits, so the in-pod
+    /// process supervisor can reach the `OpenShell` gateway for its session
+    /// (relays, policy, log push, token bootstrap). Same shape as `dns_peers`
+    /// (namespace/pod selectors + the gateway's TCP port). Empty by default; the
+    /// Helm chart renders it from the gateway's own pod labels and port. A
+    /// proxy-pod sandbox whose supervisor cannot reach the gateway never becomes
+    /// ready, so validation rejects an empty list for that topology.
+    pub gateway_peers: Vec<ProxyPodDnsPeer>,
     /// Keep managing existing proxy-pod sandboxes after the configured topology
     /// has been switched away from `proxy-pod`.
     ///
@@ -339,6 +347,7 @@ impl Default for KubernetesProxyPodConfig {
             proxy_uid: DEFAULT_PROXY_UID,
             affinity: ProxyPodAffinity::Disabled,
             dns_peers: default_proxy_pod_dns_peers(),
+            gateway_peers: Vec::new(),
             retain_companion_management: false,
         }
     }
@@ -369,6 +378,25 @@ impl KubernetesProxyPodConfig {
             );
         }
         for (index, peer) in self.dns_peers.iter().enumerate() {
+            peer.validate(index)?;
+        }
+        Ok(())
+    }
+
+    /// Validate the configured gateway peers.
+    ///
+    /// An empty list is rejected: the in-pod process supervisor must reach the
+    /// gateway for its session, and the agent egress `NetworkPolicy` otherwise
+    /// denies it, so the sandbox never becomes ready.
+    pub fn validate_gateway_peers(&self) -> Result<(), String> {
+        if self.gateway_peers.is_empty() {
+            return Err(
+                "proxy_pod.gateway_peers must not be empty; the in-pod process supervisor needs \
+                 egress to the gateway for its session"
+                    .to_string(),
+            );
+        }
+        for (index, peer) in self.gateway_peers.iter().enumerate() {
             peer.validate(index)?;
         }
         Ok(())

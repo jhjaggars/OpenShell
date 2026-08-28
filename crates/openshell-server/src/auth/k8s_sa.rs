@@ -53,6 +53,12 @@ const SANDBOX_KIND: &str = "Sandbox";
 const REPLICA_SET_KIND: &str = "ReplicaSet";
 const DEPLOYMENT_KIND: &str = "Deployment";
 const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
+/// Pod label the Kubernetes driver sets to distinguish a proxy-pod agent pod
+/// (`agent`) from its supervisor pod (`supervisor`). Cross-crate contract with
+/// `openshell-driver-kubernetes` (`LABEL_SANDBOX_ROLE`).
+const SANDBOX_ROLE_LABEL: &str = "openshell.ai/sandbox-role";
+/// The `sandbox-role` value that gets a scoped `Process`-kind token.
+pub const SANDBOX_ROLE_AGENT: &str = "agent";
 const POD_NAME_EXTRA: &str = "authentication.kubernetes.io/pod-name";
 const POD_UID_EXTRA: &str = "authentication.kubernetes.io/pod-uid";
 
@@ -62,6 +68,9 @@ pub struct ResolvedK8sIdentity {
     pub sandbox_id: String,
     pub pod_name: String,
     pub pod_uid: String,
+    /// The pod's `openshell.ai/sandbox-role` label, if set (e.g. `agent` for a
+    /// proxy-pod agent pod).
+    pub sandbox_role: Option<String>,
 }
 
 /// Apiserver-facing operations the authenticator depends on. Split out so
@@ -135,6 +144,7 @@ impl Authenticator for K8sServiceAccountAuthenticator {
             source: SandboxIdentitySource::K8sServiceAccount {
                 pod_name: resolved.pod_name,
                 pod_uid: resolved.pod_uid,
+                sandbox_role: resolved.sandbox_role,
             },
             trust_domain: Some("openshell".to_string()),
         })))
@@ -481,10 +491,22 @@ impl K8sIdentityResolver for LiveK8sResolver {
         };
         validate_sandbox_owner_reference(&owner, &sandbox_id, &sandbox_cr)?;
 
+        // The pod's role label (set by the driver, immutable to the workload)
+        // distinguishes a proxy-pod agent pod from its supervisor pod so the
+        // gateway can mint a scoped `Process`-kind token for the former.
+        let sandbox_role = pod
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(SANDBOX_ROLE_LABEL))
+            .filter(|role| !role.is_empty())
+            .cloned();
+
         Ok(Some(ResolvedK8sIdentity {
             sandbox_id,
             pod_name: identity.pod_name,
             pod_uid: identity.pod_uid,
+            sandbox_role,
         }))
     }
 }
@@ -1236,6 +1258,7 @@ mod tests {
             sandbox_id: "sandbox-a".to_string(),
             pod_name: "openshell-sandbox-a".to_string(),
             pod_uid: "uid-a".to_string(),
+            sandbox_role: None,
         };
         let fake = Arc::new(FakeResolver::returning(Ok(Some(resolved))));
         let auth = K8sServiceAccountAuthenticator::new(fake.clone());
@@ -1305,6 +1328,7 @@ mod tests {
             sandbox_id: String::new(),
             pod_name: "stray-pod".to_string(),
             pod_uid: "uid".to_string(),
+            sandbox_role: None,
         };
         let fake = Arc::new(FakeResolver::returning(Ok(Some(resolved))));
         let auth = K8sServiceAccountAuthenticator::new(fake);

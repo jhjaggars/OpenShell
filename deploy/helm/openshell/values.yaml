@@ -99,6 +99,12 @@ supervisor:
     #         dns.operator.openshift.io/daemonset-dns: default
     #       port: 5353
     dnsPeers: []
+    # -- Gateway peers the proxy-pod agent egress NetworkPolicy permits, so the
+    # in-pod process supervisor can reach the gateway for its session. Same shape
+    # as dnsPeers (namespaceLabels/podLabels + port). Empty (default) auto-renders
+    # a peer matching THIS chart's own gateway pods on the service port; override
+    # only for an external or differently-labeled gateway.
+    gatewayPeers: []
 
 # -- Operator-owned corporate forward proxy for policy-approved TLS egress
 # from Kubernetes sandboxes. The workload cannot select or override it.

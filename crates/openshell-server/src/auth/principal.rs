@@ -111,5 +111,13 @@ pub enum SandboxIdentitySource {
     BootstrapCert { fingerprint: String },
     /// K8s `ServiceAccount` token used to bootstrap a gateway-minted JWT
     /// via `IssueSandboxToken`. Populated only on that one RPC path.
-    K8sServiceAccount { pod_name: String, pod_uid: String },
+    K8sServiceAccount {
+        pod_name: String,
+        pod_uid: String,
+        /// The pod's `openshell.ai/sandbox-role` label, when present. Used by
+        /// `IssueSandboxToken` to mint a scoped `Process`-kind token for a
+        /// proxy-pod agent pod (`role=agent`) versus a full-authority token
+        /// otherwise.
+        sandbox_role: Option<String>,
+    },
 }
