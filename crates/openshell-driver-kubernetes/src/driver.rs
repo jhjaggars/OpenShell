@@ -4561,6 +4561,15 @@ fn apply_supervisor_proxy_pod_topology(
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut();
     if let Some(volumes) = volumes {
+        // The provider SPIFFE Workload API socket belongs only in the supervisor
+        // (proxy) pod, which mints provider credentials. The agent pod holds a
+        // scoped process-kind credential that cannot access provider secrets, so
+        // it must not carry an SVID: drop the CSI volume entirely (no container
+        // in the agent pod mounts it after the cleanup below).
+        volumes.retain(|v| {
+            v.get("name").and_then(serde_json::Value::as_str)
+                != Some(SPIFFE_WORKLOAD_API_VOLUME_NAME)
+        });
         volumes.push(serde_json::json!({
             "name": "openshell-proxy-pod-ca-source",
             "secret": {
@@ -4673,6 +4682,9 @@ fn apply_supervisor_proxy_pod_topology(
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut();
         if let Some(volume_mounts) = volume_mounts {
+            // Drop the provider SPIFFE Workload API mount from the agent
+            // container; it belongs only in the supervisor (proxy) pod.
+            remove_volume_mount(volume_mounts, SPIFFE_WORKLOAD_API_VOLUME_NAME);
             volume_mounts.push(supervisor_volume_mount());
             volume_mounts.push(proxy_pod_ca_tls_volume_mount(true));
         }
@@ -4682,6 +4694,14 @@ fn apply_supervisor_proxy_pod_topology(
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut();
         if let Some(env) = env {
+            // The provider SPIFFE Workload API socket lives only in the proxy
+            // pod; strip its env so the agent never advertises a socket it no
+            // longer mounts.
+            remove_env(
+                env,
+                openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+            );
+
             // Select the process-supervisor + remote-proxy runtime path: own
             // gateway session (no sidecar control socket), NetworkOnly
             // enforcement, and the proxy CA read from the mounted TLS dir.
@@ -9597,6 +9617,99 @@ mod tests {
         assert!(
             !joined.contains("--upstream-proxy-auth-file"),
             "proxy-pod must not reference an unmounted auth file: {joined}"
+        );
+    }
+
+    /// The provider SPIFFE Workload API socket must live only in the supervisor
+    /// (proxy) pod, which mints provider credentials. The agent pod holds a
+    /// scoped process-kind credential that cannot access provider secrets, so it
+    /// must not carry an SVID: no CSI volume, no container mount, no env.
+    #[test]
+    fn proxy_pod_strips_provider_spiffe_from_agent_but_keeps_it_on_supervisor() {
+        let names = proxy_pod_resource_names("example-sandbox", "sandbox-123");
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::ProxyPod,
+            supervisor_image: "supervisor-image:latest",
+            namespace: "agents",
+            sandbox_id: "sandbox-123",
+            sandbox_name: "example-sandbox",
+            cr_name: "example-sandbox",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            provider_spiffe_enabled: true,
+            provider_spiffe_workload_api_socket_path: "/spiffe-workload-api/spire-agent.sock",
+            ..SandboxPodParams::default()
+        };
+
+        // Agent pod: SPIFFE stripped everywhere.
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+        let agent = &pod_template["spec"]["containers"][0];
+        assert!(
+            rendered_env(
+                agent,
+                openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET
+            )
+            .is_none(),
+            "agent must not advertise the provider SPIFFE socket"
+        );
+        let agent_mounts = agent["volumeMounts"]
+            .as_array()
+            .expect("agent volumeMounts");
+        assert!(
+            !agent_mounts
+                .iter()
+                .any(|m| m["name"] == SPIFFE_WORKLOAD_API_VOLUME_NAME),
+            "agent container must not mount the SPIFFE workload API socket"
+        );
+        let pod_volumes = pod_template["spec"]["volumes"]
+            .as_array()
+            .expect("pod volumes");
+        assert!(
+            !pod_volumes
+                .iter()
+                .any(|v| v["name"] == SPIFFE_WORKLOAD_API_VOLUME_NAME),
+            "agent pod must not carry the SPIFFE CSI volume"
+        );
+
+        // Supervisor (proxy) pod: SPIFFE retained (it mints provider credentials).
+        let dep = serde_json::to_value(proxy_pod_supervisor_deployment(
+            &names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &params,
+            &KubernetesPodDriverConfig::default(),
+            &ProxyPodPlacement::default(),
+            1,
+            serde_json::json!({}),
+        ))
+        .unwrap();
+        let sup_spec = &dep["spec"]["template"]["spec"];
+        let sup_mounts = sup_spec["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("supervisor volumeMounts");
+        assert!(
+            sup_mounts
+                .iter()
+                .any(|m| m["name"] == SPIFFE_WORKLOAD_API_VOLUME_NAME),
+            "supervisor container must mount the SPIFFE workload API socket"
+        );
+        let sup_volumes = sup_spec["volumes"].as_array().expect("supervisor volumes");
+        assert!(
+            sup_volumes
+                .iter()
+                .any(|v| v["name"] == SPIFFE_WORKLOAD_API_VOLUME_NAME
+                    && v["csi"]["driver"] == "csi.spiffe.io"),
+            "supervisor pod must carry the SPIFFE CSI volume"
         );
     }
 
