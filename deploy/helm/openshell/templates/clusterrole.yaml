@@ -153,6 +153,16 @@ rules:
       - list
       - create
       - delete
+  # Setting a custom spec.host on an OpenShift Route requires the
+  # custom-host subresource in addition to routes themselves.
+  - apiGroups:
+      - route.openshift.io
+    resources:
+      - routes/custom-host
+    verbs:
+      - create
+      - patch
+      - update
   - apiGroups:
       - gateway.networking.k8s.io
     resources:
