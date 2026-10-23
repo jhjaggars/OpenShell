@@ -1336,6 +1336,82 @@ fn http_activity_for_method(method: &Method) -> ActivityId {
     }
 }
 
+/// Gateway-side source of every exposed-service hostname this gateway
+/// currently serves. Lists persisted [`ServiceEndpoint`] records across all
+/// workspaces and mints each hostname exactly as `service expose` returned
+/// it, so consumers never duplicate the hash or composite-hostname format.
+/// Drives the Kubernetes service-ingress reconciler.
+#[derive(Clone)]
+pub struct ServiceEndpointHostnames {
+    store: Arc<Store>,
+    config: Arc<openshell_core::Config>,
+}
+
+impl ServiceEndpointHostnames {
+    #[must_use]
+    pub fn new(store: Arc<Store>, config: openshell_core::Config) -> Self {
+        Self {
+            store,
+            config: Arc::new(config),
+        }
+    }
+
+    /// Every live exposed-service hostname, sorted and deduplicated.
+    /// Persistence failures return an empty set: the caller treats this as
+    /// "nothing to reconcile" and retries on the next poll.
+    pub async fn hostnames(&self) -> Vec<String> {
+        let endpoints = match self
+            .store
+            .collect_messages::<ServiceEndpoint>(ObjectListQuery::AllWorkspaces)
+            .await
+        {
+            Ok(endpoints) => endpoints,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "service ingress: failed to list service endpoints"
+                );
+                return Vec::new();
+            }
+        };
+        let mut hostnames = Vec::new();
+        for endpoint in endpoints {
+            if !endpoint.domain
+                || endpoint
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.deletion_time.is_some())
+            {
+                continue;
+            }
+            let Some(url) = endpoint_url(
+                &self.config,
+                endpoint.object_workspace(),
+                &endpoint.sandbox,
+                &endpoint.name,
+            ) else {
+                continue;
+            };
+            if let Some(hostname) = hostname_from_url(&url) {
+                hostnames.push(hostname.to_string());
+            }
+        }
+        hostnames.sort_unstable();
+        hostnames.dedup();
+        hostnames
+    }
+}
+
+/// Extract the host portion of a `scheme://host[:port]/` service URL.
+fn hostname_from_url(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split('/').next()?;
+    let host = authority.split(':').next()?;
+    (!host.is_empty()).then_some(host)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2241,5 +2317,84 @@ mod tests {
         let seen = capture.events();
         assert_eq!(seen.len(), 1, "expected exactly one OCSF tracing event");
         assert_eq!(seen[0].format_shorthand(), expected_shorthand);
+    }
+
+    #[tokio::test]
+    async fn service_endpoint_hostnames_lists_live_domain_endpoints_only() {
+        use prost::Message;
+
+        let store = crate::persistence::test_store().await;
+
+        let live = endpoint();
+        store
+            .put_if(
+                ServiceEndpoint::object_type(),
+                live.object_id(),
+                "my-sandbox--web",
+                "default",
+                &live.encode_to_vec(),
+                None,
+                crate::persistence::WriteCondition::MustCreate,
+            )
+            .await
+            .unwrap();
+
+        let mut internal = endpoint();
+        internal.metadata.as_mut().unwrap().id = "endpoint-internal".to_string();
+        internal.domain = false;
+        store
+            .put_if(
+                ServiceEndpoint::object_type(),
+                internal.object_id(),
+                "my-sandbox--internal",
+                "default",
+                &internal.encode_to_vec(),
+                None,
+                crate::persistence::WriteCondition::MustCreate,
+            )
+            .await
+            .unwrap();
+
+        let mut deleted = endpoint();
+        deleted.metadata.as_mut().unwrap().id = "endpoint-deleted".to_string();
+        deleted.metadata.as_mut().unwrap().deletion_time =
+            openshell_core::time::timestamp_from_millis(1_000).ok();
+        store
+            .put_if(
+                ServiceEndpoint::object_type(),
+                deleted.object_id(),
+                "my-sandbox--gone",
+                "default",
+                &deleted.encode_to_vec(),
+                None,
+                crate::persistence::WriteCondition::MustCreate,
+            )
+            .await
+            .unwrap();
+
+        let cfg = openshell_core::Config::new(Some(tls_config()))
+            .with_bind_address("127.0.0.1:8080".parse().unwrap())
+            .with_server_sans(["*.dev.openshell.localhost"])
+            .with_service_routing_gateway_name(Some("gateway-a"));
+        let provider = ServiceEndpointHostnames::new(store.into(), cfg);
+
+        assert_eq!(
+            provider.hostnames().await,
+            vec!["enh47uqyj7bpyttz.dev.openshell.localhost".to_string()]
+        );
+    }
+
+    #[test]
+    fn hostname_from_url_strips_scheme_and_port() {
+        assert_eq!(
+            hostname_from_url("https://a.example.com/"),
+            Some("a.example.com")
+        );
+        assert_eq!(
+            hostname_from_url("http://a.example.com:8080/"),
+            Some("a.example.com")
+        );
+        assert_eq!(hostname_from_url("ftp://host/"), None);
+        assert_eq!(hostname_from_url("https:///path"), None);
     }
 }

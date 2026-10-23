@@ -387,6 +387,41 @@ Changing or removing the routing name changes every hash URL issued before
 the change; previously issued URLs stop resolving until callers request a
 fresh URL.
 
+### Automatic Service Ingress
+
+The Kubernetes compute driver can reconcile the exact-host ingress objects
+that hashed hostnames need. Enable
+`[openshell.drivers.kubernetes.service_ingress]` with `enabled = true` and
+choose the object `kind` — `route` (an `OpenShift` Route with TLS
+passthrough), `httproute` (a Gateway API HTTPRoute attached to a parent
+Gateway), or `ingress` (a `networking.k8s.io` Ingress; the gateway terminates
+service TLS itself, so the controller must support SSL passthrough — the
+nginx passthrough annotation is set automatically).
+
+The reconciler runs inside the gateway: it polls the gateway's persisted
+service endpoints every `poll_interval_secs` (default 15) and ensures one
+object of the configured kind exists per exposed hostname, targeting the
+gateway Service named by `target_service_name` in
+`target_service_namespace` on `target_service_port`. Objects carry the
+`openshell.ai/managed-by: openshell` and `openshell.ai/service-ingress: true`
+labels plus the `openshell.ai/service-hostname` annotation; objects whose
+hostname is no longer exposed are deleted. The gateway ServiceAccount needs
+create, get, list, and delete permission on the reconciled kind.
+
+The Helm chart exposes this as `serviceIngress.enabled`, wiring the release's
+own Service, namespace, and port automatically. Because every replica of a
+highly available gateway computes the same desired set, concurrent
+reconcilers converge: creates tolerate `AlreadyExists` and deletes are
+idempotent.
+
+A single gateway that owns its whole service domain does not need this:
+one wildcard host rule (an `OpenShift` Route with
+`wildcardPolicy: Subdomain` or an HTTPRoute with a `*.domain` hostname)
+pointed at the gateway Service covers every hostname the gateway will ever
+mint. Reconciliation is for the shared-domain multi-gateway topology, where
+exact-host rules are the only way to steer each hostname to the right
+gateway.
+
 ## Database Pool
 
 `[openshell.gateway] database_max_connections` sets the connection ceiling for the gateway's database pool. One pool is shared by every database-backed RPC, so this value is also the gateway's ceiling on concurrent database work. When the pool is saturated, callers queue on connection acquisition and sqlx logs that the time to acquire a connection exceeded its slow threshold. The background readiness monitor draws from the same pool, so sustained saturation can push its database ping past the check timeout and flip `/readyz` to not-ready while the gateway is otherwise serving.

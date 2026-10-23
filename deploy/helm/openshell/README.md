@@ -566,6 +566,11 @@ discovery endpoint or its TLS CA.
 | server.sandboxJwt.ttlSecs | int | `3600` | Token TTL in seconds. Defaults to 3600 (1h). |
 | server.sandboxNamespace | string | `""` | Namespace where sandbox pods are created. Defaults to the Helm release namespace (.Release.Namespace) when left empty. |
 | server.sandboxUid | string | `""` | UID for sandbox pods (`sandbox_uid`). Empty (default) = use the OpenShift SCC namespace annotation if present, otherwise the driver default. Must be an integer between 1 and 4294967294. |
+| serviceIngress.enabled | bool | `false` | Reconcile ingress objects for exposed sandbox service hostnames, targeting this release's gateway Service. Needed when multiple gateways share one service base domain; a single gateway can use one wildcard host rule instead. |
+| serviceIngress.kind | string | `"route"` | Object kind to reconcile: `route` (OpenShift Route with TLS passthrough), `httproute` (Gateway API HTTPRoute), or `ingress` (networking.k8s.io Ingress; requires a controller with SSL passthrough, annotated for nginx). |
+| serviceIngress.ingressClass | string | `""` | Ingress class for the `ingress` kind. |
+| serviceIngress.httpRouteParentGateway | string | `""` | Parent Gateway name for the `httproute` kind. Defaults to the chart-managed Gateway. |
+| serviceIngress.pollIntervalSeconds | int | `15` | Seconds between reconciliation passes. |
 | server.serviceRoutingGatewayName | string | `""` | Optional routing name that disambiguates exposed-service hostnames when multiple gateways share one service base domain behind a single ingress and wildcard certificate. Must be unique among those gateways. When set, exposed-service hostnames become opaque fixed-length hashed labels (for example enh47uqyj7bpyttz.apps.example.com) instead of the readable workspace--sandbox--service composite. Unset preserves the composite hostnames. |
 | server.telemetryEnabled | bool | `true` | Enable anonymous OpenShell telemetry from the gateway and the sandbox supervisors it launches. |
 | server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |

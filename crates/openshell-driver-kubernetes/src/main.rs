@@ -13,7 +13,7 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 use openshell_driver_kubernetes::{
     ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
     KubernetesComputeConfig, KubernetesComputeDriver, KubernetesImagePullPolicy,
-    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, WorkspaceMode,
+    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, ServiceIngressConfig, WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -278,6 +278,10 @@ async fn main() -> Result<()> {
                 gateway_namespace: args.managed_ssh_gateway_namespace.unwrap_or_default(),
                 gateway_pod_selector: managed_ssh_gateway_pod_selector,
             },
+            // Service ingress reconciliation is gateway-driven; the
+            // standalone driver process has no access to the gateway's
+            // exposed-service hostnames.
+            service_ingress: ServiceIngressConfig::default(),
             sandbox_runtime_image: args
                 .sandbox_runtime_image
                 .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image),

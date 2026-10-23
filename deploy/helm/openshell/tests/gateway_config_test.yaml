@@ -57,6 +57,45 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?m)^service_routing_gateway_name\s*=\s*"gateway-east"$'
 
+  - it: omits service_ingress unless reconciliation is enabled
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.drivers\.kubernetes\.service_ingress\]'
+
+  - it: wires service_ingress to this release's gateway Service when enabled
+    template: templates/gateway-config.yaml
+    set:
+      serviceIngress.enabled: true
+      serviceIngress.kind: httproute
+      serviceIngress.pollIntervalSeconds: 30
+    release:
+      name: gateway-a
+      namespace: openshell-a
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\[openshell\.drivers\.kubernetes\.service_ingress\]$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^enabled\s*=\s*true$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^kind\s*=\s*"httproute"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^target_service_name\s*=\s*"gateway-a-openshell"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^target_service_namespace\s*=\s*"openshell-a"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^http_route_parent_gateway\s*=\s*"gateway-a-openshell"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^poll_interval_secs\s*=\s*30$'
+
   - it: defaults to label admission with caller driver config disabled
     template: templates/gateway-config.yaml
     asserts:

@@ -293,6 +293,7 @@ pub use multiplex::{MultiplexService, MultiplexedService};
 pub use persistence::Store;
 use sandbox_index::SandboxIndex;
 use sandbox_watch::SandboxWatchBus;
+pub use service_routing::ServiceEndpointHostnames;
 pub use tls::TlsAcceptor;
 use tracing_bus::TracingLogBus;
 
@@ -1709,6 +1710,7 @@ pub struct ComputeDriverBuildContext<'a> {
     config: ComputeDriverConfigContext<'a>,
     shutdown_rx: watch::Receiver<bool>,
     shared_supervision: &'a OnceLock<openshell_supervisor_control::SharedSupervision>,
+    exposed_service_hostnames: Arc<ServiceEndpointHostnames>,
 }
 
 impl ComputeDriverBuildContext<'_> {
@@ -1722,6 +1724,13 @@ impl ComputeDriverBuildContext<'_> {
         self.shared_supervision
             .get_or_init(openshell_supervisor_control::SharedSupervision::new)
             .clone()
+    }
+
+    /// The gateway's source of exposed-service hostnames, for drivers that
+    /// reconcile ingress objects for exposed sandbox services.
+    #[must_use]
+    pub fn exposed_service_hostnames(&self) -> Arc<ServiceEndpointHostnames> {
+        self.exposed_service_hostnames.clone()
     }
 
     #[must_use]
@@ -1852,6 +1861,10 @@ async fn build_compute_runtime(
                 },
                 shutdown_rx,
                 shared_supervision: &shared_supervision,
+                exposed_service_hostnames: Arc::new(ServiceEndpointHostnames::new(
+                    store.clone(),
+                    config.clone(),
+                )),
             };
             let instance = registration.factory.build(build_context).await?;
             let supervisor_host = shared_supervision

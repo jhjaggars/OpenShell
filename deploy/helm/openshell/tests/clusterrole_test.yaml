@@ -221,3 +221,59 @@ tests:
       - equal:
           path: metadata.name
           value: openshell-node-reader-my-namespace
+
+  - it: omits service ingress rules unless reconciliation is enabled
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups:
+              - route.openshift.io
+            resources:
+              - routes
+            verbs:
+              - get
+              - list
+              - create
+              - delete
+
+  - it: grants service ingress object access when reconciliation is enabled
+    set:
+      serviceIngress.enabled: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - route.openshift.io
+            resources:
+              - routes
+            verbs:
+              - get
+              - list
+              - create
+              - delete
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - gateway.networking.k8s.io
+            resources:
+              - httproutes
+            verbs:
+              - get
+              - list
+              - create
+              - delete
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - networking.k8s.io
+            resources:
+              - ingresses
+            verbs:
+              - get
+              - list
+              - create
+              - delete

@@ -285,6 +285,27 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
             .map(str::to_string);
         config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
         config.supervisor_gateway_name = Some(context.gateway_name().to_string());
+        // Reconcile ingress objects for exposed sandbox services when the
+        // operator opted in. The reconciler polls the gateway's persisted
+        // endpoints and owns the Kubernetes objects it creates.
+        if config.service_ingress.enabled {
+            let source = std::sync::Arc::new(GatewayExposedServices {
+                hostnames: context.exposed_service_hostnames(),
+            });
+            let reconciler =
+                openshell_driver_kubernetes::service_ingress::ServiceIngressReconciler::new(
+                    config.service_ingress.clone(),
+                    source,
+                    context.shutdown_receiver(),
+                )
+                .await
+                .map_err(|error| {
+                    openshell_core::Error::config(format!(
+                        "failed to start the service ingress reconciler: {error}"
+                    ))
+                })?;
+            reconciler.spawn();
+        }
         // With the gateway supervisor topology, the gateway owns the shared
         // supervisor's assignments and token; the driver adapts them to
         // Kubernetes objects.
@@ -307,6 +328,23 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
         Ok(openshell_server::ComputeDriverInstance::InProcess(
             std::sync::Arc::new(driver),
         ))
+    }
+}
+
+/// Adapts the gateway's exposed-service hostname source to the driver
+/// crate's reconciler trait.
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-kubernetes"))]
+struct GatewayExposedServices {
+    hostnames: std::sync::Arc<openshell_server::ServiceEndpointHostnames>,
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-kubernetes"))]
+impl openshell_driver_kubernetes::service_ingress::ExposedServiceSource for GatewayExposedServices {
+    fn exposed_service_hostnames(
+        &self,
+    ) -> openshell_driver_kubernetes::service_ingress::ExposedHostnamesFuture {
+        let source = self.hostnames.clone();
+        Box::pin(async move { source.hostnames().await })
     }
 }
 

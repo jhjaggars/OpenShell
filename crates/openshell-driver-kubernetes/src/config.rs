@@ -311,6 +311,8 @@ pub struct KubernetesComputeConfig {
     /// `NetworkPolicy` in each managed workspace namespace that permits TCP 2222
     /// only from gateway pods matching this peer.
     pub managed_ssh_ingress: ManagedSshIngressConfig,
+    /// Automatic ingress reconciliation for exposed sandbox services.
+    pub service_ingress: ServiceIngressConfig,
     /// Image that provides the trusted `openshell-sandbox` bootstrap binary.
     pub sandbox_runtime_image: String,
     /// Kubernetes `imagePullPolicy` for the sandbox runtime image.
@@ -442,6 +444,72 @@ pub struct ManagedSshIngressConfig {
     pub gateway_pod_selector: BTreeMap<String, String>,
 }
 
+/// Kubernetes object kind reconciled for exposed sandbox services.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceIngressKind {
+    /// `OpenShift` `Route` with TLS passthrough. The router forwards by SNI
+    /// and the gateway terminates TLS with its own certificate.
+    #[default]
+    Route,
+    /// Gateway API `HTTPRoute` attached to the configured parent `Gateway`.
+    HttpRoute,
+    /// `networking.k8s.io/v1` `Ingress`. Requires an ingress controller that
+    /// supports SSL passthrough (the annotation is set for nginx).
+    Ingress,
+}
+
+/// Automatic ingress reconciliation for exposed sandbox services.
+///
+/// When enabled, the gateway periodically lists its exposed service
+/// hostnames and ensures one ingress object of the configured kind exists
+/// per hostname, targeting the gateway's own Service. Objects are labeled as
+/// OpenShell-managed and orphaned entries are removed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServiceIngressConfig {
+    pub enabled: bool,
+    /// Object kind to reconcile for each exposed hostname.
+    pub kind: ServiceIngressKind,
+    /// Name of the gateway's Kubernetes `Service` that terminates service
+    /// traffic.
+    pub target_service_name: String,
+    /// Namespace holding the gateway `Service` and the reconciled objects.
+    pub target_service_namespace: String,
+    /// Numeric port of `target_service_name` that serves sandbox service
+    /// traffic (the gateway's main listener).
+    pub target_service_port: u16,
+    /// `spec.ingressClassName` for the `ingress` kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingress_class: Option<String>,
+    /// Parent `Gateway` name for the `httproute` kind. Defaults to the
+    /// gateway's own namespace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_route_parent_gateway: Option<String>,
+    /// Namespace of the parent `Gateway`. Defaults to
+    /// `target_service_namespace`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_route_parent_namespace: Option<String>,
+    /// Seconds between reconciliation passes.
+    pub poll_interval_secs: u64,
+}
+
+impl Default for ServiceIngressConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            kind: ServiceIngressKind::default(),
+            target_service_name: String::new(),
+            target_service_namespace: String::new(),
+            target_service_port: 8080,
+            ingress_class: None,
+            http_route_parent_gateway: None,
+            http_route_parent_namespace: None,
+            poll_interval_secs: 15,
+        }
+    }
+}
+
 /// Lower bound enforced by kubelet for projected SA tokens.
 pub const MIN_SA_TOKEN_TTL_SECS: i64 = 600;
 
@@ -487,6 +555,7 @@ impl Default for KubernetesComputeConfig {
             image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             managed_ssh_ingress: ManagedSshIngressConfig::default(),
+            service_ingress: ServiceIngressConfig::default(),
             sandbox_runtime_image: config::default_sandbox_runtime_image(),
             sandbox_runtime_image_pull_policy: None,
             supervisor_image: config::default_supervisor_image(),
@@ -530,7 +599,38 @@ impl KubernetesComputeConfig {
         self.validate_proxy_uid()?;
         self.validate_upstream_proxy_config()?;
         self.validate_allowed_pod_annotations()?;
-        self.validate_allowed_pod_labels()
+        self.validate_allowed_pod_labels()?;
+        self.validate_service_ingress()
+    }
+
+    /// Automatic service ingress reconciliation runs in every workspace mode,
+    /// because the reconciled objects live in the gateway's own namespace.
+    pub fn validate_service_ingress(&self) -> Result<(), String> {
+        if !self.service_ingress.enabled {
+            return Ok(());
+        }
+        let ingress = &self.service_ingress;
+        if ingress.target_service_name.is_empty() {
+            return Err("service_ingress requires target_service_name".into());
+        }
+        if ingress.target_service_namespace.is_empty() {
+            return Err("service_ingress requires target_service_namespace".into());
+        }
+        if ingress.target_service_port == 0 {
+            return Err("service_ingress requires a non-zero target_service_port".into());
+        }
+        if ingress.kind == ServiceIngressKind::HttpRoute
+            && ingress
+                .http_route_parent_gateway
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            return Err("service_ingress kind=httproute requires http_route_parent_gateway".into());
+        }
+        if ingress.poll_interval_secs == 0 {
+            return Err("service_ingress requires a non-zero poll_interval_secs".into());
+        }
+        Ok(())
     }
 
     /// The shared supervisor serves only sandbox instances it can isolate: it

@@ -147,6 +147,20 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- if not (hasKey $config "openshell.drivers.kubernetes.managed_ssh_ingress") -}}
 {{- $_ := set $config "openshell.drivers.kubernetes.managed_ssh_ingress" (dict "enabled" .Values.networkPolicy.enabled "gateway_namespace" .Release.Namespace "gateway_pod_selector" (dict "app.kubernetes.io/name" (include "openshell.name" .) "app.kubernetes.io/instance" .Release.Name)) -}}
 {{- end -}}
+{{- if and (hasKey .Values "serviceIngress") .Values.serviceIngress.enabled -}}
+{{- $serviceIngress := .Values.serviceIngress -}}
+{{- $parentGateway := default (include "openshell.grpcRouteGatewayName" .) $serviceIngress.httpRouteParentGateway -}}
+{{- $_ := set $config "openshell.drivers.kubernetes.service_ingress" (dict
+  "enabled" true
+  "kind" $serviceIngress.kind
+  "target_service_name" (include "openshell.fullname" .)
+  "target_service_namespace" .Release.Namespace
+  "target_service_port" .Values.service.port
+  "ingress_class" ($serviceIngress.ingressClass | default "")
+  "http_route_parent_gateway" $parentGateway
+  "poll_interval_secs" ($serviceIngress.pollIntervalSeconds | default 15)
+) -}}
+{{- end -}}
 {{- $legacyOidc := get $legacyServer "oidc" | default dict -}}
 {{- $oidcConfig := get $config "openshell.gateway.oidc" | default dict -}}
 {{- if or (hasKey $config "openshell.gateway.oidc") (get $legacyOidc "issuer") -}}

@@ -647,6 +647,29 @@ networkPolicy:
   # the driver applies the equivalent policy to each workspace namespace.
   enabled: true
 
+# Ingress reconciliation for exposed sandbox services. The gateway polls its
+# exposed service endpoints and ensures one ingress object exists per
+# hostname, targeting this release's gateway Service. Objects are labeled as
+# OpenShell-owned and removed when the service is no longer exposed. Needed
+# when multiple gateways share one service base domain (exact-host routing);
+# a single gateway can instead use one wildcard host rule.
+serviceIngress:
+  # -- Reconcile ingress objects for exposed sandbox service hostnames.
+  enabled: false
+  # -- Object kind to reconcile: `route` (OpenShift Route with TLS
+  # passthrough), `httproute` (Gateway API HTTPRoute), or `ingress`
+  # (networking.k8s.io Ingress; requires a controller with SSL passthrough,
+  # annotated for nginx).
+  kind: route
+  # -- Ingress class for the `ingress` kind.
+  ingressClass: ""
+  # -- Parent Gateway name for the `httproute` kind. Defaults to the
+  # chart-managed Gateway.
+  httpRouteParentGateway: ""
+  # -- Seconds between reconciliation passes.
+  pollIntervalSeconds: 15
+
+
 # Built-in TLS PKI bootstrap via a pre-install/pre-upgrade hook Job.
 # Runs `openshell-gateway generate-certs` to create the server and client TLS
 # Secrets in-cluster. Key material is written directly to K8s Secrets and

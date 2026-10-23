@@ -301,14 +301,35 @@ With a routing name set, each gateway emits opaque, fixed-length hashed
 hostnames (`https://<hash>.apps.example.com/`) for its exposed services. Hash
 hostnames are deterministic and unique per gateway, so exact-host
 `HTTPRoute`/`Ingress` rules route them unambiguously with the single shared
-wildcard certificate. The hostnames exist only once services are exposed, so
-the rules must be created as services are exposed — for example by automation
-that reads `openshell service list` or the gateway API and reconciles
-exact-host routes per gateway. The chart does not create or manage these
-routes.
+wildcard certificate.
+
+The hostnames exist only once services are exposed, so the exact-host rules
+must appear as services are exposed. Enable the chart's service ingress
+reconciler and the gateway creates and removes them itself:
+
+```shell
+helm upgrade openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set server.serviceRoutingGatewayName=gateway-a \
+  --set serviceIngress.enabled=true
+```
+
+The reconciler polls the gateway's exposed services and ensures one ingress
+object per hostname, targeting the gateway's own Service. `serviceIngress.kind`
+selects the object kind — `route` (`OpenShift` Route with TLS passthrough),
+`httproute` (Gateway API HTTPRoute), or `ingress` (requires an SSL-passthrough
+capable controller). The chart grants the matching RBAC automatically.
+
+Alternatively, run your own automation that reads `openshell service list` or
+the gateway API and reconciles exact-host routes per gateway. Without either,
+the URLs printed by `openshell service expose` are not reachable through the
+shared ingress.
 
 See [Gateway configuration](/how-it-works/gateways/configuration#service-routing)
-for the routing-name field, its validation, and the effects of changing it.
+for the routing-name field, its validation, the effects of changing it, and
+the service ingress reconciler settings.
 
 ## Next Steps
 
