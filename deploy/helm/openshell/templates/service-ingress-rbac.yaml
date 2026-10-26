@@ -1,0 +1,83 @@
+{{- if include "openshell.rbacCreate" . }}
+{{- /* RBAC for service ingress reconciliation.
+       All reconciled objects (OpenShift Routes, Gateway API HTTPRoutes, and
+       networking.k8s.io Ingresses) are created in the gateway's own
+       namespace, so a namespaced Role is sufficient — no cluster-scoped
+       permissions are required for this feature. The rules cover every
+       supported kind because the reconciled kind is selected by
+       configuration. */ -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- $serviceIngressTOML := get $gatewayConfig "openshell.drivers.kubernetes.service_ingress" | default dict -}}
+{{- $serviceIngressEnabled := false -}}
+{{- if hasKey $serviceIngressTOML "enabled" -}}
+{{- $serviceIngressEnabled = get $serviceIngressTOML "enabled" -}}
+{{- else if hasKey .Values "serviceIngress" -}}
+{{- $serviceIngressEnabled = .Values.serviceIngress.enabled -}}
+{{- end -}}
+{{- if $serviceIngressEnabled }}
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "openshell.fullname" . }}-service-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - route.openshift.io
+    resources:
+      - routes
+    verbs:
+      - get
+      - list
+      - create
+      - delete
+  # Setting a custom spec.host on an OpenShift Route requires the
+  # custom-host subresource in addition to routes themselves.
+  - apiGroups:
+      - route.openshift.io
+    resources:
+      - routes/custom-host
+    verbs:
+      - create
+      - patch
+      - update
+  - apiGroups:
+      - gateway.networking.k8s.io
+    resources:
+      - httproutes
+    verbs:
+      - get
+      - list
+      - create
+      - delete
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - ingresses
+    verbs:
+      - get
+      - list
+      - create
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "openshell.fullname" . }}-service-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "openshell.fullname" . }}-service-ingress
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "openshell.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

@@ -320,7 +320,9 @@ The reconciler polls the gateway's exposed services and ensures one ingress
 object per hostname, targeting the gateway's own Service. `serviceIngress.kind`
 selects the object kind — `route` (`OpenShift` Route with TLS passthrough),
 `httproute` (Gateway API HTTPRoute), or `ingress` (requires an SSL-passthrough
-capable controller). The chart grants the matching RBAC automatically.
+capable controller). The chart grants the matching RBAC automatically through
+a Role in the release namespace; no cluster-scoped permissions are required.
+Changing `kind` cleans up objects left by the previous kind.
 
 Alternatively, run your own automation that reads `openshell service list` or
 the gateway API and reconciles exact-host routes per gateway. Without either,
