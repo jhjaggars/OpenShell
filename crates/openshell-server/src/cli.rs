@@ -1467,6 +1467,13 @@ async fn run_service_ingress_controller(args: ServiceIngressControllerArgs) -> R
         ConfigMapFeedSource, ServiceIngressReconciler,
     };
 
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .init();
+
     let config_path = if let Some(path) = args.config {
         Some(path)
     } else {
