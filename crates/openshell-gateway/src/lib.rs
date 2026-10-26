@@ -42,6 +42,7 @@ use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_server::ComputeDriverRegistration;
 use openshell_server::ComputeDriverRegistry;
 use openshell_server::config_file::OtlpConfig;
+use std::time::Duration;
 
 #[cfg(all(
     not(target_os = "windows"),
@@ -285,26 +286,19 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
             .map(str::to_string);
         config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
         config.supervisor_gateway_name = Some(context.gateway_name().to_string());
-        // Reconcile ingress objects for exposed sandbox services when the
-        // operator opted in. The reconciler polls the gateway's persisted
-        // endpoints and owns the Kubernetes objects it creates.
+        // Publish the exposed-service hostname feed for the dedicated
+        // service-ingress controller when the operator opted in. The gateway
+        // owns hostname minting and endpoint persistence; the controller
+        // (deployed separately by the chart) watches the feed and owns the
+        // Kubernetes objects.
         if config.service_ingress.enabled {
-            let source = std::sync::Arc::new(GatewayExposedServices {
-                hostnames: context.exposed_service_hostnames(),
-            });
-            let reconciler =
-                openshell_driver_kubernetes::service_ingress::ServiceIngressReconciler::new(
-                    config.service_ingress.clone(),
-                    source,
-                    context.shutdown_receiver(),
-                )
-                .await
-                .map_err(|error| {
-                    openshell_core::Error::config(format!(
-                        "failed to start the service ingress reconciler: {error}"
-                    ))
-                })?;
-            reconciler.spawn();
+            spawn_service_ingress_feed_publisher(
+                context.exposed_service_hostnames(),
+                config.namespace.clone(),
+                config.service_ingress.publish_config_map_name.clone(),
+                Duration::from_secs(config.service_ingress.publish_interval_secs.max(1)),
+                context.shutdown_receiver(),
+            );
         }
         // With the gateway supervisor topology, the gateway owns the shared
         // supervisor's assignments and token; the driver adapts them to
@@ -331,21 +325,71 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
     }
 }
 
-/// Adapts the gateway's exposed-service hostname source to the driver
-/// crate's reconciler trait.
+/// Publishes the gateway's exposed-service hostname set into the feed
+/// `ConfigMap` consumed by the dedicated service-ingress controller.
+///
+/// Store read failures skip the pass instead of publishing an empty set:
+/// an empty feed is authoritative (every exposure was removed) and would
+/// instruct the controller to delete every ingress object.
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-kubernetes"))]
-struct GatewayExposedServices {
+fn spawn_service_ingress_feed_publisher(
     hostnames: std::sync::Arc<openshell_server::ServiceEndpointHostnames>,
-}
-
-#[cfg(all(not(target_os = "windows"), feature = "compute-driver-kubernetes"))]
-impl openshell_driver_kubernetes::service_ingress::ExposedServiceSource for GatewayExposedServices {
-    fn exposed_service_hostnames(
-        &self,
-    ) -> openshell_driver_kubernetes::service_ingress::ExposedHostnamesFuture {
-        let source = self.hostnames.clone();
-        Box::pin(async move { source.hostnames().await })
-    }
+    namespace: String,
+    config_map_name: String,
+    interval: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let client = match kube::Client::try_default().await {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "service ingress feed publisher failed to build a Kubernetes client"
+                );
+                return;
+            }
+        };
+        let mut publisher =
+            openshell_driver_kubernetes::service_ingress::ServiceIngressFeedPublisher::new(
+                client,
+                namespace.clone(),
+                config_map_name.clone(),
+            );
+        let mut ticker = tokio::time::interval(interval);
+        tracing::info!(
+            %namespace,
+            %config_map_name,
+            ?interval,
+            "service ingress feed publisher started"
+        );
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => break,
+            }
+            if *shutdown.borrow() {
+                break;
+            }
+            match hostnames.hostnames().await {
+                Ok(set) => {
+                    if let Err(error) = publisher.publish(&set).await {
+                        tracing::warn!(
+                            error = %error,
+                            "service ingress feed publish failed"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "service ingress feed skipped: endpoint persistence unavailable"
+                    );
+                }
+            }
+        }
+        tracing::info!("service ingress feed publisher stopped");
+    });
 }
 
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-kubernetes"))]

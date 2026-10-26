@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- /* The dedicated service-ingress controller. Watches the hostname-feed
+       ConfigMap the gateway publishes and reconciles one ingress object per
+       exposed service hostname, targeting the gateway's own Service. Runs
+       the gateway image's `service-ingress` subcommand against the shared
+       gateway configuration. A single replica is sufficient: the controller
+       is never in the data path, and its convergence guarantees (exact
+       object names, AlreadyExists-tolerant creates, idempotent deletes)
+       make additional replicas safe but redundant. */ -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- $serviceIngressTOML := get $gatewayConfig "openshell.drivers.kubernetes.service_ingress" | default dict -}}
+{{- $serviceIngressEnabled := false -}}
+{{- if hasKey $serviceIngressTOML "enabled" -}}
+{{- $serviceIngressEnabled = get $serviceIngressTOML "enabled" -}}
+{{- else if hasKey .Values "serviceIngress" -}}
+{{- $serviceIngressEnabled = .Values.serviceIngress.enabled -}}
+{{- end -}}
+{{- if $serviceIngressEnabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "openshell.fullname" . }}-service-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: service-ingress-controller
+spec:
+  replicas: {{ .Values.serviceIngress.replicas | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "openshell.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: service-ingress-controller
+  template:
+    metadata:
+      labels:
+        {{- include "openshell.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: service-ingress-controller
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "openshell.fullname" . }}-service-ingress
+      automountServiceAccountToken: true
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: service-ingress-controller
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: {{ include "openshell.image" . | quote }}
+          imagePullPolicy: {{ .Values.gateway.image.pullPolicy | default .Values.global.image.pullPolicy }}
+          args:
+            - service-ingress
+            - --config
+            - /etc/openshell/gateway.toml
+          volumeMounts:
+            - name: gateway-config
+              mountPath: /etc/openshell/gateway.toml
+              subPath: gateway.toml
+              readOnly: true
+          {{- with .Values.serviceIngress.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: gateway-config
+          configMap:
+            name: {{ include "openshell.fullname" . }}-config
+{{- end }}

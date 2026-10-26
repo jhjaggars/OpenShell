@@ -42,12 +42,31 @@ enum Commands {
     GenerateCerts(certgen::CertgenArgs),
     /// Inspect gateway configuration without starting the service.
     Config(ConfigArgs),
+    /// Run the dedicated service-ingress controller.
+    ///
+    /// Reconciles ingress objects for the gateway's exposed sandbox services
+    /// by watching the hostname feed the gateway publishes. Deployed by the
+    /// Helm chart as its own pod; the gateway's configuration file selects
+    /// the `[openshell.drivers.kubernetes.service_ingress]` table shared
+    /// with the gateway.
+    #[cfg(all(not(target_os = "windows"), feature = "service-ingress-controller"))]
+    ServiceIngress(ServiceIngressControllerArgs),
 }
 
 #[derive(clap::Args, Debug)]
 struct ConfigArgs {
     #[command(subcommand)]
     command: ConfigCommand,
+}
+
+/// Arguments for the dedicated service-ingress controller subcommand.
+#[derive(clap::Args, Debug)]
+struct ServiceIngressControllerArgs {
+    /// Gateway configuration file. The controller reads the
+    /// `[openshell.drivers.kubernetes.service_ingress]` table; every other
+    /// section is ignored.
+    #[arg(long, env = "OPENSHELL_CONFIG")]
+    config: Option<PathBuf>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -338,6 +357,8 @@ pub async fn run_cli_with_compute_drivers(compute_drivers: ComputeDriverRegistry
                 Ok(())
             }
         },
+        #[cfg(all(not(target_os = "windows"), feature = "service-ingress-controller"))]
+        Some(Commands::ServiceIngress(args)) => run_service_ingress_controller(args).await,
         None => Box::pin(run_from_args(cli.run, matches, compute_drivers)).await,
     }
 }
@@ -1431,6 +1452,79 @@ fn resolve_mtls_auth_enabled(
     }
 
     true
+}
+
+/// Run the dedicated service-ingress controller.
+///
+/// Loads the gateway configuration file, extracts the shared
+/// `[openshell.drivers.kubernetes.service_ingress]` table, and reconciles
+/// ingress objects against the hostname feed the gateway publishes into a
+/// `ConfigMap`. Runs until interrupted.
+#[cfg(all(not(target_os = "windows"), feature = "service-ingress-controller"))]
+async fn run_service_ingress_controller(args: ServiceIngressControllerArgs) -> Result<()> {
+    use openshell_driver_kubernetes::KubernetesComputeConfig;
+    use openshell_driver_kubernetes::service_ingress::{
+        ConfigMapFeedSource, ServiceIngressReconciler,
+    };
+
+    let config_path = if let Some(path) = args.config {
+        Some(path)
+    } else {
+        let default_path = defaults::default_gateway_config_path()?;
+        match std::fs::symlink_metadata(&default_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Ok(_) | Err(_) => Some(default_path),
+        }
+    };
+    let config: KubernetesComputeConfig = match config_path {
+        Some(path) => {
+            let file = config_file::load(&path).map_err(|e| miette::miette!("{e}"))?;
+            let table = config_file::driver_table(
+                "kubernetes",
+                &file.openshell.gateway,
+                file.openshell.drivers.get("kubernetes"),
+            );
+            table
+                .try_into()
+                .map_err(|e| miette::miette!("invalid [openshell.drivers.kubernetes] table: {e}"))?
+        }
+        None => KubernetesComputeConfig::default(),
+    };
+    config
+        .validate_configuration()
+        .map_err(|e| miette::miette!("invalid [openshell.drivers.kubernetes] table: {e}"))?;
+    if !config.service_ingress.enabled {
+        return Err(miette::miette!(
+            "service ingress is not enabled in \
+             [openshell.drivers.kubernetes.service_ingress]"
+        ));
+    }
+    let namespace = config.namespace.clone();
+    let source = ConfigMapFeedSource::from_ambient(
+        namespace.clone(),
+        config.service_ingress.publish_config_map_name.clone(),
+    )
+    .await
+    .map_err(|e| miette::miette!("failed to build a Kubernetes client: {e}"))?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = shutdown_tx.send(true);
+        }
+    });
+    let reconciler = ServiceIngressReconciler::new(
+        config.service_ingress,
+        std::sync::Arc::new(source),
+        shutdown_rx,
+    )
+    .await
+    .map_err(|e| miette::miette!("failed to start the service ingress reconciler: {e}"))?;
+    tracing::info!(
+        %namespace,
+        "service ingress controller started from CLI"
+    );
+    reconciler.run().await;
+    Ok(())
 }
 
 #[cfg(test)]

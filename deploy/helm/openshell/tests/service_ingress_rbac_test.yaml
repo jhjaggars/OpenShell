@@ -3,7 +3,11 @@
 
 suite: Service ingress RBAC
 templates:
-  - templates/service-ingress-rbac.yaml
+  - templates/service-ingress-serviceaccount.yaml
+  - templates/service-ingress-role.yaml
+  - templates/service-ingress-rolebinding.yaml
+  - templates/service-ingress-publisher-role.yaml
+  - templates/service-ingress-publisher-rolebinding.yaml
 release:
   name: openshell
   namespace: my-namespace
@@ -14,20 +18,47 @@ tests:
       - hasDocuments:
           count: 0
 
-  - it: grants service ingress object access when reconciliation is enabled
+  - it: creates a dedicated controller service account when enabled
+    template: templates/service-ingress-serviceaccount.yaml
     set:
       serviceIngress.enabled: true
     asserts:
       - hasDocuments:
-          count: 2
+          count: 1
+      - equal:
+          path: kind
+          value: ServiceAccount
       - equal:
           path: metadata.name
           value: openshell-service-ingress
-        documentIndex: 0
       - equal:
           path: metadata.namespace
           value: my-namespace
-        documentIndex: 0
+
+  - it: grants the controller feed reads and ingress object access
+    template: templates/service-ingress-role.yaml
+    set:
+      serviceIngress.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: kind
+          value: Role
+      - equal:
+          path: metadata.namespace
+          value: my-namespace
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - configmaps
+            verbs:
+              - get
+              - list
+              - watch
       - contains:
           path: rules
           content:
@@ -40,7 +71,6 @@ tests:
               - list
               - create
               - delete
-        documentIndex: 0
       - contains:
           path: rules
           content:
@@ -52,7 +82,6 @@ tests:
               - create
               - patch
               - update
-        documentIndex: 0
       - contains:
           path: rules
           content:
@@ -65,7 +94,6 @@ tests:
               - list
               - create
               - delete
-        documentIndex: 0
       - contains:
           path: rules
           content:
@@ -78,70 +106,98 @@ tests:
               - list
               - create
               - delete
-        documentIndex: 0
 
-  - it: binds the role to the gateway service account in the release namespace
+  - it: binds the controller role to the controller service account only
+    template: templates/service-ingress-rolebinding.yaml
     set:
       serviceIngress.enabled: true
     asserts:
+      - hasDocuments:
+          count: 1
       - equal:
           path: kind
           value: RoleBinding
-        documentIndex: 1
-      - equal:
-          path: metadata.namespace
-          value: my-namespace
-        documentIndex: 1
-      - equal:
-          path: roleRef.kind
-          value: Role
-        documentIndex: 1
       - equal:
           path: roleRef.name
           value: openshell-service-ingress
-        documentIndex: 1
       - equal:
-          path: subjects[0].kind
-          value: ServiceAccount
-        documentIndex: 1
+          path: subjects[0].name
+          value: openshell-service-ingress
       - equal:
           path: subjects[0].namespace
           value: my-namespace
-        documentIndex: 1
+
+  - it: scopes feed publishing to the feed object for the gateway identity
+    template: templates/service-ingress-publisher-role.yaml
+    set:
+      serviceIngress.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: kind
+          value: Role
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - configmaps
+            resourceNames:
+              - openshell-service-ingress-hostnames
+            verbs:
+              - get
+              - update
+              - patch
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - configmaps
+            verbs:
+              - create
+
+  - it: binds the publisher role to the gateway service account
+    template: templates/service-ingress-publisher-rolebinding.yaml
+    set:
+      serviceIngress.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: kind
+          value: RoleBinding
+      - equal:
+          path: roleRef.name
+          value: openshell-service-ingress-publisher
+      - equal:
+          path: subjects[0].name
+          value: openshell
+
+  - it: grants service ingress access in managed workspace mode
+    template: templates/service-ingress-role.yaml
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      serviceIngress.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.namespace
+          value: my-namespace
 
   - it: honors raw TOML gateway config enablement
+    template: templates/service-ingress-serviceaccount.yaml
     set:
       gatewayConfig:
         openshell.drivers.kubernetes.service_ingress:
           enabled: true
     asserts:
       - hasDocuments:
-          count: 2
-
-  - it: grants service ingress access in managed workspace mode
-    set:
-      server.drivers.kubernetes.workspaceMode: managed
-      serviceIngress.enabled: true
-    asserts:
-      - hasDocuments:
-          count: 2
-      - equal:
-          path: metadata.namespace
-          value: my-namespace
-        documentIndex: 0
-      - contains:
-          path: rules
-          content:
-            apiGroups:
-              - route.openshift.io
-            resources:
-              - routes
-            verbs:
-              - get
-              - list
-              - create
-              - delete
-        documentIndex: 0
+          count: 1
 
   - it: renders no documents when chart RBAC ownership is disabled
     set:

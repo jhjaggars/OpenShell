@@ -669,8 +669,18 @@ serviceIngress:
   # -- Parent Gateway name for the `httproute` kind. Defaults to the
   # chart-managed Gateway.
   httpRouteParentGateway: ""
-  # -- Seconds between reconciliation passes.
+  # -- Replica count for the dedicated service-ingress controller
+  # Deployment. One replica is sufficient: the controller is never in the
+  # data path and its reconciliation converges; extra replicas are safe but
+  # redundant.
+  replicas: 1
+  # -- Seconds between gateway publications of the hostname feed the
+  # controller consumes.
+  publishIntervalSeconds: 5
+  # -- Seconds between controller reconciliation passes.
   pollIntervalSeconds: 15
+  # -- Resources for the service-ingress controller container.
+  resources: {}
 
 
 # Built-in TLS PKI bootstrap via a pre-install/pre-upgrade hook Job.

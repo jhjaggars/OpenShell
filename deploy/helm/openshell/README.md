@@ -585,7 +585,10 @@ discovery endpoint or its TLS CA.
 | serviceIngress.httpRouteParentGateway | string | `""` | Parent Gateway name for the `httproute` kind. Defaults to the chart-managed Gateway. |
 | serviceIngress.ingressClass | string | `""` | Ingress class for the `ingress` kind. |
 | serviceIngress.kind | string | `"route"` | Object kind to reconcile: `route` (OpenShift Route with TLS passthrough), `httproute` (Gateway API HTTPRoute), or `ingress` (networking.k8s.io Ingress; requires a controller with SSL passthrough, annotated for nginx). |
-| serviceIngress.pollIntervalSeconds | int | `15` | Seconds between reconciliation passes. |
+| serviceIngress.pollIntervalSeconds | int | `15` | Seconds between controller reconciliation passes. |
+| serviceIngress.publishIntervalSeconds | int | `5` | Seconds between gateway publications of the hostname feed the controller consumes. |
+| serviceIngress.replicas | int | `1` | Replica count for the dedicated service-ingress controller Deployment. One replica is sufficient: the controller is never in the data path and its reconciliation converges; extra replicas are safe but redundant. |
+| serviceIngress.resources | object | `{}` | Resources for the service-ingress controller container. |
 | supervisor.image.digest | string | `""` | Supervisor image digest. When set, this takes precedence over tag. |
 | supervisor.image.pullPolicy | string | `nil` | Supervisor image pull policy. Empty uses global.image.pullPolicy. Prefer always, if_not_present, or never; the chart also accepts legacy Kubernetes spellings Always, IfNotPresent, and Never. |
 | supervisor.image.registry | string | `""` | Supervisor image registry. Empty uses global.image.registry. |

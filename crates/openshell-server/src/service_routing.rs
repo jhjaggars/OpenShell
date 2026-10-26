@@ -3,6 +3,7 @@
 
 //! Browser-facing HTTP routing for sandbox service endpoints.
 
+use crate::persistence::PersistenceResult;
 use axum::{
     body::Body,
     response::{IntoResponse, Response as AxumResponse},
@@ -1337,10 +1338,12 @@ fn http_activity_for_method(method: &Method) -> ActivityId {
 }
 
 /// Gateway-side source of every exposed-service hostname this gateway
-/// currently serves. Lists persisted [`ServiceEndpoint`] records across all
-/// workspaces and mints each hostname exactly as `service expose` returned
-/// it, so consumers never duplicate the hash or composite-hostname format.
-/// Drives the Kubernetes service-ingress reconciler.
+/// currently serves.
+///
+/// Lists persisted [`ServiceEndpoint`] records across all workspaces and
+/// mints each hostname exactly as `service expose` returned it, so consumers
+/// never duplicate the hash or composite-hostname format. Drives the
+/// Kubernetes service-ingress feed publisher.
 #[derive(Clone)]
 pub struct ServiceEndpointHostnames {
     store: Arc<Store>,
@@ -1357,23 +1360,16 @@ impl ServiceEndpointHostnames {
     }
 
     /// Every live exposed-service hostname, sorted and deduplicated.
-    /// Persistence failures return an empty set: the caller treats this as
-    /// "nothing to reconcile" and retries on the next poll.
-    pub async fn hostnames(&self) -> Vec<String> {
-        let endpoints = match self
+    ///
+    /// Persistence failures surface as `Err` so callers can distinguish a
+    /// transient store outage from a genuinely empty set: the feed publisher
+    /// must skip publishing on error, because an empty feed instructs the
+    /// controller to delete every ingress object.
+    pub async fn hostnames(&self) -> PersistenceResult<Vec<String>> {
+        let endpoints = self
             .store
             .collect_messages::<ServiceEndpoint>(ObjectListQuery::AllWorkspaces)
-            .await
-        {
-            Ok(endpoints) => endpoints,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "service ingress: failed to list service endpoints"
-                );
-                return Vec::new();
-            }
-        };
+            .await?;
         let mut hostnames = Vec::new();
         for endpoint in endpoints {
             if !endpoint.domain
@@ -1398,7 +1394,7 @@ impl ServiceEndpointHostnames {
         }
         hostnames.sort_unstable();
         hostnames.dedup();
-        hostnames
+        Ok(hostnames)
     }
 }
 
@@ -2379,7 +2375,7 @@ mod tests {
         let provider = ServiceEndpointHostnames::new(store.into(), cfg);
 
         assert_eq!(
-            provider.hostnames().await,
+            provider.hostnames().await.unwrap(),
             vec!["enh47uqyj7bpyttz.dev.openshell.localhost".to_string()]
         );
     }

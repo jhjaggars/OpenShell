@@ -118,8 +118,16 @@ x509-parser = "0.16"
 arc-swap = "1"
 notify = "8"
 
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes", optional = true }
+
 [features]
 default = ["telemetry"]
+## Compile in the `service-ingress` controller subcommand (requires the
+## Kubernetes compute driver). Enabled by openshell-gateway's
+## compute-driver-kubernetes feature so the gateway image can run the
+## chart-deployed controller.
+service-ingress-controller = ["dep:openshell-driver-kubernetes"]
 ## Compile in anonymous telemetry emission (forwards to openshell-core/telemetry).
 ## On by default; build with `--no-default-features` for a telemetry-free gateway
 ## that contains no telemetry endpoint, HTTP client, or emission code.

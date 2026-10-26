@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- /* Binds the service-ingress Role to the controller ServiceAccount. */ -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- $serviceIngressTOML := get $gatewayConfig "openshell.drivers.kubernetes.service_ingress" | default dict -}}
+{{- $serviceIngressEnabled := false -}}
+{{- if hasKey $serviceIngressTOML "enabled" -}}
+{{- $serviceIngressEnabled = get $serviceIngressTOML "enabled" -}}
+{{- else if hasKey .Values "serviceIngress" -}}
+{{- $serviceIngressEnabled = .Values.serviceIngress.enabled -}}
+{{- end -}}
+{{- if and (include "openshell.rbacCreate" .) $serviceIngressEnabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "openshell.fullname" . }}-service-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "openshell.fullname" . }}-service-ingress
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "openshell.fullname" . }}-service-ingress
+    namespace: {{ .Release.Namespace }}
+{{- end }}

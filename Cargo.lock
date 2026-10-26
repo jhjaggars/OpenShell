@@ -4707,6 +4707,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "hyper-util",
+ "kube",
  "miette",
  "nix 0.29.0",
  "openshell-core",
@@ -5021,6 +5022,7 @@ dependencies = [
  "openshell-core",
  "openshell-crypto",
  "openshell-driver-db-credstore",
+ "openshell-driver-kubernetes",
  "openshell-driver-kubernetes-secrets",
  "openshell-driver-vault",
  "openshell-extension-core",

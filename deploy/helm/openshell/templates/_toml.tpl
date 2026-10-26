@@ -158,6 +158,8 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
   "target_service_port" .Values.service.port
   "ingress_class" ($serviceIngress.ingressClass | default "")
   "http_route_parent_gateway" $parentGateway
+  "publish_config_map_name" (printf "%s-service-ingress-hostnames" (include "openshell.fullname" .))
+  "publish_interval_secs" ($serviceIngress.publishIntervalSeconds | default 5)
   "poll_interval_secs" ($serviceIngress.pollIntervalSeconds | default 15)
 ) -}}
 {{- end -}}

@@ -399,23 +399,34 @@ Gateway; the Helm chart's `httproute` spelling is accepted as an alias), or
 service TLS itself, so the controller must support SSL passthrough — the
 nginx passthrough annotation is set automatically).
 
-The reconciler runs inside the gateway: it polls the gateway's persisted
-service endpoints every `poll_interval_secs` (default 15) and ensures one
-object of the configured kind exists per exposed hostname, targeting the
-gateway Service named by `target_service_name` in
-`target_service_namespace` on `target_service_port`. Objects carry the
-`openshell.ai/managed-by: openshell` and `openshell.ai/service-ingress: true`
-labels plus the `openshell.ai/service-hostname` annotation; objects whose
-hostname is no longer exposed are deleted, and so are objects of other kinds
-left behind by a previous `kind` configuration. The gateway ServiceAccount
-needs create, get, list, and delete permission on every supported kind in
-the gateway's namespace.
+Service ingress is split across two components sharing this one
+configuration table. Inside the gateway, a feed publisher polls the
+gateway's persisted service endpoints every `publish_interval_secs`
+(default 5) and writes the resulting hostname set into the `ConfigMap`
+named by `publish_config_map_name`; a persistence outage skips the
+publication rather than publishing an empty set. The dedicated controller
+(the Helm chart's `service-ingress` Deployment, running the gateway image's
+`service-ingress` subcommand with the same configuration file) reads that
+feed every `poll_interval_secs` (default 15) and ensures one object of the
+configured kind exists per exposed hostname, targeting the gateway Service
+named by `target_service_name` in `target_service_namespace` on
+`target_service_port`. A missing or unreadable feed skips the pass — an
+existing feed with an empty list is authoritative and deletes everything.
 
-The Helm chart exposes this as `serviceIngress.enabled`, wiring the release's
-own Service, namespace, and port automatically. Because every replica of a
-highly available gateway computes the same desired set, concurrent
-reconcilers converge: creates tolerate `AlreadyExists` and deletes are
-idempotent.
+Objects carry the `openshell.ai/managed-by: openshell` and
+`openshell.ai/service-ingress: true` labels plus the
+`openshell.ai/service-hostname` annotation; objects whose hostname is no
+longer exposed are deleted, and so are objects of other kinds left behind
+by a previous `kind` configuration. The controller's ServiceAccount needs
+create, get, list, and delete permission on every supported kind plus feed
+reads in the gateway's namespace; the gateway's ServiceAccount only needs
+permission to publish the feed `ConfigMap`.
+
+The Helm chart exposes this as `serviceIngress.enabled`, wiring the
+release's own Service, namespace, port, and feed `ConfigMap` automatically.
+One controller replica is sufficient — it is never in the data path and
+its reconciliation converges — and every replica of a highly available
+gateway publishes identical feed content.
 
 A single gateway that owns its whole service domain does not need this:
 one wildcard host rule (an `OpenShift` Route with

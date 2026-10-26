@@ -453,7 +453,7 @@ pub enum ServiceIngressKind {
     #[default]
     Route,
     /// Gateway API `HTTPRoute` attached to the configured parent `Gateway`.
-    /// The canonical wire value is `http_route` (snake_case, matching every
+    /// The canonical wire value is `http_route` (`snake_case`, matching every
     /// other config key); the Helm chart surfaces `httproute` (matching the
     /// Kubernetes kind) and passes it through verbatim, so that spelling is
     /// accepted as an alias.
@@ -469,7 +469,7 @@ pub enum ServiceIngressKind {
 /// When enabled, the gateway periodically lists its exposed service
 /// hostnames and ensures one ingress object of the configured kind exists
 /// per hostname, targeting the gateway's own Service. Objects are labeled as
-/// OpenShell-managed and orphaned entries are removed.
+/// `OpenShell`-managed and orphaned entries are removed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServiceIngressConfig {
@@ -495,6 +495,12 @@ pub struct ServiceIngressConfig {
     /// `target_service_namespace`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_route_parent_namespace: Option<String>,
+    /// Name of the `ConfigMap` the gateway publishes the exposed-hostname
+    /// feed into. The dedicated service-ingress controller watches the same
+    /// object. Required when enabled.
+    pub publish_config_map_name: String,
+    /// Seconds between gateway feed publications.
+    pub publish_interval_secs: u64,
     /// Seconds between reconciliation passes.
     pub poll_interval_secs: u64,
 }
@@ -510,6 +516,8 @@ impl Default for ServiceIngressConfig {
             ingress_class: None,
             http_route_parent_gateway: None,
             http_route_parent_namespace: None,
+            publish_config_map_name: String::new(),
+            publish_interval_secs: 5,
             poll_interval_secs: 15,
         }
     }
@@ -634,6 +642,12 @@ impl KubernetesComputeConfig {
         }
         if ingress.poll_interval_secs == 0 {
             return Err("service_ingress requires a non-zero poll_interval_secs".into());
+        }
+        if ingress.publish_config_map_name.is_empty() {
+            return Err("service_ingress requires publish_config_map_name".into());
+        }
+        if ingress.publish_interval_secs == 0 {
+            return Err("service_ingress requires a non-zero publish_interval_secs".into());
         }
         Ok(())
     }

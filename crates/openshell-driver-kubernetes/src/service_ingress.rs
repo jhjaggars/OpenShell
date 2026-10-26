@@ -13,9 +13,9 @@
 //! This module implements that reconciliation. A source of exposed hostnames
 //! (implemented by the gateway, which owns endpoint persistence and hostname
 //! minting) is polled on an interval, and one object of the configured kind —
-//! an OpenShift `Route` with TLS passthrough, a Gateway API `HTTPRoute`, or a
+//! an `OpenShift` `Route` with TLS passthrough, a Gateway API `HTTPRoute`, or a
 //! `networking.k8s.io` `Ingress` — is ensured per hostname, targeting the
-//! gateway's own Service. Objects carry OpenShell ownership labels; managed
+//! gateway's own Service. Objects carry `OpenShell` ownership labels; managed
 //! objects whose hostname is no longer exposed are removed.
 //!
 //! The gateway terminates TLS for service traffic itself, so every kind is
@@ -34,7 +34,7 @@ use kube::{Api, Client, ResourceExt};
 use openshell_core::driver_utils::{LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{ServiceIngressConfig, ServiceIngressKind};
 
@@ -43,19 +43,256 @@ pub const LABEL_SERVICE_INGRESS: &str = "openshell.ai/service-ingress";
 /// Annotation recording the exposed-service hostname an object routes.
 pub const ANNOTATION_SERVICE_HOSTNAME: &str = "openshell.ai/service-hostname";
 
-/// Future returned by [`ExposedServiceSource::exposed_service_hostnames`].
-pub type ExposedHostnamesFuture = Pin<Box<dyn Future<Output = Vec<String>> + Send + 'static>>;
+/// `ConfigMap` data key holding the newline-separated exposed-hostname feed.
+pub const FEED_DATA_KEY: &str = "hostnames";
+/// Annotation versioning the feed format. The publisher writes it; the
+/// controller refuses feeds with an unknown format instead of guessing.
+pub const FEED_FORMAT_ANNOTATION: &str = "openshell.ai/service-ingress-format";
+/// Current feed format version.
+pub const FEED_FORMAT_VERSION: &str = "1";
 
-/// Source of exposed-service hostnames. Implemented by the gateway, which
-/// mints hostnames and persists service endpoints; the reconciler only
-/// consumes the final hostnames, so it never duplicates hash or
-/// composite-hostname logic.
+/// Future returned by [`ExposedServiceSource::exposed_service_hostnames`].
+pub type ExposedHostnamesFuture =
+    Pin<Box<dyn Future<Output = Option<Vec<String>>> + Send + 'static>>;
+
+/// Source of exposed-service hostnames consumed by the reconciler.
+///
+/// The gateway mints hostnames and persists service endpoints; the
+/// reconciler only consumes the final hostnames, so it never duplicates hash
+/// or composite-hostname logic. [`Option::None`] means the feed is not
+/// available right now (for example the published `ConfigMap` does not exist
+/// yet): the reconciler skips the pass entirely rather than treating it as an
+/// empty set, so a missing feed never deletes ingress objects.
 pub trait ExposedServiceSource: Send + Sync {
-    /// Return every exposed-service hostname this gateway currently serves.
+    /// Return every exposed-service hostname this gateway currently serves,
+    /// or `None` when the feed is unavailable.
     fn exposed_service_hostnames(&self) -> ExposedHostnamesFuture;
 }
 
-/// OpenShift `Route` (route.openshift.io/v1) with TLS passthrough.
+/// Encodes a hostname set into `ConfigMap` feed data: sorted, deduplicated,
+/// newline-separated, with no trailing newline.
+#[must_use]
+pub fn encode_feed_hostnames(hostnames: &[String]) -> String {
+    let mut sorted = hostnames.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sorted.join("\n")
+}
+
+/// Decodes `ConfigMap` feed data into a hostname set. Returns `None` when an
+/// entry is malformed (empty or containing whitespace), refusing to act on a
+/// partially-readable feed.
+#[must_use]
+pub fn decode_feed_hostnames(data: &str) -> Option<Vec<String>> {
+    if data.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut hostnames = Vec::new();
+    for entry in data.split('\n') {
+        // The feed is machine-written and exact: any empty entry or embedded
+        // whitespace — including leading/trailing — marks the feed malformed.
+        if entry.is_empty() || entry.chars().any(char::is_whitespace) {
+            return None;
+        }
+        hostnames.push(entry.to_string());
+    }
+    hostnames.sort_unstable();
+    hostnames.dedup();
+    Some(hostnames)
+}
+
+/// Watches the `ConfigMap` the gateway publishes the exposed-hostname feed
+/// into.
+///
+/// Reading the feed on every reconciler pass keeps the controller
+/// stateless: a missing or unreadable `ConfigMap` yields `None` (skip the
+/// pass, keep existing objects), while an existing `ConfigMap` with an empty
+/// list yields `Some(vec![])` (delete everything) — absence of the feed is
+/// never confused with an empty feed.
+#[derive(Clone)]
+pub struct ConfigMapFeedSource {
+    client: Client,
+    namespace: String,
+    name: String,
+}
+
+impl ConfigMapFeedSource {
+    pub fn new(client: Client, namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            client,
+            namespace: namespace.into(),
+            name: name.into(),
+        }
+    }
+
+    /// Build a source with its own Kubernetes client using the ambient
+    /// in-cluster (or kubeconfig) identity.
+    pub async fn from_ambient(
+        namespace: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Result<Self, kube::Error> {
+        Ok(Self::new(Client::try_default().await?, namespace, name))
+    }
+}
+
+impl ExposedServiceSource for ConfigMapFeedSource {
+    fn exposed_service_hostnames(&self) -> ExposedHostnamesFuture {
+        let client = self.client.clone();
+        let namespace = self.namespace.clone();
+        let name = self.name.clone();
+        Box::pin(async move {
+            let api: Api<k8s_openapi::api::core::v1::ConfigMap> =
+                Api::namespaced(client, &namespace);
+            let feed = match api.get(&name).await {
+                Ok(feed) => feed,
+                Err(kube::Error::Api(error)) if error.code == 404 => {
+                    debug!(%name, "service ingress feed ConfigMap does not exist yet");
+                    return None;
+                }
+                Err(error) => {
+                    warn!(%name, error = %error, "failed to read service ingress feed");
+                    return None;
+                }
+            };
+            let format = feed
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(FEED_FORMAT_ANNOTATION))
+                .map(String::as_str)
+                .unwrap_or_default();
+            if format != FEED_FORMAT_VERSION {
+                warn!(%name, format, "service ingress feed has an unsupported format");
+                return None;
+            }
+            let data = feed.data.as_ref().and_then(|data| data.get(FEED_DATA_KEY));
+            match data.map(String::as_str).map(decode_feed_hostnames) {
+                Some(Some(hostnames)) => Some(hostnames),
+                Some(None) => {
+                    warn!(%name, "service ingress feed data is malformed");
+                    None
+                }
+                None => {
+                    warn!(%name, "service ingress feed ConfigMap lacks hostname data");
+                    None
+                }
+            }
+        })
+    }
+}
+
+/// Publishes the exposed-hostname set into a `ConfigMap`. Runs inside the
+/// gateway: every poll reads the persisted endpoints and ensures the feed
+/// reflects them.
+///
+/// The write is skipped when the content is unchanged, and a
+/// missing `ConfigMap` is (re-)created, so a deleted feed heals within one
+/// publish interval. Multiple gateway replicas write identical content;
+/// conflicting updates converge through retry.
+pub struct ServiceIngressFeedPublisher {
+    client: Client,
+    namespace: String,
+    name: String,
+    last_published: Option<String>,
+}
+
+impl ServiceIngressFeedPublisher {
+    pub fn new(client: Client, namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            client,
+            namespace: namespace.into(),
+            name: name.into(),
+            last_published: None,
+        }
+    }
+
+    /// Ensure the feed `ConfigMap` reflects `hostnames`. A store read that
+    /// fails upstream must be reported by the caller by skipping this call
+    /// entirely: publishing an empty set on a transient persistence failure
+    /// would instruct the controller to delete every ingress object.
+    pub async fn publish(&mut self, hostnames: &[String]) -> Result<(), kube::Error> {
+        let content = encode_feed_hostnames(hostnames);
+        if self.last_published.as_deref() == Some(content.as_str()) {
+            return Ok(());
+        }
+        let api: Api<k8s_openapi::api::core::v1::ConfigMap> =
+            Api::namespaced(self.client.clone(), &self.namespace);
+        let mut last_error = None;
+        for _ in 0..3 {
+            match api.get(&self.name).await {
+                Ok(mut feed) => {
+                    let unchanged = feed
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get(FEED_DATA_KEY))
+                        .is_some_and(|value| value == &content);
+                    if unchanged {
+                        break;
+                    }
+                    feed.data
+                        .get_or_insert_with(BTreeMap::new)
+                        .insert(FEED_DATA_KEY.to_string(), content.clone());
+                    feed.metadata
+                        .annotations
+                        .get_or_insert_with(BTreeMap::new)
+                        .insert(
+                            FEED_FORMAT_ANNOTATION.to_string(),
+                            FEED_FORMAT_VERSION.to_string(),
+                        );
+                    match api.replace(&self.name, &PostParams::default(), &feed).await {
+                        Ok(_) => break,
+                        Err(kube::Error::Api(error)) if error.code == 409 => {
+                            last_error = Some(kube::Error::Api(error));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(kube::Error::Api(error)) if error.code == 404 => {
+                    let feed = k8s_openapi::api::core::v1::ConfigMap {
+                        metadata: ObjectMeta {
+                            name: Some(self.name.clone()),
+                            namespace: Some(self.namespace.clone()),
+                            labels: Some(BTreeMap::from([
+                                (
+                                    LABEL_MANAGED_BY.to_string(),
+                                    LABEL_MANAGED_BY_VALUE.to_string(),
+                                ),
+                                (LABEL_SERVICE_INGRESS.to_string(), "true".to_string()),
+                            ])),
+                            annotations: Some(BTreeMap::from([(
+                                FEED_FORMAT_ANNOTATION.to_string(),
+                                FEED_FORMAT_VERSION.to_string(),
+                            )])),
+                            ..Default::default()
+                        },
+                        data: Some(BTreeMap::from([(
+                            FEED_DATA_KEY.to_string(),
+                            content.clone(),
+                        )])),
+                        ..Default::default()
+                    };
+                    match api.create(&PostParams::default(), &feed).await {
+                        Ok(_) => break,
+                        Err(kube::Error::Api(error)) if error.code == 409 => {
+                            last_error = Some(kube::Error::Api(error));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(error) = last_error {
+            // Content conflicts with other replicas should converge; surface
+            // persistent conflicts so the caller logs and retries next poll.
+            return Err(error);
+        }
+        self.last_published = Some(content);
+        Ok(())
+    }
+}
+
+/// `OpenShift` `Route` (route.openshift.io/v1) with TLS passthrough.
 #[derive(Clone, Debug, Serialize, Deserialize, kube::CustomResource)]
 #[kube(
     group = "route.openshift.io",
@@ -210,7 +447,10 @@ impl ServiceIngressReconciler {
     }
 
     async fn reconcile_once(&self) -> Result<(), kube::Error> {
-        let mut desired = self.source.exposed_service_hostnames().await;
+        let Some(mut desired) = self.source.exposed_service_hostnames().await else {
+            debug!("service ingress feed unavailable; skipping reconciliation pass");
+            return Ok(());
+        };
         desired.sort_unstable();
         desired.dedup();
         match self.config.kind {
@@ -279,8 +519,8 @@ impl ServiceIngressReconciler {
     where
         T: kube::Resource<DynamicType = (), Scope = kube::core::NamespaceResourceScope>
             + Clone
-            + std::fmt::Debug,
-        for<'de> T: Deserialize<'de>,
+            + std::fmt::Debug
+            + for<'de> Deserialize<'de>,
         F: Fn(&T) -> bool + Sync,
     {
         let api: Api<T> =
@@ -307,7 +547,7 @@ impl ServiceIngressReconciler {
                 .unwrap_or_else(|| name.clone());
             match api.delete(&name, &DeleteParams::default()).await {
                 Ok(_) => {
-                    info!(hostname, %name, "deleted service ingress object left by a previous kind")
+                    info!(hostname, %name, "deleted service ingress object left by a previous kind");
                 }
                 Err(kube::Error::Api(error)) if error.code == 404 => {}
                 Err(error) => return Err(error),
@@ -473,8 +713,7 @@ fn managed_selector() -> String {
 /// List objects this controller owns, keyed by their annotated hostname.
 async fn managed_objects<T>(api: &Api<T>) -> Result<Vec<(String, String)>, kube::Error>
 where
-    T: kube::Resource<DynamicType = ()> + Clone + std::fmt::Debug,
-    for<'de> T: Deserialize<'de>,
+    T: kube::Resource<DynamicType = ()> + Clone + std::fmt::Debug + for<'de> Deserialize<'de>,
 {
     let items = api
         .list(&ListParams::default().labels(&managed_selector()))
@@ -496,7 +735,7 @@ where
         .collect())
 }
 
-/// Whether an OpenShift `Route` created for service ingress routes to the
+/// Whether an `OpenShift` `Route` created for service ingress routes to the
 /// named gateway Service.
 fn openshift_route_targets_service(route: &OpenshiftRoute, service: &str) -> bool {
     route.spec.to.name == service
@@ -523,18 +762,14 @@ fn ingress_targets_service(
         return false;
     };
     rules.iter().any(|rule| {
-        rule.http
-            .as_ref()
-            .map(|http| {
-                http.paths.iter().any(|path| {
-                    path.backend
-                        .service
-                        .as_ref()
-                        .map(|backend| backend.name == service)
-                        .unwrap_or(false)
-                })
+        rule.http.as_ref().is_some_and(|http| {
+            http.paths.iter().any(|path| {
+                path.backend
+                    .service
+                    .as_ref()
+                    .is_some_and(|backend| backend.name == service)
             })
-            .unwrap_or(false)
+        })
     })
 }
 
@@ -582,8 +817,7 @@ fn plan_reconciliation(desired: &[String], existing: &[(String, String)]) -> Rec
 
 async fn delete_orphans<T>(api: &Api<T>, names: &[String]) -> Result<(), kube::Error>
 where
-    T: kube::Resource<DynamicType = ()> + Clone + std::fmt::Debug,
-    for<'de> T: Deserialize<'de>,
+    T: kube::Resource<DynamicType = ()> + Clone + std::fmt::Debug + for<'de> Deserialize<'de>,
 {
     for name in names {
         match api.delete(name, &DeleteParams::default()).await {
@@ -595,9 +829,11 @@ where
     Ok(())
 }
 
-/// Deterministic object name for an exposed-service hostname. The hostname is
-/// sanitized to DNS-1123 and long hostnames are truncated with a hash suffix
-/// so distinct hostnames never collapse onto the same object.
+/// Deterministic object name for an exposed-service hostname.
+///
+/// The hostname is sanitized to DNS-1123 and long hostnames are truncated
+/// with a hash suffix so distinct hostnames never collapse onto the same
+/// object.
 #[must_use]
 pub fn ingress_object_name(hostname: &str) -> String {
     const PREFIX: &str = "openshell-svc-";
@@ -779,5 +1015,38 @@ mod tests {
             ..Default::default()
         };
         assert!(!ingress_targets_service(&empty, "my-gateway"));
+    }
+
+    #[test]
+    fn feed_round_trips_sorted_deduplicated_hostnames() {
+        let encoded = encode_feed_hostnames(&[
+            "b.example.com".to_string(),
+            "a.example.com".to_string(),
+            "a.example.com".to_string(),
+        ]);
+        assert_eq!(encoded, "a.example.com\nb.example.com");
+        assert_eq!(
+            decode_feed_hostnames(&encoded),
+            Some(vec![
+                "a.example.com".to_string(),
+                "b.example.com".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn empty_feed_encodes_to_empty_data_and_decodes_to_empty_set() {
+        assert_eq!(encode_feed_hostnames(&[]), "");
+        assert_eq!(decode_feed_hostnames(""), Some(Vec::new()));
+    }
+
+    #[test]
+    fn malformed_feed_data_is_rejected() {
+        assert_eq!(
+            decode_feed_hostnames("a.example.com\n\nb.example.com"),
+            None
+        );
+        assert_eq!(decode_feed_hostnames("has space.example.com"), None);
+        assert_eq!(decode_feed_hostnames("a.example.com\n b.example.com"), None);
     }
 }
