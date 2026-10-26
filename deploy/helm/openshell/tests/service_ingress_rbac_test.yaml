@@ -118,6 +118,31 @@ tests:
       - hasDocuments:
           count: 2
 
+  - it: grants service ingress access in managed workspace mode
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      serviceIngress.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 2
+      - equal:
+          path: metadata.namespace
+          value: my-namespace
+        documentIndex: 0
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - route.openshift.io
+            resources:
+              - routes
+            verbs:
+              - get
+              - list
+              - create
+              - delete
+        documentIndex: 0
+
   - it: renders no documents when chart RBAC ownership is disabled
     set:
       serviceIngress.enabled: true
