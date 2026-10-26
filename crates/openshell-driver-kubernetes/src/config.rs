@@ -453,6 +453,11 @@ pub enum ServiceIngressKind {
     #[default]
     Route,
     /// Gateway API `HTTPRoute` attached to the configured parent `Gateway`.
+    /// The canonical wire value is `http_route` (snake_case, matching every
+    /// other config key); the Helm chart surfaces `httproute` (matching the
+    /// Kubernetes kind) and passes it through verbatim, so that spelling is
+    /// accepted as an alias.
+    #[serde(alias = "httproute")]
     HttpRoute,
     /// `networking.k8s.io/v1` `Ingress`. Requires an ingress controller that
     /// supports SSL passthrough (the annotation is set for nginx).
@@ -1302,6 +1307,29 @@ mod tests {
             let input = format!("{field} = \"sometimes\"");
             assert!(toml::from_str::<KubernetesComputeConfig>(&input).is_err());
         }
+    }
+
+    #[test]
+    fn service_ingress_kind_accepts_chart_and_snake_case_spellings() {
+        for value in ["http_route", "httproute"] {
+            let input = format!(
+                "[service_ingress]\nenabled = true\nkind = \"{value}\"\n\
+                 target_service_name = \"gw\"\n\
+                 target_service_namespace = \"ns\"\n\
+                 target_service_port = 8080\n\
+                 http_route_parent_gateway = \"gw\"\n\
+                 poll_interval_secs = 5\n"
+            );
+            let config: KubernetesComputeConfig = toml::from_str(&input)
+                .unwrap_or_else(|error| panic!("{value} should parse: {error}"));
+            assert_eq!(config.service_ingress.kind, ServiceIngressKind::HttpRoute);
+        }
+    }
+
+    #[test]
+    fn service_ingress_kind_rejects_unknown_values() {
+        let input = "[service_ingress]\nenabled = true\nkind = \"routes\"";
+        assert!(toml::from_str::<KubernetesComputeConfig>(input).is_err());
     }
 
     #[test]
