@@ -654,7 +654,10 @@ networkPolicy:
 # when multiple gateways share one service base domain (exact-host routing);
 # a single gateway can instead use one wildcard host rule.
 serviceIngress:
-  # -- Reconcile ingress objects for exposed sandbox service hostnames.
+  # -- Reconcile ingress objects for exposed sandbox service hostnames,
+  # targeting this release's gateway Service. Needed when multiple gateways
+  # share one service base domain; a single gateway can use one wildcard host
+  # rule instead.
   enabled: false
   # -- Object kind to reconcile: `route` (OpenShift Route with TLS
   # passthrough), `httproute` (Gateway API HTTPRoute), or `ingress`

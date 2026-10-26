@@ -1,4 +1,6 @@
-{{- if include "openshell.rbacCreate" . }}
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 {{- /* RBAC for service ingress reconciliation.
        All reconciled objects (OpenShift Routes, Gateway API HTTPRoutes, and
        networking.k8s.io Ingresses) are created in the gateway's own
@@ -6,6 +8,7 @@
        permissions are required for this feature. The rules cover every
        supported kind because the reconciled kind is selected by
        configuration. */ -}}
+{{- if include "openshell.rbacCreate" . }}
 {{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
 {{- $serviceIngressTOML := get $gatewayConfig "openshell.drivers.kubernetes.service_ingress" | default dict -}}
 {{- $serviceIngressEnabled := false -}}
@@ -15,9 +18,6 @@
 {{- $serviceIngressEnabled = .Values.serviceIngress.enabled -}}
 {{- end -}}
 {{- if $serviceIngressEnabled }}
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

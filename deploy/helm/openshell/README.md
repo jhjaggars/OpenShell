@@ -566,11 +566,6 @@ discovery endpoint or its TLS CA.
 | server.sandboxJwt.ttlSecs | int | `3600` | Token TTL in seconds. Defaults to 3600 (1h). |
 | server.sandboxNamespace | string | `""` | Namespace where sandbox pods are created. Defaults to the Helm release namespace (.Release.Namespace) when left empty. |
 | server.sandboxUid | string | `""` | UID for sandbox pods (`sandbox_uid`). Empty (default) = use the OpenShift SCC namespace annotation if present, otherwise the driver default. Must be an integer between 1 and 4294967294. |
-| serviceIngress.enabled | bool | `false` | Reconcile ingress objects for exposed sandbox service hostnames, targeting this release's gateway Service. Needed when multiple gateways share one service base domain; a single gateway can use one wildcard host rule instead. |
-| serviceIngress.kind | string | `"route"` | Object kind to reconcile: `route` (OpenShift Route with TLS passthrough), `httproute` (Gateway API HTTPRoute), or `ingress` (networking.k8s.io Ingress; requires a controller with SSL passthrough, annotated for nginx). |
-| serviceIngress.ingressClass | string | `""` | Ingress class for the `ingress` kind. |
-| serviceIngress.httpRouteParentGateway | string | `""` | Parent Gateway name for the `httproute` kind. Defaults to the chart-managed Gateway. |
-| serviceIngress.pollIntervalSeconds | int | `15` | Seconds between reconciliation passes. |
 | server.serviceRoutingGatewayName | string | `""` | Optional routing name that disambiguates exposed-service hostnames when multiple gateways share one service base domain behind a single ingress and wildcard certificate. Must be unique among those gateways. When set, exposed-service hostnames become opaque fixed-length hashed labels (for example enh47uqyj7bpyttz.apps.example.com) instead of the readable workspace--sandbox--service composite. Unset preserves the composite hostnames. |
 | server.telemetryEnabled | bool | `true` | Enable anonymous OpenShell telemetry from the gateway and the sandbox supervisors it launches. |
 | server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |
@@ -586,6 +581,11 @@ discovery endpoint or its TLS CA.
 | serviceAccount.annotations | object | `{}` | Annotations to add to the generated service account. |
 | serviceAccount.create | bool | `true` | Create a service account for the gateway. |
 | serviceAccount.name | string | `""` | Existing service account name to use when serviceAccount.create is false. |
+| serviceIngress.enabled | bool | `false` | Reconcile ingress objects for exposed sandbox service hostnames, targeting this release's gateway Service. Needed when multiple gateways share one service base domain; a single gateway can use one wildcard host rule instead. |
+| serviceIngress.httpRouteParentGateway | string | `""` | Parent Gateway name for the `httproute` kind. Defaults to the chart-managed Gateway. |
+| serviceIngress.ingressClass | string | `""` | Ingress class for the `ingress` kind. |
+| serviceIngress.kind | string | `"route"` | Object kind to reconcile: `route` (OpenShift Route with TLS passthrough), `httproute` (Gateway API HTTPRoute), or `ingress` (networking.k8s.io Ingress; requires a controller with SSL passthrough, annotated for nginx). |
+| serviceIngress.pollIntervalSeconds | int | `15` | Seconds between reconciliation passes. |
 | supervisor.image.digest | string | `""` | Supervisor image digest. When set, this takes precedence over tag. |
 | supervisor.image.pullPolicy | string | `nil` | Supervisor image pull policy. Empty uses global.image.pullPolicy. Prefer always, if_not_present, or never; the chart also accepts legacy Kubernetes spellings Always, IfNotPresent, and Never. |
 | supervisor.image.registry | string | `""` | Supervisor image registry. Empty uses global.image.registry. |
