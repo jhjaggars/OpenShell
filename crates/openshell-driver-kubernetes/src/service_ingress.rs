@@ -214,10 +214,106 @@ impl ServiceIngressReconciler {
         desired.sort_unstable();
         desired.dedup();
         match self.config.kind {
-            ServiceIngressKind::Route => self.reconcile_openshift_routes(&desired).await,
-            ServiceIngressKind::HttpRoute => self.reconcile_http_routes(&desired).await,
-            ServiceIngressKind::Ingress => self.reconcile_ingresses(&desired).await,
+            ServiceIngressKind::Route => self.reconcile_openshift_routes(&desired).await?,
+            ServiceIngressKind::HttpRoute => self.reconcile_http_routes(&desired).await?,
+            ServiceIngressKind::Ingress => self.reconcile_ingresses(&desired).await?,
         }
+        self.prune_other_kinds().await
+    }
+
+    /// Delete managed service-ingress objects of kinds other than the
+    /// configured one.
+    ///
+    /// Switching `kind` in the configuration orphans the objects of the
+    /// previous kind: the active reconciler only lists its own kind, so the
+    /// stale objects keep routing traffic (and, for `OpenShift` `Route`s,
+    /// keep DNS records alive) after the exposure is removed. Ownership
+    /// labels are kind-agnostic, so any other-kind object that still targets
+    /// this gateway's `Service` is removed regardless of whether its hostname
+    /// is still exposed — objects for removed hostnames must go too, since no
+    /// reconciler is watching their kind anymore.
+    ///
+    /// Kinds whose CRD is not installed (`OpenShift` `Route`s off `OpenShift`,
+    /// `HTTPRoute` without Gateway API) are treated as having nothing to
+    /// prune.
+    async fn prune_other_kinds(&self) -> Result<(), kube::Error> {
+        match self.config.kind {
+            ServiceIngressKind::Route => {
+                self.prune_stale_kind::<HTTPRoute, _>(&|object: &HTTPRoute| {
+                    http_route_targets_service(object, &self.config.target_service_name)
+                })
+                .await?;
+                self.prune_stale_kind::<k8s_openapi::api::networking::v1::Ingress, _>(&|object| {
+                    ingress_targets_service(object, &self.config.target_service_name)
+                })
+                .await
+            }
+            ServiceIngressKind::HttpRoute => {
+                self.prune_stale_kind::<OpenshiftRoute, _>(&|object: &OpenshiftRoute| {
+                    openshift_route_targets_service(object, &self.config.target_service_name)
+                })
+                .await?;
+                self.prune_stale_kind::<k8s_openapi::api::networking::v1::Ingress, _>(&|object| {
+                    ingress_targets_service(object, &self.config.target_service_name)
+                })
+                .await
+            }
+            ServiceIngressKind::Ingress => {
+                self.prune_stale_kind::<OpenshiftRoute, _>(&|object: &OpenshiftRoute| {
+                    openshift_route_targets_service(object, &self.config.target_service_name)
+                })
+                .await?;
+                self.prune_stale_kind::<HTTPRoute, _>(&|object: &HTTPRoute| {
+                    http_route_targets_service(object, &self.config.target_service_name)
+                })
+                .await
+            }
+        }
+    }
+
+    /// List managed objects of one kind and delete those the
+    /// `targets_this_gateway` predicate claims. Missing-CRD list failures
+    /// are ignored: the configured kind's availability is enforced by its
+    /// own reconcile pass.
+    async fn prune_stale_kind<T, F>(&self, targets_this_gateway: &F) -> Result<(), kube::Error>
+    where
+        T: kube::Resource<DynamicType = (), Scope = kube::core::NamespaceResourceScope>
+            + Clone
+            + std::fmt::Debug,
+        for<'de> T: Deserialize<'de>,
+        F: Fn(&T) -> bool + Sync,
+    {
+        let api: Api<T> =
+            Api::namespaced(self.client.clone(), &self.config.target_service_namespace);
+        let objects = match api
+            .list(&ListParams::default().labels(&managed_selector()))
+            .await
+        {
+            Ok(list) => list.items,
+            Err(kube::Error::Api(error)) if error.code == 404 => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        for object in objects {
+            if !targets_this_gateway(&object) {
+                continue;
+            }
+            let name = object.name_any();
+            let hostname = object
+                .meta()
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(ANNOTATION_SERVICE_HOSTNAME))
+                .cloned()
+                .unwrap_or_else(|| name.clone());
+            match api.delete(&name, &DeleteParams::default()).await {
+                Ok(_) => {
+                    info!(hostname, %name, "deleted service ingress object left by a previous kind")
+                }
+                Err(kube::Error::Api(error)) if error.code == 404 => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     async fn reconcile_openshift_routes(&self, desired: &[String]) -> Result<(), kube::Error> {
@@ -400,6 +496,48 @@ where
         .collect())
 }
 
+/// Whether an OpenShift `Route` created for service ingress routes to the
+/// named gateway Service.
+fn openshift_route_targets_service(route: &OpenshiftRoute, service: &str) -> bool {
+    route.spec.to.name == service
+}
+
+/// Whether a Gateway API `HTTPRoute` created for service ingress routes to
+/// the named gateway Service in any rule's backend refs.
+fn http_route_targets_service(route: &HTTPRoute, service: &str) -> bool {
+    route.spec.rules.iter().any(|rule| {
+        rule.backend_refs
+            .iter()
+            .any(|backend| backend.name == service)
+    })
+}
+
+/// Whether a `networking.k8s.io/v1` `Ingress` created for service ingress
+/// routes to the named gateway Service in any rule's backend.
+fn ingress_targets_service(
+    ingress: &k8s_openapi::api::networking::v1::Ingress,
+    service: &str,
+) -> bool {
+    let rules = ingress.spec.as_ref().and_then(|spec| spec.rules.as_ref());
+    let Some(rules) = rules else {
+        return false;
+    };
+    rules.iter().any(|rule| {
+        rule.http
+            .as_ref()
+            .map(|http| {
+                http.paths.iter().any(|path| {
+                    path.backend
+                        .service
+                        .as_ref()
+                        .map(|backend| backend.name == service)
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// Ownership labels and hostname annotation applied to every object this
 /// controller creates.
 fn apply_ownership(metadata: &mut ObjectMeta, hostname: &str) {
@@ -552,5 +690,94 @@ mod tests {
             managed_selector(),
             "openshell.ai/managed-by=openshell,openshell.ai/service-ingress=true"
         );
+    }
+
+    #[test]
+    fn openshift_route_target_detection_follows_backend_name() {
+        let mut route = OpenshiftRoute::new(
+            "obj",
+            OpenshiftRouteSpec {
+                host: "hash.example.com".to_string(),
+                to: RouteTargetReference {
+                    kind: "Service".to_string(),
+                    name: "other-gateway".to_string(),
+                    weight: None,
+                },
+                port: None,
+                tls: None,
+            },
+        );
+        assert!(!openshift_route_targets_service(&route, "my-gateway"));
+        route.spec.to.name = "my-gateway".to_string();
+        assert!(openshift_route_targets_service(&route, "my-gateway"));
+    }
+
+    #[test]
+    fn http_route_target_detection_scans_all_backend_refs() {
+        let make = |backends: &[&str]| {
+            HTTPRoute::new(
+                "obj",
+                HttpRouteSpec {
+                    parent_refs: vec![],
+                    hostnames: vec!["hash.example.com".to_string()],
+                    rules: vec![HttpRouteRule {
+                        backend_refs: backends
+                            .iter()
+                            .map(|name| HttpRouteBackendReference {
+                                group: String::new(),
+                                kind: "Service".to_string(),
+                                name: (*name).to_string(),
+                                port: 8080,
+                            })
+                            .collect(),
+                    }],
+                },
+            )
+        };
+        assert!(!http_route_targets_service(&make(&["other"]), "my-gateway"));
+        assert!(http_route_targets_service(
+            &make(&["other", "my-gateway"]),
+            "my-gateway"
+        ));
+    }
+
+    #[test]
+    fn ingress_target_detection_scans_all_rules_and_paths() {
+        use k8s_openapi::api::networking::v1 as networking;
+        let make = |service: &str| networking::Ingress {
+            metadata: ObjectMeta {
+                name: Some("obj".to_string()),
+                ..Default::default()
+            },
+            spec: Some(networking::IngressSpec {
+                rules: Some(vec![networking::IngressRule {
+                    host: Some("hash.example.com".to_string()),
+                    http: Some(networking::HTTPIngressRuleValue {
+                        paths: vec![networking::HTTPIngressPath {
+                            path: Some("/".to_string()),
+                            path_type: "Prefix".to_string(),
+                            backend: networking::IngressBackend {
+                                service: Some(networking::IngressServiceBackend {
+                                    name: service.to_string(),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            },
+                        }],
+                    }),
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!ingress_targets_service(&make("other"), "my-gateway"));
+        assert!(ingress_targets_service(&make("my-gateway"), "my-gateway"));
+        // No spec at all cannot target anything.
+        let empty = networking::Ingress {
+            metadata: ObjectMeta::default(),
+            spec: None,
+            ..Default::default()
+        };
+        assert!(!ingress_targets_service(&empty, "my-gateway"));
     }
 }
