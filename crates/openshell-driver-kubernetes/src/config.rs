@@ -141,6 +141,64 @@ impl KubernetesSandboxRuntimeConfig {
 }
 
 /// How workspaces map to Kubernetes namespaces.
+/// Runtime substrate the Kubernetes driver provisions sandboxes on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KubernetesRuntimeMode {
+    /// Provision sandboxes as `agents.x-k8s.io` Sandbox CRs reconciled into
+    /// pods by the upstream Agent Sandbox controller (default, production
+    /// path).
+    #[default]
+    Pod,
+    /// Provision sandboxes as `kubevirt.io/v1` `VirtualMachine` objects
+    /// reconciled by the `KubeVirt` controller (proof of concept).
+    #[serde(rename = "kubevirt", alias = "kube-virt")]
+    KubeVirt,
+}
+
+impl std::fmt::Display for KubernetesRuntimeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pod => f.write_str("pod"),
+            Self::KubeVirt => f.write_str("kubevirt"),
+        }
+    }
+}
+
+/// `KubeVirt` runtime mode settings (proof of concept).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubeVirtConfig {
+    /// containerDisk image providing the bootable guest filesystem. The image
+    /// must contain a Linux guest with the static `openshell-sandbox`
+    /// supervisor and an init that consumes the driver-rendered bootstrap
+    /// Secret (cloudInitNoCloud transport). Not an arbitrary sandbox OCI
+    /// image — see `e2e/kubevirt/` for the purpose-built image build.
+    pub guest_image: String,
+    /// Kubernetes `imagePullPolicy` for the guest containerDisk.
+    /// Empty string omits the field, using the Kubernetes default.
+    pub guest_image_pull_policy: String,
+    /// vCPU cores allocated to each guest.
+    pub cpu_cores: u32,
+    /// Guest memory request, e.g. `"1Gi"`.
+    pub memory: String,
+    /// Attach a per-sandbox PVC at `/sandbox` so the workspace survives
+    /// stop/start (mirrors the pod path's PVC-backed workspace).
+    pub workspace_pvc: bool,
+}
+
+impl Default for KubeVirtConfig {
+    fn default() -> Self {
+        Self {
+            guest_image: String::new(),
+            guest_image_pull_policy: String::new(),
+            cpu_cores: 1,
+            memory: "1Gi".to_string(),
+            workspace_pvc: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkspaceMode {
@@ -436,6 +494,12 @@ pub struct KubernetesComputeConfig {
     /// When empty and `sandbox_uid` is set, defaults to the resolved UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_gid: Option<u32>,
+    /// Runtime substrate the driver provisions sandboxes on. Defaults to
+    /// `pod` (Agent Sandbox CRs). `kubevirt` creates `KubeVirt`
+    /// `VirtualMachine` objects directly (proof of concept).
+    pub runtime: KubernetesRuntimeMode,
+    /// `KubeVirt` settings, used only when `runtime = "kubevirt"`.
+    pub kubevirt: KubeVirtConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -521,6 +585,8 @@ impl Default for KubernetesComputeConfig {
             provider_spiffe_workload_api_socket_path: String::new(),
             sandbox_uid: None,
             sandbox_gid: None,
+            runtime: KubernetesRuntimeMode::default(),
+            kubevirt: KubeVirtConfig::default(),
         }
     }
 }
@@ -619,6 +685,41 @@ impl KubernetesComputeConfig {
         validate_provider_spiffe_workload_api_socket_path_value(
             &self.provider_spiffe_workload_api_socket_path,
         )
+    }
+
+    /// Validate the `KubeVirt` runtime mode configuration (`PoC` constraints).
+    pub fn validate_kubevirt_config(&self) -> Result<(), String> {
+        if self.runtime != KubernetesRuntimeMode::KubeVirt {
+            return Ok(());
+        }
+        if self.kubevirt.guest_image.trim().is_empty() {
+            return Err(
+                "kubevirt runtime requires kubevirt.guest_image to be set to a bootable \
+                 containerDisk image"
+                    .to_string(),
+            );
+        }
+        if self.kubevirt.cpu_cores == 0 {
+            return Err("kubevirt.cpu_cores must be at least 1".to_string());
+        }
+        if self.kubevirt.memory.trim().is_empty() {
+            return Err("kubevirt.memory must be set (e.g. \"1Gi\")".to_string());
+        }
+        if self.workspace_mode != WorkspaceMode::Shared {
+            return Err(format!(
+                "kubevirt runtime (PoC) supports only the shared workspace mode; \
+                 configured mode is {}",
+                self.workspace_mode
+            ));
+        }
+        if self.grpc_endpoint.trim().is_empty() {
+            return Err(
+                "kubevirt runtime requires grpc_endpoint: the guest supervisor must be \
+                 able to reach the gateway"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     pub fn validate_proxy_uid(&self) -> Result<(), String> {

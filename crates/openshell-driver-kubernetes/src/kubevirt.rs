@@ -1,0 +1,722 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! `KubeVirt` runtime mode (proof of concept).
+//!
+//! When `[openshell.drivers.kubernetes] runtime = "kubevirt"` is configured,
+//! the driver provisions sandboxes as `kubevirt.io/v1` `VirtualMachine`
+//! objects instead of `agents.x-k8s.io` Sandbox CRs. The `KubeVirt` controller
+//! (VM -> VMI -> virt-launcher pod) plays the role the Agent Sandbox
+//! controller plays in the pod runtime.
+//!
+//! Resource model per sandbox:
+//! - one `VirtualMachine` carrying the standard `OpenShell` ownership labels
+//!   (the durable lifecycle handle; `runStrategy: Once` mirrors the pod
+//!   path's `restartPolicy: Never` — supervisor exit is terminal),
+//! - one bootstrap `Secret` referenced through a `cloudInitNoCloud` volume
+//!   (transport only — the guest init parses the ISO itself, no cloud-init
+//!   software required). It carries the supervisor environment plus the
+//!   gateway-minted sandbox JWT from `DriverSandboxSpec.sandbox_token`, the
+//!   same pre-minted-token model the libkrun VM driver uses,
+//! - one workspace `PersistentVolumeClaim` mounted by the guest init at
+//!   `/sandbox` (mirrors the pod path's PVC-backed workspace).
+//!
+//! What the `PoC` deliberately skips: GPU, managed/operator workspace modes,
+//! mTLS to the gateway, `NetworkPolicy` coverage for virt-launcher pods,
+//! live-migration/VMI-replacement semantics, and arbitrary OCI sandbox
+//! images as VM disks (the guest image is a purpose-built containerDisk).
+
+use std::collections::BTreeMap;
+
+use k8s_openapi::api::core::v1::{
+    PersistentVolumeClaim, PersistentVolumeClaimSpec, Secret, VolumeResourceRequirements,
+};
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::api::{Api, ApiResource, ListParams, ObjectList};
+use kube::core::DynamicObject;
+use kube::{Client, Error as KubeError};
+use openshell_core::driver_utils::{
+    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
+    LABEL_SANDBOX_WORKSPACE,
+};
+use openshell_core::proto::compute::v1::{
+    DriverCondition, DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus,
+};
+use openshell_core::sandbox_env;
+
+use crate::KubernetesDriverError;
+use crate::config::{KubernetesComputeConfig, KubernetesRuntimeMode, WorkspaceMode};
+use crate::driver::{sandbox_annotations, sandbox_labels};
+
+pub const KUBEVIRT_GROUP: &str = "kubevirt.io";
+pub const KUBEVIRT_VERSION: &str = "v1";
+const KUBEVIRT_VM_PLURAL: &str = "virtualmachines";
+const KUBEVIRT_RUN_STRATEGY: &str = "Once";
+
+/// Kernel and initramfs locations inside the purpose-built guest image
+/// (see `e2e/kubevirt/` for the image build).
+const KUBEVIRT_GUEST_KERNEL_PATH: &str = "/boot/vmlinuz-virt";
+const KUBEVIRT_GUEST_INITRD_PATH: &str = "/boot/initramfs-virt";
+const KUBEVIRT_KERNEL_ARGS: &str =
+    "console=ttyS0 root=/dev/vda rw rootfstype=ext4 modules=ext4 init=/opt/openshell/init";
+
+/// Condition reason set on `Ready=False` while the VM is booting. Matches the
+/// gateway's transient-reason vocabulary so the sandbox stays `Provisioning`
+/// rather than `Error`.
+const REASON_VM_NOT_READY: &str = "Starting";
+
+/// Namespaced API for `kubevirt.io/v1` `virtualmachines`.
+pub fn virtual_machine_api(client: &Client, namespace: &str) -> Api<DynamicObject> {
+    Api::namespaced_with(client.clone(), namespace, &virtual_machine_api_resource())
+}
+
+pub fn virtual_machine_api_resource() -> ApiResource {
+    ApiResource {
+        group: KUBEVIRT_GROUP.to_string(),
+        version: KUBEVIRT_VERSION.to_string(),
+        api_version: format!("{KUBEVIRT_GROUP}/{KUBEVIRT_VERSION}"),
+        kind: "VirtualMachine".to_string(),
+        plural: KUBEVIRT_VM_PLURAL.to_string(),
+    }
+}
+
+/// Check that the cluster serves `kubevirt.io/v1` virtualmachines.
+pub async fn kubevirt_available(client: &Client, namespace: &str) -> Result<(), String> {
+    let api = virtual_machine_api(client, namespace);
+    match api.list(&ListParams::default().limit(1)).await {
+        Ok(_) => Ok(()),
+        Err(KubeError::Api(err)) if err.code == 404 => Err(format!(
+            "kubevirt.io/{KUBEVIRT_VERSION} virtualmachines is not served by this cluster; \
+             install KubeVirt to use runtime = \"kubevirt\""
+        )),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// Everything the renderer needs for one sandbox.
+pub struct KubeVirtSandboxParams<'a> {
+    pub sandbox: &'a Sandbox,
+    pub config: &'a KubernetesComputeConfig,
+    pub namespace: &'a str,
+    /// `KubeVirt` resource name (`{workspace}--{name}` in shared mode).
+    pub kube_name: &'a str,
+}
+
+/// Render the bootstrap Secret consumed by the guest init through the
+/// `cloudInitNoCloud` volume. `user-data` is a shell-sourceable `KEY=VALUE`
+/// file; the guest init writes the token to a 0600 file and unsets it before
+/// exec'ing the supervisor.
+pub fn render_bootstrap_secret(params: &KubeVirtSandboxParams<'_>) -> Secret {
+    let sandbox = params.sandbox;
+    let spec = sandbox.spec.as_ref();
+    let mut lines = Vec::new();
+
+    let mut push = |key: &str, value: &str| {
+        lines.push(format!("{key}={}", shell_quote(value)));
+    };
+
+    push(sandbox_env::ENDPOINT, &params.config.grpc_endpoint);
+    push(sandbox_env::SANDBOX_ID, &sandbox.id);
+    push(sandbox_env::SANDBOX, &sandbox.name);
+    // The supervisor runs its own SSH server on this in-guest unix socket;
+    // providing the path is what enables the readiness-bearing supervisor
+    // session (same value as the libkrun VM driver uses).
+    push(
+        sandbox_env::SSH_SOCKET_PATH,
+        openshell_core::container_paths::SSH_SOCKET_PATH,
+    );
+    push(
+        sandbox_env::SANDBOX_TOKEN_FILE,
+        openshell_core::container_paths::VM_GUEST_SANDBOX_TOKEN_PATH,
+    );
+    // Pre-minted gateway JWT — same delivery model as the libkrun VM driver.
+    if let Some(token) = spec.and_then(|spec| {
+        let token = spec.sandbox_token.as_str();
+        (!token.is_empty()).then_some(token)
+    }) {
+        push(sandbox_env::SANDBOX_TOKEN, token);
+    }
+    let main_process =
+        sandbox_env::MainProcessConfig::encode_driver_spec_base64url(spec).unwrap_or_default();
+    push(sandbox_env::MAIN_PROCESS_SPEC, &main_process);
+    push(
+        sandbox_env::LOG_LEVEL,
+        &openshell_core::driver_utils::sandbox_log_level(sandbox, "info"),
+    );
+    push(
+        sandbox_env::TELEMETRY_ENABLED,
+        openshell_core::telemetry::enabled_env_value(),
+    );
+    // Runtime capabilities are driver-owned; this PoC provides no policy DNS
+    // or transparent TCP substrate inside the guest.
+    push(sandbox_env::NETWORK_RUNTIME_CAPABILITIES, "");
+    let user_env = spec
+        .map(|spec| spec.environment.clone())
+        .unwrap_or_default();
+    if !user_env.is_empty()
+        && let Ok(json) = serde_json::to_string(&user_env)
+    {
+        push(sandbox_env::USER_ENVIRONMENT, &json);
+    }
+
+    let user_data = lines.join("\n") + "\n";
+
+    Secret {
+        metadata: ObjectMeta {
+            name: Some(bootstrap_secret_name(params.kube_name)),
+            namespace: Some(params.namespace.to_string()),
+            labels: Some(sandbox_labels(sandbox, Some(&params.config.gateway_id))),
+            annotations: Some(sandbox_annotations(sandbox)),
+            ..Default::default()
+        },
+        string_data: Some(BTreeMap::from([("userData".to_string(), user_data)])),
+        type_: Some("Opaque".to_string()),
+        ..Default::default()
+    }
+}
+
+/// Render the workspace PVC. The guest init formats it on first boot (sentinel
+/// guarded, same pattern as the pod path's init-container seeding) and mounts
+/// it at `/sandbox`.
+pub fn render_workspace_pvc(params: &KubeVirtSandboxParams<'_>) -> PersistentVolumeClaim {
+    let storage_class = (!params.config.workspace_storage_class.is_empty())
+        .then(|| params.config.workspace_storage_class.clone());
+    PersistentVolumeClaim {
+        metadata: ObjectMeta {
+            name: Some(workspace_pvc_name(params.kube_name)),
+            namespace: Some(params.namespace.to_string()),
+            labels: Some(sandbox_labels(
+                params.sandbox,
+                Some(&params.config.gateway_id),
+            )),
+            annotations: Some(sandbox_annotations(params.sandbox)),
+            ..Default::default()
+        },
+        spec: Some(PersistentVolumeClaimSpec {
+            access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+            resources: Some(VolumeResourceRequirements {
+                requests: Some(BTreeMap::from([(
+                    "storage".to_string(),
+                    Quantity(params.config.workspace_default_storage_size.clone()),
+                )])),
+                ..Default::default()
+            }),
+            storage_class_name: storage_class,
+            ..Default::default()
+        }),
+        status: None,
+    }
+}
+
+/// Render the `VirtualMachine`.
+pub fn render_virtual_machine(params: &KubeVirtSandboxParams<'_>) -> DynamicObject {
+    let sandbox = params.sandbox;
+    let kubevirt = &params.config.kubevirt;
+    let mut labels = sandbox_labels(sandbox, Some(&params.config.gateway_id));
+    let annotations = sandbox_annotations(sandbox);
+
+    let mut container_disk = serde_json::json!({
+        "image": kubevirt.guest_image,
+    });
+    if !kubevirt.guest_image_pull_policy.is_empty() {
+        container_disk["imagePullPolicy"] = serde_json::json!(kubevirt.guest_image_pull_policy);
+    }
+
+    let disks = vec![
+        serde_json::json!({"name": "rootdisk", "disk": {"bus": "virtio"}}),
+        serde_json::json!({"name": "cloudinit", "disk": {"bus": "virtio"}}),
+    ];
+    let mut volumes = vec![
+        serde_json::json!({"name": "rootdisk", "containerDisk": container_disk}),
+        serde_json::json!({
+            "name": "cloudinit",
+            "cloudInitNoCloud": {
+                "secretRef": {"name": bootstrap_secret_name(params.kube_name)}
+            }
+        }),
+    ];
+    // The workspace PVC is a filesystem volume (the cluster's default
+    // storage class provisions filesystem PVCs), which KubeVirt shares
+    // with the guest via virtio-fs rather than as a block disk.
+    let mut filesystems = Vec::new();
+    if kubevirt.workspace_pvc {
+        filesystems.push(serde_json::json!({
+            "name": "workspace",
+            "virtiofs": {}
+        }));
+        volumes.push(serde_json::json!({
+            "name": "workspace",
+            "persistentVolumeClaim": {"claimName": workspace_pvc_name(params.kube_name)}
+        }));
+    }
+
+    // VMI inherits template labels; keeping the OpenShell ownership labels
+    // there makes VMI-scoped tooling (describe, events) correlate as well.
+    labels.insert(
+        KUBEVIRT_VM_LABEL.to_string(),
+        KUBEVIRT_VM_LABEL_VALUE.to_string(),
+    );
+
+    // Direct kernel boot: the guest image is purpose-built (see
+    // `e2e/kubevirt/`), so no bootloader is installed in the rootfs. The
+    // kernel and initramfs live next to the rootfs disk inside the same
+    // containerDisk image.
+    let mut kernel_boot_container = serde_json::json!({
+        "image": kubevirt.guest_image,
+        "kernelPath": KUBEVIRT_GUEST_KERNEL_PATH,
+        "initrdPath": KUBEVIRT_GUEST_INITRD_PATH,
+    });
+    if !kubevirt.guest_image_pull_policy.is_empty() {
+        kernel_boot_container["imagePullPolicy"] =
+            serde_json::json!(kubevirt.guest_image_pull_policy);
+    }
+
+    let data = serde_json::json!({
+        "spec": {
+            "runStrategy": KUBEVIRT_RUN_STRATEGY,
+            "template": {
+                "metadata": {"labels": labels},
+                "spec": {
+                    "domain": {
+                        "firmware": {
+                            "kernelBoot": {
+                                "container": kernel_boot_container,
+                                "kernelArgs": KUBEVIRT_KERNEL_ARGS
+                            }
+                        },
+                        "cpu": {"cores": kubevirt.cpu_cores},
+                        "resources": {"requests": {"memory": kubevirt.memory}},
+                        "devices": {
+                            "disks": disks,
+                            "filesystems": filesystems,
+                            "interfaces": [{"name": "default", "masquerade": {}}]
+                        }
+                    },
+                    "volumes": volumes,
+                    "networks": [{"name": "default", "pod": {}}]
+                }
+            }
+        }
+    });
+
+    let mut obj = DynamicObject::new(params.kube_name, &virtual_machine_api_resource());
+    obj.metadata = ObjectMeta {
+        name: Some(params.kube_name.to_string()),
+        namespace: Some(params.namespace.to_string()),
+        labels: Some(sandbox_labels(sandbox, Some(&params.config.gateway_id))),
+        annotations: Some(annotations),
+        ..Default::default()
+    };
+    obj.data = data;
+    obj
+}
+
+/// Label set on the VM template so the VMI (and virt-launcher pod) carry the
+/// `OpenShell` ownership markers.
+const KUBEVIRT_VM_LABEL: &str = "kubevirt.io/domain";
+const KUBEVIRT_VM_LABEL_VALUE: &str = "openshell";
+
+pub fn bootstrap_secret_name(kube_name: &str) -> String {
+    format!("{kube_name}-bootstrap")
+}
+
+pub fn workspace_pvc_name(kube_name: &str) -> String {
+    format!("{kube_name}-workspace")
+}
+
+/// Map a `VirtualMachine` object to a driver sandbox snapshot.
+///
+/// Backend observations only: the gateway still composes public `Ready` from
+/// the supervisor relay session, exactly as with Sandbox CRs.
+pub fn sandbox_from_vm_object(
+    namespace: &str,
+    obj: DynamicObject,
+) -> Result<(String, Sandbox), String> {
+    let kube_name = obj.metadata.name.clone().unwrap_or_default();
+
+    if !is_openshell_managed(&obj) {
+        return Err(format!("object {kube_name} not managed by openshell"));
+    }
+    let Some(id) = annotation_or_label(&obj, LABEL_SANDBOX_ID) else {
+        return Err(format!("object {kube_name} missing sandbox id"));
+    };
+    let Some(name) = annotation_or_label(&obj, LABEL_SANDBOX_NAME) else {
+        return Err(format!("object {kube_name} missing sandbox name"));
+    };
+    let Some(workspace) = annotation_or_label(&obj, LABEL_SANDBOX_WORKSPACE) else {
+        return Err(format!("object {kube_name} missing sandbox workspace"));
+    };
+
+    let namespace = obj
+        .metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| namespace.to_string());
+    let status = vm_status_from_object(&obj, &name);
+
+    Ok((
+        kube_name,
+        Sandbox {
+            id,
+            name,
+            namespace,
+            spec: None,
+            status,
+            workspace,
+        },
+    ))
+}
+
+/// Translate VM status into driver conditions:
+/// - `status.ready == true` (VMI Running and guest agent reported up) becomes
+///   a backend `Ready=True` observation. Without a connected supervisor
+///   session the gateway still reports `Provisioning`
+///   ("`SupervisorNotConnected`") — the central readiness invariant.
+/// - `runStrategy: Halted` becomes `Suspended=True` (public `Stopped`).
+/// - a deletion timestamp becomes `deleting`.
+fn vm_status_from_object(obj: &DynamicObject, sandbox_name: &str) -> Option<SandboxStatus> {
+    let status = obj.data.get("status")?;
+    let status_obj = status.as_object()?;
+
+    let ready = status_obj
+        .get("ready")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    // Only an explicit `runStrategy: Halted` maps to `Suspended`. A fresh VM
+    // (or one whose `Once` VMI exited) also reports `printableStatus:
+    // Stopped`; treating that as Suspended would flip a provisioning sandbox
+    // to public `Stopped`.
+    let halted = obj
+        .data
+        .get("spec")
+        .and_then(|spec| spec.get("runStrategy"))
+        .and_then(serde_json::Value::as_str)
+        == Some("Halted");
+    let stopped = halted;
+
+    let printable = status_obj
+        .get("printableStatus")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+
+    let mut conditions = Vec::new();
+    conditions.push(DriverCondition {
+        r#type: "Ready".to_string(),
+        status: if ready { "True" } else { "False" }.to_string(),
+        reason: if ready {
+            "VMReady".to_string()
+        } else {
+            REASON_VM_NOT_READY.to_string()
+        },
+        message: if ready {
+            "VirtualMachineInstance is running".to_string()
+        } else {
+            format!("VirtualMachine status: {printable}")
+        },
+        transition_time: None,
+    });
+    if stopped {
+        conditions.push(DriverCondition {
+            r#type: "Suspended".to_string(),
+            status: "True".to_string(),
+            reason: "VMHalted".to_string(),
+            message: "VirtualMachine runStrategy is Halted".to_string(),
+            transition_time: None,
+        });
+    }
+
+    Some(SandboxStatus {
+        name: sandbox_name.to_string(),
+        // The VMI is created with the same name as the VM.
+        instance_id: obj.metadata.name.clone().unwrap_or_default(),
+        agent_fd: String::new(),
+        sandbox_fd: String::new(),
+        conditions,
+        deleting: obj.metadata.deletion_timestamp.is_some(),
+        ..Default::default()
+    })
+}
+
+fn is_openshell_managed(obj: &DynamicObject) -> bool {
+    obj.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(LABEL_MANAGED_BY))
+        .or_else(|| {
+            obj.metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(LABEL_MANAGED_BY))
+        })
+        .map(String::as_str)
+        == Some(LABEL_MANAGED_BY_VALUE)
+}
+
+fn annotation_or_label(obj: &DynamicObject, key: &str) -> Option<String> {
+    obj.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(key))
+        .or_else(|| obj.metadata.labels.as_ref().and_then(|l| l.get(key)))
+        .cloned()
+}
+
+/// Single-quote a value for the shell-sourceable user-data file.
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._-/:+=@".contains(c))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// True when the driver is configured for the `KubeVirt` runtime.
+pub fn is_kubevirt_mode(config: &KubernetesComputeConfig) -> bool {
+    config.runtime == KubernetesRuntimeMode::KubeVirt
+}
+
+/// Shared-mode namespace the VM resources render into.
+pub fn kubevirt_namespace(config: &KubernetesComputeConfig) -> Result<String, String> {
+    if config.workspace_mode != WorkspaceMode::Shared {
+        return Err(format!(
+            "kubevirt runtime (PoC) supports only the shared workspace mode; configured mode is {}",
+            config.workspace_mode
+        ));
+    }
+    Ok(config.namespace.clone())
+}
+
+/// List driver-owned VMs by label selector.
+pub async fn list_virtual_machines(
+    client: &Client,
+    config: &KubernetesComputeConfig,
+    selector: &str,
+) -> Result<ObjectList<DynamicObject>, KubernetesDriverError> {
+    let namespace = kubevirt_namespace(config).map_err(KubernetesDriverError::Message)?;
+    let api = virtual_machine_api(client, &namespace);
+    api.list(&ListParams::default().labels(selector))
+        .await
+        .map_err(KubernetesDriverError::from_kube)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::KubernetesComputeConfig;
+    use openshell_core::proto::compute::v1::DriverSandbox as Sandbox;
+
+    fn sandbox() -> Sandbox {
+        Sandbox {
+            id: "sbx-id".to_string(),
+            name: "demo".to_string(),
+            namespace: "kvpoc-sandboxes".to_string(),
+            spec: None,
+            status: None,
+            workspace: "default".to_string(),
+        }
+    }
+
+    fn config() -> KubernetesComputeConfig {
+        KubernetesComputeConfig {
+            runtime: KubernetesRuntimeMode::KubeVirt,
+            namespace: "kvpoc-sandboxes".to_string(),
+            gateway_id: "kvpoc".to_string(),
+            grpc_endpoint: "http://172.18.0.1:18085/".to_string(),
+            kubevirt: crate::KubeVirtConfig {
+                guest_image: "kvpoc/openshell-sandbox-vm:dev".to_string(),
+                guest_image_pull_policy: "IfNotPresent".to_string(),
+                cpu_cores: 2,
+                memory: "2Gi".to_string(),
+                workspace_pvc: true,
+            },
+            ..KubernetesComputeConfig::default()
+        }
+    }
+
+    fn params<'a>(
+        sandbox: &'a Sandbox,
+        config: &'a KubernetesComputeConfig,
+    ) -> KubeVirtSandboxParams<'a> {
+        KubeVirtSandboxParams {
+            sandbox,
+            config,
+            namespace: "kvpoc-sandboxes",
+            kube_name: "default--demo",
+        }
+    }
+
+    #[test]
+    fn bootstrap_secret_carries_supervisor_environment() {
+        let mut sbx = sandbox();
+        sbx.spec = Some(openshell_core::proto::compute::v1::DriverSandboxSpec {
+            sandbox_token: "jwt-value".to_string(),
+            ..Default::default()
+        });
+        let cfg = config();
+        let secret = render_bootstrap_secret(&params(&sbx, &cfg));
+
+        let data = secret
+            .string_data
+            .expect("string data")
+            .remove("userData")
+            .expect("userData key uses KubeVirt cloudInitNoCloud convention");
+        assert!(data.contains("OPENSHELL_ENDPOINT=http"));
+        assert!(data.contains("OPENSHELL_SANDBOX_ID=sbx-id"));
+        assert!(data.contains("OPENSHELL_SANDBOX=demo"));
+        assert!(data.contains("OPENSHELL_SANDBOX_TOKEN=jwt-value"));
+        assert!(data.contains("OPENSHELL_SANDBOX_TOKEN_FILE=/opt/openshell/auth/sandbox.jwt"));
+        // The main-process spec envelope must survive shell quoting.
+        assert!(data.contains("OPENSHELL_MAIN_PROCESS_SPEC=base64url:"));
+        let labels = secret.metadata.labels.expect("labels");
+        assert_eq!(
+            labels.get(LABEL_SANDBOX_ID).map(String::as_str),
+            Some("sbx-id")
+        );
+        assert_eq!(
+            secret.metadata.name.as_deref(),
+            Some("default--demo-bootstrap")
+        );
+    }
+
+    #[test]
+    fn virtual_machine_renders_kubevirt_contract() {
+        let cfg = config();
+        let vm = render_virtual_machine(&params(&sandbox(), &cfg));
+
+        assert_eq!(vm.metadata.name.as_deref(), Some("default--demo"));
+        assert_eq!(vm.metadata.namespace.as_deref(), Some("kvpoc-sandboxes"));
+        let labels = vm.metadata.labels.expect("labels");
+        assert_eq!(
+            labels.get(LABEL_MANAGED_BY).map(String::as_str),
+            Some("openshell")
+        );
+
+        assert_eq!(vm.data["spec"]["runStrategy"], "Once");
+
+        let domain = &vm.data["spec"]["template"]["spec"]["domain"];
+        assert_eq!(domain["cpu"]["cores"], 2);
+        assert_eq!(domain["resources"]["requests"]["memory"], "2Gi");
+        // Direct kernel boot from the purpose-built image.
+        assert_eq!(
+            domain["firmware"]["kernelBoot"]["container"]["image"],
+            "kvpoc/openshell-sandbox-vm:dev"
+        );
+        assert_eq!(
+            domain["firmware"]["kernelBoot"]["container"]["kernelPath"],
+            "/boot/vmlinuz-virt"
+        );
+        let kernel_args = domain["firmware"]["kernelBoot"]["kernelArgs"]
+            .as_str()
+            .expect("kernel args");
+        assert!(kernel_args.contains("root=/dev/vda"));
+        assert!(kernel_args.contains("init=/opt/openshell/init"));
+
+        let volumes = vm.data["spec"]["template"]["spec"]["volumes"]
+            .as_array()
+            .unwrap();
+        let names: Vec<&str> = volumes
+            .iter()
+            .map(|v| v["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["rootdisk", "cloudinit", "workspace"]);
+        assert_eq!(
+            volumes[1]["cloudInitNoCloud"]["secretRef"]["name"],
+            "default--demo-bootstrap"
+        );
+        assert_eq!(
+            volumes[2]["persistentVolumeClaim"]["claimName"],
+            "default--demo-workspace"
+        );
+
+        let filesystems = vm.data["spec"]["template"]["spec"]["domain"]["devices"]["filesystems"]
+            .as_array()
+            .unwrap();
+        assert_eq!(filesystems.len(), 1);
+        assert_eq!(filesystems[0]["name"], "workspace");
+    }
+
+    #[test]
+    fn virtual_machine_omits_workspace_without_pvc() {
+        let mut cfg = config();
+        cfg.kubevirt.workspace_pvc = false;
+        let vm = render_virtual_machine(&params(&sandbox(), &cfg));
+        let volumes = vm.data["spec"]["template"]["spec"]["volumes"]
+            .as_array()
+            .unwrap();
+        assert_eq!(volumes.len(), 2);
+        assert_eq!(
+            vm.data["spec"]["template"]["spec"]["domain"]["devices"]["filesystems"]
+                .as_array()
+                .map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn vm_status_maps_conditions() {
+        let cfg = config();
+        let vm = render_virtual_machine(&params(&sandbox(), &cfg));
+        let mut with_status = vm.clone();
+        with_status.data["status"] = serde_json::json!({"ready": true});
+        let (_, sbx) =
+            sandbox_from_vm_object("kvpoc-sandboxes", with_status).expect("managed vm converts");
+        let status = sbx.status.expect("status");
+        let ready = status
+            .conditions
+            .iter()
+            .find(|c| c.r#type == "Ready")
+            .expect("ready condition");
+        assert_eq!(ready.status, "True");
+
+        // A halted VM reports Suspended.
+        let mut halted = vm;
+        halted.data["spec"]["runStrategy"] = serde_json::json!("Halted");
+        halted.data["status"] = serde_json::json!({"ready": false});
+        let (_, sbx) = sandbox_from_vm_object("kvpoc-sandboxes", halted).expect("managed vm");
+        let status = sbx.status.expect("status");
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.r#type == "Suspended" && c.status == "True")
+        );
+
+        // A freshly created VM (runStrategy Once, not ready) must NOT report
+        // Suspended even though printableStatus is Stopped.
+        let mut fresh = render_virtual_machine(&params(&sandbox(), &config()));
+        fresh.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Stopped"});
+        let (_, sbx) = sandbox_from_vm_object("kvpoc-sandboxes", fresh).expect("managed vm");
+        let status = sbx.status.expect("status");
+        assert!(!status.conditions.iter().any(|c| c.r#type == "Suspended"));
+    }
+
+    #[test]
+    fn unmanaged_vm_is_rejected() {
+        let cfg = config();
+        let mut vm = render_virtual_machine(&params(&sandbox(), &cfg));
+        vm.metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .remove(LABEL_MANAGED_BY);
+        assert!(sandbox_from_vm_object("kvpoc-sandboxes", vm).is_err());
+    }
+
+    #[test]
+    fn kubevirt_namespace_rejects_non_shared_modes() {
+        let mut cfg = config();
+        cfg.workspace_mode = WorkspaceMode::Managed;
+        assert!(kubevirt_namespace(&cfg).is_err());
+        assert!(kubevirt_namespace(&config()).is_ok());
+    }
+
+    #[test]
+    fn shell_quote_keeps_values_lossless() {
+        assert_eq!(shell_quote("simple-value.1"), "simple-value.1");
+        assert_eq!(shell_quote("has space"), "'has space'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+}

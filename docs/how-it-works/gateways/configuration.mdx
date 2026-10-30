@@ -1197,6 +1197,37 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # (hot-reloaded on change, e.g. via ConfigMap volume mount).
 # operator_namespace_file      = "/etc/openshell/workspace-namespaces.json"
 
+# Runtime substrate for sandboxes (proof of concept). "pod" (default)
+# provisions `agents.x-k8s.io` Sandbox CRs reconciled into pods by the
+# upstream Agent Sandbox controller. "kubevirt" provisions `kubevirt.io/v1`
+# VirtualMachine objects directly — the KubeVirt controller replaces the
+# Agent Sandbox controller, and each sandbox boots a purpose-built guest
+# image with the `openshell-sandbox` supervisor as guest PID 1. The kubevirt
+# runtime currently supports only `workspace_mode = "shared"` and requires
+# `grpc_endpoint` to be reachable from guest VMs. See `e2e/kubevirt/README.md`
+# for the PoC workflow, guest-image build, and known gaps.
+# runtime                      = "kubevirt"
+
+# Settings used only when runtime = "kubevirt".
+# guest_image is the containerDisk providing the bootable guest filesystem
+# (Alpine + supervisor + kernel, built by `e2e/kubevirt/build-guest-image.sh`);
+# it is NOT an arbitrary sandbox OCI image. cpu_cores and memory size the
+# guest. workspace_pvc attaches a per-sandbox PVC at /sandbox (virtio-fs),
+# surviving stop/start. proxy_pod spawns a per-sandbox proxy pod — a
+# standalone network supervisor whose policy-enforced proxy is the sandbox's
+# egress path (mirroring the proxy-pod supervisor topology planned for the
+# pod runtime; a shared multi-tenant proxy is the follow-on). The guest's
+# supervisor then runs process-only and the VM's egress is fenced by a
+# NetworkPolicy to the proxy pod, cluster DNS, and the gateway. proxy_pod
+# requires an IP-literal grpc_endpoint host.
+# [openshell.drivers.kubernetes.kubevirt]
+# guest_image              = "kvpoc/openshell-sandbox-vm:dev"
+# guest_image_pull_policy  = "IfNotPresent"
+# cpu_cores                = 1
+# memory                   = "1Gi"
+# workspace_pvc            = true
+# proxy_pod                = true
+
 [openshell.drivers.kubernetes.managed_ssh_ingress]
 enabled = true
 gateway_namespace = "openshell"

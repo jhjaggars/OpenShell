@@ -31,8 +31,8 @@ use k8s_openapi::api::authentication::v1::{
     TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
 };
 use k8s_openapi::api::core::v1::{
-    ConfigMap, Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod,
-    Secret, Service, ServiceAccount, Volume, VolumeMount,
+    ConfigMap, Event as KubeEventObj, Namespace, Node, PersistentVolumeClaim,
+    PersistentVolumeClaimVolumeSource, Pod, Secret, Service, ServiceAccount, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
@@ -486,7 +486,7 @@ pub enum KubernetesDriverError {
 }
 
 impl KubernetesDriverError {
-    fn from_kube(err: KubeError) -> Self {
+    pub(crate) fn from_kube(err: KubeError) -> Self {
         match err {
             KubeError::Api(api) if api.code == 409 && api.reason == "AlreadyExists" => {
                 Self::AlreadyExists
@@ -1303,7 +1303,9 @@ impl KubernetesComputeDriver {
             shared_supervisor,
         };
 
-        if driver.workspace_mode() == WorkspaceMode::Shared {
+        if driver.workspace_mode() == WorkspaceMode::Shared
+            && !crate::kubevirt::is_kubevirt_mode(&driver.config)
+        {
             driver.backfill_gateway_id_labels().await?;
         }
 
@@ -2232,10 +2234,24 @@ impl KubernetesComputeDriver {
                 "sandbox external resource identity or attachment inventory changed",
             ));
         }
+        if crate::kubevirt::is_kubevirt_mode(&self.config) {
+            let namespace = crate::kubevirt::kubevirt_namespace(&self.config)
+                .map_err(tonic::Status::failed_precondition)?;
+            crate::kubevirt::kubevirt_available(&self.client, &namespace)
+                .await
+                .map_err(|err| {
+                    tonic::Status::failed_precondition(format!(
+                        "kubevirt runtime selected but unusable: {err}"
+                    ))
+                })?;
+        }
         Ok(())
     }
 
     pub async fn get_sandbox(&self, sandbox_id: &str) -> Result<Option<Sandbox>, String> {
+        if crate::kubevirt::is_kubevirt_mode(&self.config) {
+            return self.get_kubevirt_sandbox(sandbox_id).await;
+        }
         info!(
             sandbox_id = %sandbox_id,
             workspace_mode = %self.config.workspace_mode,
@@ -2291,6 +2307,25 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn list_sandboxes(&self) -> Result<Vec<Sandbox>, String> {
+        if crate::kubevirt::is_kubevirt_mode(&self.config) {
+            let namespace = crate::kubevirt::kubevirt_namespace(&self.config)?;
+            let list = crate::kubevirt::list_virtual_machines(
+                &self.client,
+                &self.config,
+                &self.openshell_sandbox_selector(),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+            return Ok(list
+                .items
+                .into_iter()
+                .filter_map(|obj| {
+                    crate::kubevirt::sandbox_from_vm_object(&namespace, obj)
+                        .map(|(_, sandbox)| sandbox)
+                        .ok()
+                })
+                .collect());
+        }
         info!(
             workspace_mode = %self.config.workspace_mode,
             "Listing sandboxes from Kubernetes"
@@ -2399,6 +2434,11 @@ impl KubernetesComputeDriver {
         validate_gpu_request(gpu_requirements).map_err(|status| {
             KubernetesDriverError::InvalidArgument(status.message().to_string())
         })?;
+
+        if crate::kubevirt::is_kubevirt_mode(&self.config) {
+            let runtime_identity = self.create_kubevirt_sandbox(sandbox).await?;
+            return Ok(runtime_identity);
+        }
 
         // Validate sandbox name against Kubernetes naming requirements
         validate_kubernetes_dns1123_label(&sandbox.name, "sandbox name")
@@ -3919,6 +3959,488 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
+    /// `KubeVirt` runtime mode: create the bootstrap Secret, workspace PVC,
+    /// proxy-pod companions and `VirtualMachine` for one sandbox. Returns the
+    /// VM's UID as the opaque runtime identity (stable across stop/start).
+    async fn create_kubevirt_sandbox(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<String, KubernetesDriverError> {
+        let namespace = crate::kubevirt::kubevirt_namespace(&self.config)
+            .map_err(KubernetesDriverError::Precondition)?;
+        crate::kubevirt::kubevirt_available(&self.client, &namespace)
+            .await
+            .map_err(KubernetesDriverError::Precondition)?;
+
+        let kube_name = self
+            .config
+            .kube_resource_name(&sandbox.workspace, &sandbox.name);
+        let params = crate::kubevirt::KubeVirtSandboxParams {
+            sandbox,
+            config: &self.config,
+            namespace: &namespace,
+            kube_name: &kube_name,
+        };
+
+        info!(
+            sandbox_id = %sandbox.id,
+            sandbox_name = %sandbox.name,
+            namespace = %namespace,
+            guest_image = %self.config.kubevirt.guest_image,
+            "Creating KubeVirt VirtualMachine sandbox"
+        );
+
+        let vm_api = crate::kubevirt::virtual_machine_api(&self.client, &namespace);
+        // The VM is the owning resource: if it already exists this sandbox
+        // already exists. Companion Secret/PVC are replaced when orphaned
+        // (e.g. after an out-of-band `kubectl delete vm`), so a retried
+        // create converges instead of colliding with stale labelled state.
+        match tokio::time::timeout(KUBE_API_TIMEOUT, vm_api.get(&kube_name)).await {
+            Ok(Ok(_)) => return Err(KubernetesDriverError::AlreadyExists),
+            Ok(Err(KubeError::Api(err))) if err.code == 404 => {}
+            Ok(Err(err)) => return Err(KubernetesDriverError::from_kube(err)),
+            Err(_elapsed) => {
+                return Err(KubernetesDriverError::Message(format!(
+                    "timed out after {}s checking for existing VirtualMachine",
+                    KUBE_API_TIMEOUT.as_secs()
+                )));
+            }
+        }
+
+        // Bootstrap Secret first: the VM references it and the KubeVirt
+        // controller waits for referenced volumes to exist.
+        let secret = crate::kubevirt::render_bootstrap_secret(&params);
+        let secret_api: Api<Secret> = Api::namespaced(self.client.clone(), &namespace);
+        let _ = secret_api
+            .delete(
+                &crate::kubevirt::bootstrap_secret_name(&kube_name),
+                &DeleteParams::default(),
+            )
+            .await;
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            secret_api.create(&PostParams::default(), &secret),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(KubeError::Api(err))) if err.code == 409 => {
+                return Err(KubernetesDriverError::AlreadyExists);
+            }
+            Ok(Err(err)) => return Err(KubernetesDriverError::from_kube(err)),
+            Err(_elapsed) => {
+                return Err(KubernetesDriverError::Message(format!(
+                    "timed out after {}s creating bootstrap Secret",
+                    KUBE_API_TIMEOUT.as_secs()
+                )));
+            }
+        }
+
+        if self.config.kubevirt.workspace_pvc {
+            let pvc = crate::kubevirt::render_workspace_pvc(&params);
+            let pvc_api: Api<PersistentVolumeClaim> =
+                Api::namespaced(self.client.clone(), &namespace);
+            let _ = pvc_api
+                .delete(
+                    &crate::kubevirt::workspace_pvc_name(&kube_name),
+                    &DeleteParams::default(),
+                )
+                .await;
+            match tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                pvc_api.create(&PostParams::default(), &pvc),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(KubeError::Api(err))) if err.code == 409 => {
+                    return Err(KubernetesDriverError::AlreadyExists);
+                }
+                Ok(Err(err)) => return Err(KubernetesDriverError::from_kube(err)),
+                Err(_elapsed) => {
+                    return Err(KubernetesDriverError::Message(format!(
+                        "timed out after {}s creating workspace PVC",
+                        KUBE_API_TIMEOUT.as_secs()
+                    )));
+                }
+            }
+        }
+
+        let vm = crate::kubevirt::render_virtual_machine(&params);
+        let created = match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            vm_api.create(&PostParams::default(), &vm),
+        )
+        .await
+        {
+            Ok(Ok(result)) => {
+                info!(
+                    sandbox_id = %sandbox.id,
+                    sandbox_name = %sandbox.name,
+                    "KubeVirt VirtualMachine created successfully"
+                );
+                Ok(result)
+            }
+            Ok(Err(KubeError::Api(err))) if err.code == 409 => {
+                Err(KubernetesDriverError::AlreadyExists)
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    error = %err,
+                    "Failed to create KubeVirt VirtualMachine"
+                );
+                Err(KubernetesDriverError::from_kube(err))
+            }
+            Err(_elapsed) => Err(KubernetesDriverError::Message(format!(
+                "timed out after {}s creating VirtualMachine",
+                KUBE_API_TIMEOUT.as_secs()
+            ))),
+        };
+
+        let vm = match created {
+            Ok(vm) => vm,
+            Err(error) => {
+                // The VM is the owning resource: if it could not be created,
+                // roll back the companion Secret and PVC so a retried create
+                // does not collide with orphaned state.
+                let secret_api: Api<Secret> = Api::namespaced(self.client.clone(), &namespace);
+                let _ = secret_api
+                    .delete(
+                        &crate::kubevirt::bootstrap_secret_name(&kube_name),
+                        &DeleteParams::default(),
+                    )
+                    .await;
+                if self.config.kubevirt.workspace_pvc {
+                    let pvc_api: Api<PersistentVolumeClaim> =
+                        Api::namespaced(self.client.clone(), &namespace);
+                    let _ = pvc_api
+                        .delete(
+                            &crate::kubevirt::workspace_pvc_name(&kube_name),
+                            &DeleteParams::default(),
+                        )
+                        .await;
+                }
+                return Err(error);
+            }
+        };
+
+        Ok(vm
+            .metadata
+            .uid
+            .unwrap_or_else(|| kube_name.clone()))
+    }
+
+    /// `KubeVirt` runtime mode lookup by sandbox-id label.
+    async fn get_kubevirt_sandbox(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Option<Sandbox>, String> {
+        let namespace = crate::kubevirt::kubevirt_namespace(&self.config)?;
+        let api = crate::kubevirt::virtual_machine_api(&self.client, &namespace);
+        let selector = self.sandbox_lookup_selector(sandbox_id);
+        let list = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            api.list(&ListParams::default().labels(&selector)),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|err| err.to_string())?;
+        Ok(list
+            .items
+            .into_iter()
+            .next()
+            .and_then(|obj| crate::kubevirt::sandbox_from_vm_object(&namespace, obj).ok()
+                .map(|(_, sandbox)| sandbox)))
+    }
+
+    /// `KubeVirt` runtime mode start: patch the VM run strategy to `Once`.
+    /// The launch authentication and runtime-generation identity are
+    /// handled by the follow-up token-refresh work.
+    async fn start_kubevirt_sandbox(
+        &self,
+        sandbox_id: &str,
+        _encoded_authentication: &[u8],
+        _encoded_expected_runtime_identity: &str,
+    ) -> Result<String, KubernetesDriverError> {
+        let namespace = crate::kubevirt::kubevirt_namespace(&self.config)
+            .map_err(KubernetesDriverError::Message)?;
+        let api = crate::kubevirt::virtual_machine_api(&self.client, &namespace);
+        let selector = self.sandbox_lookup_selector(sandbox_id);
+        let list = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            api.list(&ListParams::default().labels(&selector)),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+        let object = list
+            .items
+            .into_iter()
+            .next()
+            .ok_or(KubernetesDriverError::NotFound)?;
+
+        let patch = serde_json::json!({"spec": {"runStrategy": "Once"}});
+        tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            api.patch(
+                object.metadata.name.as_deref().unwrap_or_default(),
+                &PatchParams::default(),
+                &Patch::Merge(&patch),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out after {}s patching VirtualMachine run strategy",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+
+        info!(
+            sandbox_id,
+            "Patched KubeVirt VirtualMachine run strategy to Once"
+        );
+        Ok(object
+            .metadata
+            .uid
+            .unwrap_or_default())
+    }
+
+    /// `KubeVirt` runtime mode stop: halt the VM and wait for the guest to go
+    /// down (status.ready == false). The VM, bootstrap Secret and workspace
+    /// PVC are retained.
+    async fn stop_kubevirt_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
+        let namespace = crate::kubevirt::kubevirt_namespace(&self.config)
+            .map_err(KubernetesDriverError::Message)?;
+        let api = crate::kubevirt::virtual_machine_api(&self.client, &namespace);
+        let selector = self.sandbox_lookup_selector(sandbox_id);
+        let list = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            api.list(&ListParams::default().labels(&selector)),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+        let object = list
+            .items
+            .into_iter()
+            .next()
+            .ok_or(KubernetesDriverError::NotFound)?;
+        let kube_name = object
+            .metadata
+            .name
+            .clone()
+            .ok_or_else(|| KubernetesDriverError::Message("VirtualMachine has no name".to_string()))?;
+
+        let patch = serde_json::json!({"spec": {"runStrategy": "Halted"}});
+        tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            api.patch(&kube_name, &PatchParams::default(), &Patch::Merge(&patch)),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out after {}s patching VirtualMachine run strategy",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+
+        info!(
+            sandbox_id,
+            vm = %kube_name,
+            run_strategy = "Halted",
+            "Patched KubeVirt VirtualMachine run strategy"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let mut poll_interval = Duration::from_millis(500);
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(KubernetesDriverError::Message(
+                    "timed out after 120s waiting for KubeVirt sandbox to stop".to_string(),
+                ));
+            }
+            let object = tokio::time::timeout(
+                KUBE_API_TIMEOUT.min(deadline.saturating_duration_since(now)),
+                api.get(&kube_name),
+            )
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message("timed out checking VirtualMachine stop".to_string())
+            })?
+            .map_err(KubernetesDriverError::from_kube)?;
+            let ready = object
+                .data
+                .get("status")
+                .and_then(|status| status.get("ready"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if !ready {
+                return Ok(());
+            }
+            tokio::time::sleep(poll_interval).await;
+            poll_interval = (poll_interval * 2).min(Duration::from_secs(5));
+        }
+    }
+
+    /// `KubeVirt` runtime mode delete: remove the VM (which cascades the VMI
+    /// and virt-launcher pod), then the bootstrap Secret, workspace PVC and
+    /// proxy-pod companions.
+    async fn delete_kubevirt_sandbox(&self, sandbox_id: &str) -> Result<bool, String> {
+        let namespace = crate::kubevirt::kubevirt_namespace(&self.config)?;
+        let api = crate::kubevirt::virtual_machine_api(&self.client, &namespace);
+        let selector = self.sandbox_lookup_selector(sandbox_id);
+        let list = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            api.list(&ListParams::default().labels(&selector)),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|err| err.to_string())?;
+        let Some(object) = list.items.into_iter().next() else {
+            debug!(sandbox_id = %sandbox_id, "VirtualMachine not found (already deleted)");
+            return Ok(false);
+        };
+        let kube_name = object
+            .metadata
+            .name
+            .clone()
+            .ok_or("VirtualMachine has no name")?;
+        let preconditions = Preconditions {
+            uid: object.metadata.uid,
+            resource_version: None,
+        };
+
+        info!(sandbox_id = %sandbox_id, vm = %kube_name, "Deleting KubeVirt VirtualMachine sandbox");
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            api.delete(&kube_name, &DeleteParams::default().preconditions(preconditions)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(KubeError::Api(err))) if err.code == 404 => {
+                return Ok(false);
+            }
+            Ok(Err(err)) => return Err(err.to_string()),
+            Err(_elapsed) => {
+                return Err(format!(
+                    "timed out after {}s deleting VirtualMachine",
+                    KUBE_API_TIMEOUT.as_secs()
+                ));
+            }
+        }
+
+        // Explicit cleanup of the companion resources; the VM cannot own
+        // them (they must exist before it is created), so they are labelled
+        // and deleted by the driver instead.
+        let secret_api: Api<Secret> = Api::namespaced(self.client.clone(), &namespace);
+        let _ = secret_api
+            .delete(
+                &crate::kubevirt::bootstrap_secret_name(&kube_name),
+                &DeleteParams::default(),
+            )
+            .await;
+        if self.config.kubevirt.workspace_pvc {
+            let pvc_api: Api<PersistentVolumeClaim> =
+                Api::namespaced(self.client.clone(), &namespace);
+            let _ = pvc_api
+                .delete(
+                    &crate::kubevirt::workspace_pvc_name(&kube_name),
+                    &DeleteParams::default(),
+                )
+                .await;
+        }
+        Ok(true)
+    }
+
+    /// `KubeVirt` runtime mode watch: label-selected VirtualMachine watcher.
+    /// The KubeVirt controller updates `VM.status` as the VMI progresses, so
+    /// VM objects alone carry enough signal for driver snapshots; the
+    /// gateway still composes public readiness from the supervisor session.
+    #[allow(clippy::unused_async)]
+    async fn watch_sandboxes_kubevirt(&self) -> Result<WatchStream, String> {
+        let namespace = crate::kubevirt::kubevirt_namespace(&self.config)?;
+        let vm_api = crate::kubevirt::virtual_machine_api(&self.watch_client.clone(), &namespace);
+        let watcher_config = watcher::Config::default().labels(&openshell_sandbox_label_selector());
+        let mut vm_stream = recovering_watcher_stream(
+            watcher::watcher(vm_api, watcher_config),
+            "kubevirt-virtualmachine",
+        )
+        .boxed();
+        let (tx, rx) = mpsc::channel(256);
+
+        tokio::spawn(async move {
+            loop {
+                match vm_stream.next().await {
+                    Some(Event::Apply(obj) | Event::InitApply(obj)) => {
+                        if let Ok((_, sandbox)) =
+                            crate::kubevirt::sandbox_from_vm_object(&namespace, obj)
+                        {
+                            let event = WatchSandboxesEvent {
+                                payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                                    WatchSandboxesSandboxEvent { sandbox: Some(sandbox) },
+                                )),
+                            };
+                            if tx.send(Ok(event)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Event::Delete(obj)) => {
+                        if is_openshell_managed(&obj)
+                            && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
+                        {
+                            let event = WatchSandboxesEvent {
+                                payload: Some(watch_sandboxes_event::Payload::Deleted(
+                                    WatchSandboxesDeletedEvent { sandbox_id },
+                                )),
+                            };
+                            if tx.send(Ok(event)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Event::Init | Event::InitDone) => {}
+                    None => {
+                        let _ = tx
+                            .send(Err(KubernetesDriverError::Message(
+                                "VirtualMachine watcher stream ended unexpectedly".to_string(),
+                            )))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
     #[tracing::instrument(
         name = "kubernetes.stop_sandbox",
         skip(self),
@@ -3936,6 +4458,9 @@ impl KubernetesComputeDriver {
     }
 
     async fn stop_sandbox_inner(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
+        if crate::kubevirt::is_kubevirt_mode(&self.config) {
+            return self.stop_kubevirt_sandbox(sandbox_id).await;
+        }
         let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout, phase, placement) =
             self.prepare_sandbox_stop(sandbox_id).await?;
         if phase != Some(SandboxRuntimeBootstrapPhase::Suspending) {
@@ -4049,6 +4574,15 @@ impl KubernetesComputeDriver {
         encoded_authentication: &[u8],
         encoded_expected_runtime_identity: &str,
     ) -> Result<String, KubernetesDriverError> {
+        if crate::kubevirt::is_kubevirt_mode(&self.config) {
+            return self
+                .start_kubevirt_sandbox(
+                    sandbox_id,
+                    encoded_authentication,
+                    encoded_expected_runtime_identity,
+                )
+                .await;
+        }
         let staged = self.read_staged_bootstrap_material().await?;
         let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
             encoded_generation.to_string(),
@@ -4609,6 +5143,9 @@ impl KubernetesComputeDriver {
         )
     )]
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, String> {
+        if crate::kubevirt::is_kubevirt_mode(&self.config) {
+            return self.delete_kubevirt_sandbox(sandbox_id).await;
+        }
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let _guard = self.lifecycle_gates.gate_for(sandbox_id).lock_owned().await;
         let result = self.delete_sandbox_inner(sandbox_id).await;
@@ -4766,6 +5303,12 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn sandbox_exists(&self, sandbox_id: &str) -> Result<bool, String> {
+        if crate::kubevirt::is_kubevirt_mode(&self.config) {
+            return self
+                .get_kubevirt_sandbox(sandbox_id)
+                .await
+                .map(|sandbox| sandbox.is_some());
+        }
         let agent_sandbox_api = self
             .supported_sandbox_api_for_lookup(self.client.clone())
             .await?;
@@ -5519,6 +6062,9 @@ impl KubernetesComputeDriver {
     // Kept `async` to match the gRPC handler signature in `grpc.rs`, which awaits this method.
     #[allow(clippy::unused_async)]
     pub async fn watch_sandboxes(&self) -> Result<WatchStream, String> {
+        if crate::kubevirt::is_kubevirt_mode(&self.config) {
+            return self.watch_sandboxes_kubevirt().await;
+        }
         self.reconcile_sandbox_runtime_resources().await;
         if self.config.is_multi_namespace() {
             self.watch_sandboxes_cluster_wide().await
@@ -6147,7 +6693,7 @@ fn openshell_sandbox_selector_for(gateway_id: &str) -> String {
     selector
 }
 
-fn sandbox_labels(sandbox: &Sandbox, gateway_id: Option<&str>) -> BTreeMap<String, String> {
+pub(crate) fn sandbox_labels(sandbox: &Sandbox, gateway_id: Option<&str>) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_SANDBOX_ID.to_string(), sandbox.id.clone());
     labels.insert(LABEL_SANDBOX_NAME.to_string(), sandbox.name.clone());
@@ -6257,7 +6803,7 @@ fn replace_sandbox_bootstrap_init_container(
     Ok(())
 }
 
-fn sandbox_annotations(sandbox: &Sandbox) -> BTreeMap<String, String> {
+pub(crate) fn sandbox_annotations(sandbox: &Sandbox) -> BTreeMap<String, String> {
     let mut annotations = BTreeMap::new();
     annotations.insert(LABEL_SANDBOX_ID.to_string(), sandbox.id.clone());
     annotations.insert(LABEL_SANDBOX_NAME.to_string(), sandbox.name.clone());
