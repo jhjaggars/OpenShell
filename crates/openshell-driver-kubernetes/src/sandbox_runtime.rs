@@ -626,6 +626,39 @@ pub fn supervisor_pod(
     })
 }
 
+/// The three boundary bootstrap artifacts every runtime delivers to the
+/// in-workload boundary: the encoded `BoundaryConfig`, the session TLS
+/// certificate chain, and its private key.
+///
+/// Both the pod path (via a Kubernetes Secret mounted by the workload) and
+/// the `KubeVirt` path (via the cloudInitNoCloud bootstrap payload) render
+/// these from the same inputs, so their identity claims cannot drift.
+#[derive(Debug, Clone)]
+pub struct BoundaryBootstrapArtifacts {
+    /// Encoded `boundary.json`.
+    pub config_json: Vec<u8>,
+    /// Session TLS certificate chain (`tls.crt`).
+    pub certificate_pem: Vec<u8>,
+    /// Session TLS private key (`tls.key`).
+    pub private_key_pem: Vec<u8>,
+}
+
+/// Render the boundary bootstrap artifacts from a provisioned boundary
+/// config and its session TLS material. Shared by every runtime; each
+/// delivers the bundle through its own transport.
+pub fn render_boundary_bootstrap(
+    boundary_config: &openshell_sandbox_backend::boundary_protocol::BoundaryConfig,
+    tls: &openshell_sandbox_backend::boundary_protocol::SandboxTlsMaterial,
+) -> Result<BoundaryBootstrapArtifacts, String> {
+    Ok(BoundaryBootstrapArtifacts {
+        config_json: boundary_config
+            .encode()
+            .map_err(|error| error.to_string())?,
+        certificate_pem: tls.certificate_chain_pem.as_bytes().to_vec(),
+        private_key_pem: tls.private_key_pem.as_bytes().to_vec(),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn sandbox_bootstrap_secret(

@@ -18,9 +18,10 @@ use crate::sandbox_runtime::{
     BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH, ClientTlsMaterial,
     SHARED_INSTANCE_KEY, SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames,
     SupervisorClientTls, boundary_service, boundary_service_matches_mode, control_policy,
-    generate_proxy_ca_material, image_pull_secret_copy, sandbox_bootstrap_secret,
-    sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference, shared_control_policy,
-    shared_instance_secret, supervisor_bootstrap_secret, supervisor_pod, workload_fence,
+    generate_proxy_ca_material, image_pull_secret_copy, render_boundary_bootstrap,
+    sandbox_bootstrap_secret, sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
+    shared_control_policy, shared_instance_secret, supervisor_bootstrap_secret, supervisor_pod,
+    workload_fence,
 };
 use crate::shared_supervisor::{
     ANNOTATION_SUPERVISOR_SESSION, ANNOTATION_SUPERVISOR_TOPOLOGY, GATEWAY_TOPOLOGY,
@@ -3827,16 +3828,15 @@ impl KubernetesComputeDriver {
         .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
         let workload_owner = runtime_pod_owner(&workload_pod_name, &workload_pod_uid);
         let instance_owner = workload_owner.clone();
+        let bootstrap = render_boundary_bootstrap(&provisioned.boundary_config, &tls)
+            .map_err(KubernetesDriverError::Message)?;
         let sandbox_secret = sandbox_bootstrap_secret(
             namespace,
             names,
             sandbox_id,
-            provisioned
-                .boundary_config
-                .encode()
-                .map_err(|error| KubernetesDriverError::Message(error.to_string()))?,
-            tls.certificate_chain_pem.into_bytes(),
-            tls.private_key_pem.into_bytes(),
+            bootstrap.config_json,
+            bootstrap.certificate_pem,
+            bootstrap.private_key_pem,
             workload_owner.clone(),
         );
         let secrets = Api::<Secret>::namespaced(self.client.clone(), namespace);
