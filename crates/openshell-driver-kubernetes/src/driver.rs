@@ -17,8 +17,8 @@ use crate::lifecycle::LifecycleGates;
 use crate::sandbox_runtime::{
     BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH, ClientTlsMaterial,
     SHARED_INSTANCE_KEY, SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames,
-    SupervisorClientTls, boundary_service, boundary_service_matches_mode, control_policy,
-    generate_proxy_ca_material, image_pull_secret_copy, render_boundary_bootstrap,
+    SupervisorClientTls, boundary_launch_inputs, boundary_service, boundary_service_matches_mode,
+    control_policy, generate_proxy_ca_material, image_pull_secret_copy, render_boundary_bootstrap,
     sandbox_bootstrap_secret, sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
     shared_control_policy, shared_instance_secret, supervisor_bootstrap_secret, supervisor_pod,
     workload_fence,
@@ -73,8 +73,7 @@ use openshell_core::proto::compute::v1::{
 use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use openshell_sandbox_backend::boundary_protocol::{
-    GatewayVerificationKey, SandboxTlsClientConfig, SandboxTlsServerConfig,
-    generate_sandbox_tls_material,
+    SandboxTlsClientConfig, SandboxTlsServerConfig,
 };
 use openshell_supervisor_control::{
     InstanceSupervision, LaunchError, RecoverableInstance, RecoveryBaseline,
@@ -652,25 +651,6 @@ fn decode_launch_authentication(
         ))
     })?;
     Ok(authentication)
-}
-
-fn gateway_verification_keys(
-    keys: &[openshell_core::jwt::SessionVerificationKey],
-) -> Result<Vec<GatewayVerificationKey>, KubernetesDriverError> {
-    keys.iter()
-        .map(|key| {
-            String::from_utf8(key.public_key_pem.clone())
-                .map(|public_key_pem| GatewayVerificationKey {
-                    key_id: key.key_id.clone(),
-                    public_key_pem,
-                })
-                .map_err(|error| {
-                    KubernetesDriverError::Precondition(format!(
-                        "Kubernetes sandbox verification key is not UTF-8 PEM: {error}"
-                    ))
-                })
-        })
-        .collect()
 }
 
 /// Kubernetes defaults pod termination to 30 seconds when the pod template
@@ -3748,11 +3728,9 @@ impl KubernetesComputeDriver {
         })
         .await?;
 
-        let session_id = launch_authentication.supervisor.session_id;
-        let tls = generate_sandbox_tls_material(session_id)
-            .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
-        let verification_keys =
-            gateway_verification_keys(&launch_authentication.verification_keys)?;
+        let launch_inputs = boundary_launch_inputs(launch_authentication)?;
+        let tls = launch_inputs.tls;
+        let verification_keys = launch_inputs.verification_keys;
         let proxy_ca = generate_proxy_ca_material().map_err(KubernetesDriverError::Message)?;
         let workload_identity = ResolvedWorkloadIdentity::new(
             agent_uid,
@@ -3799,10 +3777,10 @@ impl KubernetesComputeDriver {
                 .supervisor
                 .runtime_generation
                 .to_string(),
-            session_id,
-            session_rotation: launch_authentication.supervisor.session_rotation,
-            auth_epoch: launch_authentication.supervisor.auth_epoch,
-            gateway_id: launch_authentication.gateway_id.clone(),
+            session_id: launch_inputs.session_id,
+            session_rotation: launch_inputs.session_rotation,
+            auth_epoch: launch_inputs.auth_epoch,
+            gateway_id: launch_inputs.gateway_id,
             verification_keys,
             namespace_uid,
             sandbox_resource_uid: cr_uid.to_string(),

@@ -21,13 +21,65 @@ use rcgen::{CertificateParams, DnType, IsCa, KeyUsagePurpose};
 
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 
+use crate::KubernetesDriverError;
 use crate::config::KubernetesControlConnection;
+/// Session-scoped inputs every boundary runtime needs from one launch
+/// authentication: the identity fields the boundary config and runtime
+/// descriptor both carry, the gateway verification keys, and the session
+/// TLS material. Extracted so the pod and `KubeVirt` paths cannot drift in
+/// how they interpret the gateway's launch bundle.
+pub struct BoundaryLaunchInputs {
+    pub session_id: openshell_core::SandboxSessionId,
+    pub session_rotation: openshell_core::jwt::SessionRotation,
+    pub auth_epoch: openshell_core::jwt::CredentialEpoch,
+    pub gateway_id: String,
+    pub verification_keys: Vec<GatewayVerificationKey>,
+    pub tls: openshell_sandbox_backend::boundary_protocol::SandboxTlsMaterial,
+}
+
+/// Interpret the gateway's launch authentication into the shared boundary
+/// inputs, generating the session TLS material bound to this launch.
+pub fn boundary_launch_inputs(
+    launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
+) -> Result<BoundaryLaunchInputs, KubernetesDriverError> {
+    let supervisor = &launch_authentication.supervisor;
+    let tls = openshell_sandbox_backend::boundary_protocol::generate_sandbox_tls_material(
+        supervisor.session_id,
+    )
+    .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
+    let verification_keys = launch_authentication
+        .verification_keys
+        .iter()
+        .map(|key| {
+            String::from_utf8(key.public_key_pem.clone())
+                .map(|public_key_pem| GatewayVerificationKey {
+                    key_id: key.key_id.clone(),
+                    public_key_pem,
+                })
+                .map_err(|error| {
+                    KubernetesDriverError::Precondition(format!(
+                        "Kubernetes sandbox verification key is not UTF-8 PEM: {error}"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(BoundaryLaunchInputs {
+        session_id: supervisor.session_id,
+        session_rotation: supervisor.session_rotation,
+        auth_epoch: supervisor.auth_epoch,
+        gateway_id: launch_authentication.gateway_id.clone(),
+        verification_keys,
+        tls,
+    })
+}
+
 #[cfg(test)]
 use crate::isolation::BOUNDARY_ROLE_LABEL;
 use crate::isolation::{
     KubernetesSandboxRuntimeNetworkFence, KubernetesSandboxRuntimeNetworkFenceSpec,
     boundary_service_role, runtime_control_policy,
 };
+use openshell_sandbox_backend::boundary_protocol::GatewayVerificationKey;
 
 pub const SANDBOX_SECRET_COMPONENT: &str = "sandbox-bootstrap";
 pub const SUPERVISOR_SECRET_COMPONENT: &str = "supervisor-bootstrap";
@@ -633,7 +685,6 @@ pub fn supervisor_pod(
 /// Both the pod path (via a Kubernetes Secret mounted by the workload) and
 /// the `KubeVirt` path (via the cloudInitNoCloud bootstrap payload) render
 /// these from the same inputs, so their identity claims cannot drift.
-#[derive(Debug, Clone)]
 pub struct BoundaryBootstrapArtifacts {
     /// Encoded `boundary.json`.
     pub config_json: Vec<u8>,
@@ -641,6 +692,18 @@ pub struct BoundaryBootstrapArtifacts {
     pub certificate_pem: Vec<u8>,
     /// Session TLS private key (`tls.key`).
     pub private_key_pem: Vec<u8>,
+}
+
+impl std::fmt::Debug for BoundaryBootstrapArtifacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The private key must never reach logs or OCSF JSONL; the source
+        // type (SandboxTlsMaterial) redacts it the same way.
+        f.debug_struct("BoundaryBootstrapArtifacts")
+            .field("config_json_len", &self.config_json.len())
+            .field("certificate_pem_len", &self.certificate_pem.len())
+            .field("private_key_pem", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Render the boundary bootstrap artifacts from a provisioned boundary
@@ -1687,5 +1750,23 @@ mod tests {
                 .starts_with("-----BEGIN CERTIFICATE-----")
         );
         assert!(material.private_key_pem.contains("PRIVATE KEY"));
+    }
+}
+
+#[cfg(test)]
+mod boundary_artifacts_tests {
+    use super::*;
+
+    #[test]
+    fn boundary_bootstrap_artifacts_debug_redacts_private_key() {
+        let artifacts = BoundaryBootstrapArtifacts {
+            config_json: b"{}".to_vec(),
+            certificate_pem: b"-----BEGIN CERTIFICATE-----\nfake\n".to_vec(),
+            private_key_pem: b"-----BEGIN PRIVATE KEY-----\nsekrit\n".to_vec(),
+        };
+        let formatted = format!("{artifacts:?}");
+        assert!(!formatted.contains("sekrit"));
+        assert!(!formatted.contains("PRIVATE KEY"));
+        assert!(formatted.contains("<redacted>"));
     }
 }
