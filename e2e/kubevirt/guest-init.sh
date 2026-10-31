@@ -155,6 +155,14 @@ main() {
         ts "WARNING: /dev/ptmx missing — exec PTYs will fail"
     fi
     configure_network
+    # The capability-free sandbox owns a loopback-only DNS relay on
+    # 127.0.0.53:53. Guest init grants the low port before handing control
+    # to the zero-capability workload UID (mirrors the libkrun VM driver's
+    # init and the container runtimes' sysctl).
+    if ! echo 0 > /proc/sys/net/ipv4/ip_unprivileged_port_start; then
+        ts "FATAL: failed to permit the unprivileged DNS relay to bind port 53"
+        return 1
+    fi
     read_bootstrap_config
     materialize_token
     mount_workspace
@@ -164,7 +172,11 @@ main() {
     # the guest off so the VMI completes instead of leaving QEMU serving a
     # dead kernel (which keeps VM.status.ready true and the sandbox
     # provisioning forever).
-    /usr/local/bin/openshell-sandbox &
+    # OPENSHELL_SUPERVISOR_ARGS is word-split onto the command line: the
+    # boundary binary's hidden subcommands (capability-probe-launch,
+    # launch-capability-free) are dispatched before clap parsing.
+    # shellcheck disable=SC2086
+    /usr/local/bin/openshell-sandbox ${OPENSHELL_SUPERVISOR_ARGS:-} &
     SANDBOX_PID=$!
     # `wait` returns the child's exit status, and this script runs under
     # `set -e`: an unguarded failing wait would exit PID 1 (kernel panic)
