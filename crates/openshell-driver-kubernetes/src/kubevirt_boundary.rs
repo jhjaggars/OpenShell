@@ -442,74 +442,124 @@ use kube::Client;
 use kube::api::Api;
 use kube::core::DynamicObject;
 
-/// The observed state of the fence `NetworkPolicy` after creation or
-/// re-read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FenceObservation {
-    pub uid: String,
-    pub resource_version: String,
+/// Inputs describing the shared supervisor the fence allows egress to,
+/// read from the configured Service at render time.
+pub struct SupervisorEndpoint {
+    /// Namespace of the shared supervisor Service.
+    pub namespace: String,
+    /// The Service's `spec.selector` (pod labels), used verbatim as the
+    /// egress podSelector. Read from the live Service, never hard-coded.
+    pub pod_selector: BTreeMap<String, String>,
+    /// The Service's runtime port.
+    pub port: u16,
 }
 
-/// Expected fence identity: the UID and resourceVersion the boundary
-/// evidence was rendered against.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The fence's observed state: UID, resourceVersion, and the full spec
+/// (for drift comparison).
+#[derive(Debug, Clone)]
+pub struct ObservedFence {
+    pub uid: String,
+    pub resource_version: String,
+    pub spec: serde_json::Value,
+}
+
+/// The fence identity and shape the boundary evidence was rendered against.
+#[derive(Debug, Clone)]
 pub struct ExpectedFence {
     pub uid: String,
     pub resource_version: String,
+    pub spec: serde_json::Value,
 }
 
-/// Render the virt-launcher egress fence `NetworkPolicy`.
+impl ExpectedFence {
+    /// Build from a freshly rendered fence JSON and the observed UID/RV.
+    #[must_use]
+    pub fn from_rendered(
+        rendered: serde_json::Value,
+        uid: String,
+        resource_version: String,
+    ) -> Self {
+        Self {
+            uid,
+            resource_version,
+            spec: rendered["spec"].clone(),
+        }
+    }
+}
+
+/// Render the virt-launcher fence `NetworkPolicy`.
 ///
 /// The sandbox's only permitted egress is the shared supervisor's runtime
-/// port. No DNS, no gateway — the boundary's in-guest DNS relay forwards
-/// through the supervisor's network mediation, and the supervisor
-/// connection itself uses driver-resolved addresses (no name resolution in
-/// the guest).
+/// port (matched by the supervisor Service's own pod selector, read at
+/// render time — never hard-coded, because the Helm chart's supervisor
+/// labels vary by release). No DNS, no gateway: the boundary's in-guest
+/// DNS relay forwards through the supervisor's network mediation, and the
+/// supervisor connection uses driver-resolved addresses.
 ///
-/// The podSelector matches the virt-launcher pod via the labels `KubeVirt`
-/// propagates from the VM template (`kubevirt.io=virt-launcher` plus the
-/// `OpenShell` sandbox-id label).
+/// Ingress is deny-all (`policyTypes: [Ingress, Egress]` with no ingress
+/// rules): the boundary dials out (`RuntimeInitiatedTlsTcp`), so the guest
+/// needs no inbound connections. Serial console and virt-handler access go
+/// through unix sockets on the node, not pod networking.
+///
+/// The policy carries the standard `OpenShell` ownership labels so the
+/// driver's label-based cleanup and the demo's zero-leftovers check find
+/// it.
 #[must_use]
 pub fn render_fence(
     namespace: &str,
-    kube_name: &str,
     sandbox_id: &str,
-    _gateway_id: Option<&str>,
-    supervisor_port: u16,
-    supervisor_namespace: &str,
-    _supervisor_service_name: &str,
+    gateway_id: Option<&str>,
+    supervisor: &SupervisorEndpoint,
 ) -> serde_json::Value {
-    let _ = kube_name;
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        openshell_core::driver_utils::LABEL_MANAGED_BY.to_string(),
+        openshell_core::driver_utils::LABEL_MANAGED_BY_VALUE.to_string(),
+    );
+    labels.insert(
+        openshell_core::driver_utils::LABEL_SANDBOX_ID.to_string(),
+        sandbox_id.to_string(),
+    );
+    if let Some(gw_id) = gateway_id {
+        labels.insert(
+            openshell_core::driver_utils::LABEL_GATEWAY_ID.to_string(),
+            gw_id.to_string(),
+        );
+    }
+
+    let supervisor_selector: serde_json::Map<String, serde_json::Value> = supervisor
+        .pod_selector
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+        .collect();
+
     serde_json::json!({
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
         "metadata": {
             "name": fence_name(sandbox_id),
             "namespace": namespace,
+            "labels": labels,
         },
         "spec": {
             "podSelector": {
                 "matchLabels": {
                     "kubevirt.io": "virt-launcher",
-                    "openshell.ai/sandbox-id": sandbox_id,
+                    openshell_core::driver_utils::LABEL_SANDBOX_ID: sandbox_id,
                 }
             },
-            "policyTypes": ["Egress"],
+            "policyTypes": ["Ingress", "Egress"],
             "egress": [{
                 "to": [{
                     "namespaceSelector": {
                         "matchLabels": {
-                            "kubernetes.io/metadata.name": supervisor_namespace
+                            "kubernetes.io/metadata.name": supervisor.namespace
                         }
                     },
-                    "podSelector": {
-                        "matchLabels": {
-                            "openshell.ai/component": "shared-supervisor"
-                        }
-                    }
+                    "podSelector": {"matchLabels": supervisor_selector}
                 }],
                 "ports": [{
-                    "port": supervisor_port,
+                    "port": supervisor.port,
                     "protocol": "TCP"
                 }]
             }]
@@ -523,13 +573,12 @@ pub fn fence_name(sandbox_id: &str) -> String {
     format!("openshell-kubevirt-fence-{sandbox_id}")
 }
 
-/// Read the fence's current UID and resourceVersion. `None` when the
-/// policy does not exist.
+/// Read the fence's current state. `None` when the policy does not exist.
 pub async fn observe_fence(
     client: &Client,
     namespace: &str,
     sandbox_id: &str,
-) -> Result<Option<FenceObservation>, String> {
+) -> Result<Option<ObservedFence>, String> {
     let api: Api<DynamicObject> = Api::namespaced_with(
         client.clone(),
         namespace,
@@ -543,39 +592,39 @@ pub async fn observe_fence(
     );
     let name = fence_name(sandbox_id);
     match api.get(&name).await {
-        Ok(obj) => Ok(Some(FenceObservation {
+        Ok(obj) => Ok(Some(ObservedFence {
             uid: obj.metadata.uid.unwrap_or_default(),
             resource_version: obj.metadata.resource_version.unwrap_or_default(),
+            spec: obj
+                .data
+                .get("spec")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
         })),
         Err(kube::Error::Api(err)) if err.code == 404 => Ok(None),
         Err(err) => Err(err.to_string()),
     }
 }
 
-/// Verify the fence on every new generation:
-/// - the fence must still exist (deleted = fail);
-/// - its UID must be unchanged (a replaced policy is a new fence that the
-///   rendered evidence does not cover = fail);
-/// - its spec must still match the expected fence shape (podSelector,
-///   policyTypes, egress rules = fail on drift);
-/// - a resourceVersion-only change (a label or annotation from a policy or
-///   `GitOps` controller) PASSES: the driver re-captures the new RV into
-///   the new generation's evidence.
-pub async fn verify_fence(
-    client: &Client,
-    namespace: &str,
-    sandbox_id: &str,
+/// Pure fence verification (unit-testable without a cluster):
+/// - deleted (None) → Err;
+/// - UID changed (replaced policy) → Err;
+/// - spec drift (podSelector, policyTypes, egress rules) → Err;
+/// - resourceVersion-only change (a label or annotation from a controller)
+///   → Ok with the new RV, so the driver re-captures it into the new
+///   generation's evidence.
+pub fn check_fence(
+    observed: Option<&ObservedFence>,
     expected: &ExpectedFence,
-) -> Result<FenceObservation, String> {
-    let observed = observe_fence(client, namespace, sandbox_id)
-        .await?
-        .ok_or_else(|| {
-            format!(
-                "the virt-launcher egress fence {} was deleted; the boundary \
-                 evidence was rendered against a fence that no longer exists",
-                fence_name(sandbox_id)
-            )
-        })?;
+    sandbox_id: &str,
+) -> Result<ObservedFence, String> {
+    let Some(observed) = observed else {
+        return Err(format!(
+            "the virt-launcher egress fence {} was deleted; the boundary \
+             evidence was rendered against a fence that no longer exists",
+            fence_name(sandbox_id)
+        ));
+    };
     if observed.uid != expected.uid {
         return Err(format!(
             "the virt-launcher egress fence was replaced (expected UID {}, got {}); \
@@ -584,26 +633,72 @@ pub async fn verify_fence(
             expected.uid, observed.uid
         ));
     }
-    Ok(observed)
+    if observed.spec != expected.spec {
+        return Err(
+            "the virt-launcher egress fence spec drifted from the rendered shape \
+             (podSelector, policyTypes, or egress rules changed); the fence no \
+             longer matches what the boundary evidence was rendered against"
+                .to_string(),
+        );
+    }
+    Ok(observed.clone())
+}
+
+/// Verify the fence on every new generation.
+///
+/// The async wrapper around [`check_fence`]. Returns the current
+/// `ObservedFence` so the caller can re-capture the resourceVersion into
+/// the new generation's evidence.
+pub async fn verify_fence(
+    client: &Client,
+    namespace: &str,
+    sandbox_id: &str,
+    expected: &ExpectedFence,
+) -> Result<ObservedFence, String> {
+    let observed = observe_fence(client, namespace, sandbox_id).await?;
+    check_fence(observed.as_ref(), expected, sandbox_id)
 }
 
 #[cfg(test)]
 mod fence_tests {
     use super::*;
 
+    fn supervisor() -> SupervisorEndpoint {
+        SupervisorEndpoint {
+            namespace: "openshell".to_string(),
+            pod_selector: BTreeMap::from([
+                (
+                    "app.kubernetes.io/name".to_string(),
+                    "openshell-supervisor".to_string(),
+                ),
+                (
+                    "app.kubernetes.io/component".to_string(),
+                    "supervisor".to_string(),
+                ),
+            ]),
+            port: 5500,
+        }
+    }
+
+    fn rendered_fence() -> serde_json::Value {
+        render_fence("kvpoc-sandboxes", "sbx-1", Some("gw"), &supervisor())
+    }
+
+    fn observed(uid: &str, rv: &str, spec: serde_json::Value) -> ObservedFence {
+        ObservedFence {
+            uid: uid.to_string(),
+            resource_version: rv.to_string(),
+            spec,
+        }
+    }
+
     #[test]
-    fn fence_renders_egress_only_to_supervisor() {
-        let fence = render_fence(
-            "kvpoc-sandboxes",
-            "default--demo",
-            "sbx-1",
-            Some("gw"),
-            5500,
-            "openshell",
-            "openshell-shared-supervisor",
-        );
-        assert_eq!(fence["spec"]["policyTypes"][0], "Egress");
-        // No ingress rules.
+    fn fence_renders_deny_all_ingress_and_supervisor_only_egress() {
+        let fence = rendered_fence();
+        let policy_types = fence["spec"]["policyTypes"].as_array().unwrap();
+        assert!(policy_types.contains(&serde_json::json!("Ingress")));
+        assert!(policy_types.contains(&serde_json::json!("Egress")));
+        // No ingress rules: deny-all ingress.
         assert!(fence["spec"]["ingress"].is_null());
         // The podSelector matches the virt-launcher pod.
         assert_eq!(
@@ -614,12 +709,31 @@ mod fence_tests {
             fence["spec"]["podSelector"]["matchLabels"]["openshell.ai/sandbox-id"],
             "sbx-1"
         );
-        // Egress allows only the supervisor port in the supervisor namespace.
+        // Egress allows only the supervisor's port, matched by the Service
+        // selector (not hard-coded labels).
         assert_eq!(fence["spec"]["egress"][0]["ports"][0]["port"], 5500);
+        assert_eq!(
+            fence["spec"]["egress"][0]["to"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/name"],
+            "openshell-supervisor"
+        );
         assert_eq!(
             fence["spec"]["egress"][0]["to"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
             "openshell"
         );
+    }
+
+    #[test]
+    fn fence_carries_openshell_labels_for_cleanup() {
+        let fence = rendered_fence();
+        assert_eq!(
+            fence["metadata"]["labels"]["openshell.ai/managed-by"],
+            "openshell"
+        );
+        assert_eq!(
+            fence["metadata"]["labels"]["openshell.ai/sandbox-id"],
+            "sbx-1"
+        );
+        assert_eq!(fence["metadata"]["labels"]["openshell.ai/gateway-id"], "gw");
     }
 
     #[test]
@@ -628,10 +742,134 @@ mod fence_tests {
     }
 
     #[test]
-    fn verify_fence_rejects_uid_mismatch() {
-        // The verify function is async and needs a kube client; the UID
-        // comparison logic is exercised through the observe/ExpectedFence
-        // types and the boundary evidence tests above. A full integration
-        // test with a live cluster covers the end-to-end path.
+    fn check_fence_rejects_deleted() {
+        let expected = ExpectedFence::from_rendered(rendered_fence(), "uid-1".into(), "1".into());
+        let err = check_fence(None, &expected, "sbx-1").unwrap_err();
+        assert!(err.contains("was deleted"));
+    }
+
+    #[test]
+    fn check_fence_rejects_replaced_uid() {
+        let expected = ExpectedFence::from_rendered(rendered_fence(), "uid-1".into(), "1".into());
+        let replaced = observed("uid-2", "1", rendered_fence()["spec"].clone());
+        let err = check_fence(Some(&replaced), &expected, "sbx-1").unwrap_err();
+        assert!(err.contains("was replaced"));
+    }
+
+    #[test]
+    fn check_fence_rejects_spec_drift() {
+        let expected = ExpectedFence::from_rendered(rendered_fence(), "uid-1".into(), "1".into());
+        let mut drifted = rendered_fence();
+        drifted["spec"]["egress"][0]["ports"][0]["port"] = serde_json::json!(9999);
+        let observed_drift = observed("uid-1", "1", drifted["spec"].clone());
+        let err = check_fence(Some(&observed_drift), &expected, "sbx-1").unwrap_err();
+        assert!(err.contains("spec drifted"));
+    }
+
+    #[test]
+    fn check_fence_accepts_rv_only_change() {
+        let expected = ExpectedFence::from_rendered(rendered_fence(), "uid-1".into(), "1".into());
+        let rv_changed = observed("uid-1", "42", rendered_fence()["spec"].clone());
+        let result =
+            check_fence(Some(&rv_changed), &expected, "sbx-1").expect("RV-only change must pass");
+        assert_eq!(result.resource_version, "42");
+    }
+
+    #[test]
+    fn check_fence_accepts_unchanged() {
+        let expected = ExpectedFence::from_rendered(rendered_fence(), "uid-1".into(), "1".into());
+        let unchanged = observed("uid-1", "1", rendered_fence()["spec"].clone());
+        check_fence(Some(&unchanged), &expected, "sbx-1").expect("unchanged must pass");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cloud-init delivery
+// ---------------------------------------------------------------------------
+
+use base64::Engine as _;
+
+/// Keys in the cloudInitNoCloud `userData` payload.
+///
+/// Carrying the boundary bootstrap artifacts (base64-encoded so the
+/// shell-sourceable format is preserved). No gateway material appears in
+/// the payload — no sandbox token, no gateway endpoint, no JWT.
+pub const PAYLOAD_BOUNDARY_CONFIG: &str = "OPENSHELL_BOUNDARY_CONFIG_B64";
+pub const PAYLOAD_BOUNDARY_CERTIFICATE: &str = "OPENSHELL_BOUNDARY_CERTIFICATE_B64";
+pub const PAYLOAD_BOUNDARY_PRIVATE_KEY: &str = "OPENSHELL_BOUNDARY_PRIVATE_KEY_B64";
+/// The workload uid/gid the boundary runs as (launch-capability-free args).
+pub const PAYLOAD_WORKLOAD_UID: &str = "OPENSHELL_WORKLOAD_UID";
+pub const PAYLOAD_WORKLOAD_GID: &str = "OPENSHELL_WORKLOAD_GID";
+
+/// Render the cloudInitNoCloud `userData` payload.
+///
+/// Delivers the boundary bootstrap artifacts to the guest. The payload is
+/// shell-sourceable; the guest init decodes the base64 values, stages
+/// the files at the paths written in the `BoundaryConfig`, and runs
+/// `openshell-sandbox launch-capability-free <uid> <gid> <config-path>`.
+///
+/// Assert (checkpoint 3): no gateway endpoint, no sandbox token, no JWT.
+#[must_use]
+pub fn render_guest_payload(
+    artifacts: &crate::sandbox_runtime::BoundaryBootstrapArtifacts,
+    uid: u32,
+    gid: u32,
+) -> String {
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    format!(
+        "{PAYLOAD_BOUNDARY_CONFIG}={}\n\
+         {PAYLOAD_BOUNDARY_CERTIFICATE}={}\n\
+         {PAYLOAD_BOUNDARY_PRIVATE_KEY}={}\n\
+         {PAYLOAD_WORKLOAD_UID}={uid}\n\
+         {PAYLOAD_WORKLOAD_GID}={gid}\n",
+        b64(&artifacts.config_json),
+        b64(&artifacts.certificate_pem),
+        b64(&artifacts.private_key_pem),
+    )
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+
+    #[test]
+    fn guest_payload_carries_no_gateway_material() {
+        let artifacts = crate::sandbox_runtime::BoundaryBootstrapArtifacts {
+            config_json: br#"{"boundary_id":"sbx","generation":"g1"}"#.to_vec(),
+            certificate_pem: b"-----BEGIN CERTIFICATE-----".to_vec(),
+            private_key_pem: b"-----BEGIN PRIVATE KEY-----".to_vec(),
+        };
+        let payload = render_guest_payload(&artifacts, 10001, 10001);
+        // No gateway material (checkpoint 3).
+        assert!(!payload.contains("OPENSHELL_ENDPOINT"));
+        assert!(!payload.contains("OPENSHELL_SANDBOX_TOKEN"));
+        assert!(!payload.contains("OPENSHELL_SANDBOX_TOKEN_FILE"));
+        assert!(!payload.contains("OPENSHELL_ENDPOINT="));
+        assert!(!payload.contains("grpc_endpoint"));
+        // The boundary artifacts and identity are present.
+        assert!(payload.contains(PAYLOAD_BOUNDARY_CONFIG));
+        assert!(payload.contains(PAYLOAD_BOUNDARY_CERTIFICATE));
+        assert!(payload.contains(PAYLOAD_BOUNDARY_PRIVATE_KEY));
+        assert!(payload.contains("OPENSHELL_WORKLOAD_UID=10001"));
+        assert!(payload.contains("OPENSHELL_WORKLOAD_GID=10001"));
+    }
+
+    #[test]
+    fn guest_payload_is_shell_sourceable() {
+        let artifacts = crate::sandbox_runtime::BoundaryBootstrapArtifacts {
+            config_json: b"{}".to_vec(),
+            certificate_pem: b"cert".to_vec(),
+            private_key_pem: b"key".to_vec(),
+        };
+        let payload = render_guest_payload(&artifacts, 1000, 1000);
+        // Every line is KEY=VALUE (base64 has no spaces or shell metachars).
+        for line in payload.lines() {
+            assert!(line.contains('='), "line must be KEY=VALUE: {line}");
+            let value = line.split_once('=').unwrap().1;
+            assert!(
+                !value.contains(' ') && !value.contains('\'') && !value.contains('"'),
+                "value must be shell-safe: {value}"
+            );
+        }
     }
 }

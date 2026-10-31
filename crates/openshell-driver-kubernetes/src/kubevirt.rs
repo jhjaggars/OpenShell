@@ -308,6 +308,15 @@ pub fn render_virtual_machine(params: &KubeVirtSandboxParams<'_>) -> DynamicObje
         KUBEVIRT_VM_LABEL.to_string(),
         KUBEVIRT_VM_LABEL_VALUE.to_string(),
     );
+    // The boundary-role workload label: KubeVirt propagates template labels
+    // to the virt-launcher pod, and the shared supervisor's ingress
+    // NetworkPolicy (deploy/helm/openshell/templates/
+    // supervisor-networkpolicy.yaml) admits connections only from pods
+    // carrying this label.
+    labels.insert(
+        crate::isolation::BOUNDARY_ROLE_LABEL.to_string(),
+        "workload".to_string(),
+    );
 
     // Direct kernel boot: the guest image is purpose-built (see
     // `e2e/kubevirt/`), so no bootloader is installed in the rootfs. The

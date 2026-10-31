@@ -167,17 +167,27 @@ main() {
     materialize_token
     mount_workspace
     ts "starting openshell-sandbox"
-    # Run the sandbox runtime as a child rather than exec'ing it: when it
-    # exits (crash, refusal to boot, or a clean shutdown), PID 1 must power
-    # the guest off so the VMI completes instead of leaving QEMU serving a
-    # dead kernel (which keeps VM.status.ready true and the sandbox
-    # provisioning forever).
-    # OPENSHELL_SUPERVISOR_ARGS is word-split onto the command line: the
-    # boundary binary's hidden subcommands (capability-probe-launch,
-    # launch-capability-free) are dispatched before clap parsing.
-    # shellcheck disable=SC2086
-    /usr/local/bin/openshell-sandbox ${OPENSHELL_SUPERVISOR_ARGS:-} &
-    SANDBOX_PID=$!
+    # Stage the boundary bootstrap artifacts from the cloud-init payload
+    # (base64 in the sourced userData) at the absolute paths written in the
+    # BoundaryConfig, mode 0600, then launch the boundary. The boundary
+    # deletes its config and TLS material after loading them.
+    if [ -n "${OPENSHELL_BOUNDARY_CONFIG_B64:-}" ]; then
+        stage_boundary_bootstrap
+        # Run the boundary as a child (not exec) so PID 1 can power off on
+        # exit (see the wait + poweroff below).
+        # shellcheck disable=SC2086
+        /usr/local/bin/openshell-sandbox launch-capability-free \
+            "${OPENSHELL_WORKLOAD_UID}" "${OPENSHELL_WORKLOAD_GID}" \
+            /.openshell/state/bootstrap/boundary.json &
+        SANDBOX_PID=$!
+    else
+        # Legacy path (pre-boundary payload): run with whatever args the
+        # payload provides. Kept so the R3 dead-guest path and the
+        # capability probe still work during the transition.
+        # shellcheck disable=SC2086
+        /usr/local/bin/openshell-sandbox ${OPENSHELL_SUPERVISOR_ARGS:-} &
+        SANDBOX_PID=$!
+    fi
     # `wait` returns the child's exit status, and this script runs under
     # `set -e`: an unguarded failing wait would exit PID 1 (kernel panic)
     # before the poweroff below.
@@ -192,6 +202,31 @@ main() {
     # poweroff -f does not return; sleep forever as a fallback so PID 1
     # never exits into a kernel panic if the syscall fails.
     while true; do sleep 3600; done
+}
+
+# Decode the base64 boundary artifacts from the cloud-init payload and
+# stage them at the paths the BoundaryConfig expects, mode 0600. The
+# boundary deletes these files after loading them; the cloud-init ISO is
+# read-only so the originals cannot be removed from the config disk.
+stage_boundary_bootstrap() {
+    local config_dir cert_dir key_dir
+    config_dir=$(dirname /.openshell/state/bootstrap/boundary.json)
+    cert_dir=$(dirname /.openshell/state/bootstrap/tls.crt)
+    key_dir=$(dirname /.openshell/state/bootstrap/tls.key)
+    mkdir -p "${config_dir}" "${cert_dir}" "${key_dir}"
+    chmod 0700 "${config_dir}" "${cert_dir}" "${key_dir}"
+
+    printf '%s' "${OPENSHELL_BOUNDARY_CONFIG_B64}" | base64 -d \
+        > /.openshell/state/bootstrap/boundary.json
+    printf '%s' "${OPENSHELL_BOUNDARY_CERTIFICATE_B64}" | base64 -d \
+        > /.openshell/state/bootstrap/tls.crt
+    printf '%s' "${OPENSHELL_BOUNDARY_PRIVATE_KEY_B64}" | base64 -d \
+        > /.openshell/state/bootstrap/tls.key
+    chmod 0600 \
+        /.openshell/state/bootstrap/boundary.json \
+        /.openshell/state/bootstrap/tls.crt \
+        /.openshell/state/bootstrap/tls.key
+    ts "boundary bootstrap staged (uid=${OPENSHELL_WORKLOAD_UID}, gid=${OPENSHELL_WORKLOAD_GID})"
 }
 
 main
