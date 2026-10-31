@@ -4353,6 +4353,31 @@ impl KubernetesComputeDriver {
             }
         };
 
+        let wait_for_vmi_gone = async {
+            let vmi_api = crate::kubevirt::virtual_machine_instance_api(&self.client, &namespace);
+            let deadline = tokio::time::Instant::now() + VMI_TERMINATION_TIMEOUT;
+            loop {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(KubernetesDriverError::Message(
+                        "timed out waiting for the VirtualMachineInstance to terminate before restart"
+                            .to_string(),
+                    ));
+                }
+                match tokio::time::timeout(
+                    KUBE_API_TIMEOUT.min(deadline.saturating_duration_since(now)),
+                    vmi_api.get(&kube_name),
+                )
+                .await
+                {
+                    Ok(Err(KubeError::Api(err))) if err.code == 404 => return Ok(()),
+                    Ok(Err(err)) => return Err(KubernetesDriverError::from_kube(err)),
+                    Ok(_) | Err(_) => {}
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        };
+
         match crate::kubevirt::kubevirt_start_plan(
             run_strategy,
             vm_ready,
@@ -4360,6 +4385,11 @@ impl KubernetesComputeDriver {
             printable_status,
         ) {
             crate::kubevirt::KubeVirtStartPlan::PatchOnce => {
+                // A halted VM always needs the patch, but `stop` only waits
+                // for the VM's ready flag: a VMI in graceful shutdown can
+                // still exist here. Wait it out before patching so the
+                // controller does not reject or ignore the boot.
+                wait_for_vmi_gone.await?;
                 patch_strategy("Once".to_string()).await?;
             }
             crate::kubevirt::KubeVirtStartPlan::AlreadyRunning => {
@@ -4379,29 +4409,7 @@ impl KubernetesComputeDriver {
                 // no-op: halt first so KubeVirt discards the dead VMI, wait
                 // for it to go away, then boot a fresh one.
                 patch_strategy("Halted".to_string()).await?;
-                let vmi_api =
-                    crate::kubevirt::virtual_machine_instance_api(&self.client, &namespace);
-                let deadline = tokio::time::Instant::now() + VMI_TERMINATION_TIMEOUT;
-                loop {
-                    let now = tokio::time::Instant::now();
-                    if now >= deadline {
-                        return Err(KubernetesDriverError::Message(
-                            "timed out waiting for the completed VirtualMachineInstance to terminate before restart"
-                                .to_string(),
-                        ));
-                    }
-                    match tokio::time::timeout(
-                        KUBE_API_TIMEOUT.min(deadline.saturating_duration_since(now)),
-                        vmi_api.get(&kube_name),
-                    )
-                    .await
-                    {
-                        Ok(Err(KubeError::Api(err))) if err.code == 404 => break,
-                        Ok(Err(err)) => return Err(KubernetesDriverError::from_kube(err)),
-                        Ok(_) | Err(_) => {}
-                    }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
+                wait_for_vmi_gone.await?;
                 patch_strategy("Once".to_string()).await?;
             }
         }

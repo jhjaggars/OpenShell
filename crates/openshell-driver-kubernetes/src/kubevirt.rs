@@ -834,6 +834,14 @@ pub fn kubevirt_start_plan(
     vmi_phase: Option<&str>,
     printable_status: &str,
 ) -> KubeVirtStartPlan {
+    // A halted VM always needs the `Once` patch, whatever VMI phase is
+    // still reported: `stop` only waits for the VM's ready flag to clear,
+    // so a VMI in graceful shutdown can still show Running (or any other
+    // phase) here. Returning AlreadyRunning for those would silently leave
+    // the VM halted. The driver waits out a lingering VMI before patching.
+    if run_strategy == "Halted" {
+        return KubeVirtStartPlan::PatchOnce;
+    }
     match vmi_phase {
         // Live or booting VMI: idempotent no-op.
         Some("Pending" | "Scheduling" | "Scheduled" | "Running" | "WaitingForSync") => {
@@ -845,9 +853,7 @@ pub fn kubevirt_start_plan(
         // treat as live.
         Some(_) => KubeVirtStartPlan::AlreadyRunning,
         None => {
-            if run_strategy == "Halted" {
-                KubeVirtStartPlan::PatchOnce
-            } else if run_strategy == "Once" && !vm_ready && printable_status == "Stopped" {
+            if run_strategy == "Once" && !vm_ready && printable_status == "Stopped" {
                 // The VMI object is gone and the VM reports Stopped under
                 // Once: a dead VMI the controller will not replace on a
                 // no-op patch.
@@ -1109,6 +1115,26 @@ mod kubevirt_review_tests {
         assert_eq!(
             kubevirt_start_plan("Once", true, None, "Running"),
             KubeVirtStartPlan::AlreadyRunning
+        );
+    }
+
+    #[test]
+    fn start_plan_halved_vm_always_patches_despite_lingering_vmi() {
+        use super::KubeVirtStartPlan;
+        // `stop` only waits for the VM's ready flag; a VMI in graceful
+        // shutdown can still report any phase. A start issued right after
+        // stop must patch Once (after waiting out the VMI), never report
+        // AlreadyRunning and silently leave the VM halted.
+        for phase in ["Running", "Succeeded", "Failed", "Pending", "Unknown"] {
+            assert_eq!(
+                kubevirt_start_plan("Halted", false, Some(phase), "Stopping"),
+                KubeVirtStartPlan::PatchOnce,
+                "a halted VM with a lingering VMI ({phase}) must patch"
+            );
+        }
+        assert_eq!(
+            kubevirt_start_plan("Halted", false, Some("Succeeded"), "Stopped"),
+            KubeVirtStartPlan::PatchOnce
         );
     }
 
