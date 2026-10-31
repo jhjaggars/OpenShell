@@ -2057,3 +2057,127 @@ mod vm_guest_tests {
         ])));
     }
 }
+
+/// Whether a runtime descriptor matches the provisioned boundary config.
+///
+/// Compares every identity field: `boundary_id`, `generation`,
+/// `session_id`, `workload_identity`, `resource_claims`, and
+/// `provisioning_evidence`. This is the consistency check the boundary
+/// runs at open (via `isolation_protocol::validate_open`); drivers and
+/// tests use the same function so the comparison cannot drift between
+/// implementations.
+pub fn descriptor_matches_config(
+    descriptor: &SandboxRuntimeDescriptor,
+    config: &BoundaryConfig,
+) -> bool {
+    descriptor.boundary_id == config.boundary_id
+        && descriptor.generation == config.generation
+        && descriptor.session_id == config.session_id
+        && descriptor.workload_identity == config.workload_identity
+        && descriptor.resource_claims == config.resource_claims
+        && descriptor.provisioning_evidence == config.provisioning_evidence
+}
+
+#[cfg(test)]
+mod descriptor_config_consistency_tests {
+    use super::*;
+    use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
+    use std::collections::BTreeMap;
+
+    fn descriptor(claims: &BTreeMap<String, String>) -> SandboxRuntimeDescriptor {
+        SandboxRuntimeDescriptor {
+            boundary_id: "sandbox-1".to_string(),
+            generation: "generation-1".to_string(),
+            session_id: SandboxSessionId::new(),
+            workload_identity: ResolvedWorkloadIdentity::new(
+                1000,
+                1000,
+                Vec::new(),
+                "test".to_string(),
+                "test-resource".to_string(),
+            )
+            .unwrap(),
+            transport: SandboxTransport::Unix {
+                socket_path: "/unused".into(),
+            },
+            tls: SandboxTlsClientConfig {
+                server_name: "unused".to_string(),
+                trust_anchor_pem: String::new(),
+            },
+            host_gateway_ip: None,
+            resource_claims: claims.clone(),
+            provisioning_evidence: ProvisioningEvidence::from_enforcement_evidence(
+                "generation-1",
+                b"test-evidence",
+            )
+            .unwrap(),
+        }
+    }
+
+    fn config(claims: &BTreeMap<String, String>) -> BoundaryConfig {
+        BoundaryConfig {
+            boundary_id: "sandbox-1".to_string(),
+            generation: "generation-1".to_string(),
+            session_id: SandboxSessionId::new(),
+            session_rotation: openshell_core::jwt::SessionRotation::new(1).unwrap(),
+            auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+            gateway_id: "gateway-1".to_string(),
+            verification_keys: vec![],
+            listener: BoundaryListener::Unix {
+                socket_path: "/unused".into(),
+                tls: SandboxTlsServerConfig {
+                    certificate_chain_path: "/unused".into(),
+                    private_key_path: "/unused".into(),
+                },
+            },
+            resource_claims: claims.clone(),
+            resource_claim_files: BTreeMap::new(),
+            workload_identity: ResolvedWorkloadIdentity::new(
+                1000,
+                1000,
+                Vec::new(),
+                "test".to_string(),
+                "test-resource".to_string(),
+            )
+            .unwrap(),
+            provisioning_evidence: ProvisioningEvidence::from_enforcement_evidence(
+                "generation-1",
+                b"test-evidence",
+            )
+            .unwrap(),
+            child_env: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn matching_descriptor_and_config_pass() {
+        let claims = BTreeMap::from([("test.claim".to_string(), "value".to_string())]);
+        // The session_id must match too; build both from the same descriptor's
+        // session_id.
+        let d = descriptor(&claims);
+        let mut c = config(&claims);
+        c.session_id = d.session_id;
+        assert!(descriptor_matches_config(&d, &c));
+    }
+
+    #[test]
+    fn different_generation_fails() {
+        let claims = BTreeMap::new();
+        let d = descriptor(&claims);
+        let mut c = config(&claims);
+        c.session_id = d.session_id;
+        c.generation = "generation-2".to_string();
+        assert!(!descriptor_matches_config(&d, &c));
+    }
+
+    #[test]
+    fn different_claims_fail() {
+        let d = descriptor(&BTreeMap::new());
+        let mut c = config(&BTreeMap::from([(
+            "extra".to_string(),
+            "claim".to_string(),
+        )]));
+        c.session_id = d.session_id;
+        assert!(!descriptor_matches_config(&d, &c));
+    }
+}

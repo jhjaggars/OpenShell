@@ -173,11 +173,29 @@ main() {
     # deletes its config and TLS material after loading them.
     if [ -n "${OPENSHELL_BOUNDARY_CONFIG_B64:-}" ]; then
         stage_boundary_bootstrap
+        # G2: assert the environment is clean before launching the child.
+        # The boundary inherits PID 1's env; any B64 or token var here
+        # would leak into the boundary and its workload children.
+        if env | grep -q "BOUNDARY_.*_B64\|OPENSHELL_SANDBOX_TOKEN"; then
+            ts "FATAL: key material still in environment after staging"
+            return 1
+        fi
+        ts "environment verified clean (no B64 or token vars)"
         # Run the boundary as a child (not exec) so PID 1 can power off on
-        # exit (see the wait + poweroff below).
+        # exit (see the wait + poweroff below). The uid/gid were captured
+        # in stage_boundary_bootstrap's local vars; re-read them from the
+        # staged boundary config's workload_identity to avoid a second
+        # source of truth (G4).
+        local launch_uid launch_gid
+        launch_uid=$(sed -n 's/.*"uid":\([0-9]*\).*/\1/p' /.openshell/state/bootstrap/boundary.json | head -1)
+        launch_gid=$(sed -n 's/.*"gid":\([0-9]*\).*/\1/p' /.openshell/state/bootstrap/boundary.json | head -1)
+        if [ -z "${launch_uid}" ] || [ -z "${launch_gid}" ]; then
+            ts "FATAL: could not read workload identity from staged boundary config"
+            return 1
+        fi
         # shellcheck disable=SC2086
         /usr/local/bin/openshell-sandbox launch-capability-free \
-            "${OPENSHELL_WORKLOAD_UID}" "${OPENSHELL_WORKLOAD_GID}" \
+            "${launch_uid}" "${launch_gid}" \
             /.openshell/state/bootstrap/boundary.json &
         SANDBOX_PID=$!
     else
@@ -205,16 +223,24 @@ main() {
 }
 
 # Decode the base64 boundary artifacts from the cloud-init payload and
-# stage them at the paths the BoundaryConfig expects, mode 0600. The
-# boundary deletes these files after loading them; the cloud-init ISO is
-# read-only so the originals cannot be removed from the config disk.
+# stage them at the paths the BoundaryConfig expects. The boundary reads
+# and DELETES these files as the zero-capability workload uid:gid, so:
+# - /.openshell/state is a tmpfs (G3: the key never lands on the
+#   rootfs block device);
+# - the files and directory are chowned to the workload uid:gid (G1: the
+#   boundary can read and unlink them);
+# - the base64 environment variables are unset after staging (G2: they
+#   never leak into the boundary or workload children).
 stage_boundary_bootstrap() {
-    local config_dir cert_dir key_dir
-    config_dir=$(dirname /.openshell/state/bootstrap/boundary.json)
-    cert_dir=$(dirname /.openshell/state/bootstrap/tls.crt)
-    key_dir=$(dirname /.openshell/state/bootstrap/tls.key)
-    mkdir -p "${config_dir}" "${cert_dir}" "${key_dir}"
-    chmod 0700 "${config_dir}" "${cert_dir}" "${key_dir}"
+    local uid gid
+    uid="${OPENSHELL_WORKLOAD_UID}"
+    gid="${OPENSHELL_WORKLOAD_GID}"
+
+    # G3: tmpfs so the key material never touches the containerDisk.
+    mkdir -p /.openshell/state/bootstrap
+    mount -t tmpfs -o mode=0700,nosuid,nodev tmpfs /.openshell/state
+    mkdir -p /.openshell/state/bootstrap
+    chmod 0700 /.openshell/state /.openshell/state/bootstrap
 
     printf '%s' "${OPENSHELL_BOUNDARY_CONFIG_B64}" | base64 -d \
         > /.openshell/state/bootstrap/boundary.json
@@ -226,7 +252,18 @@ stage_boundary_bootstrap() {
         /.openshell/state/bootstrap/boundary.json \
         /.openshell/state/bootstrap/tls.crt \
         /.openshell/state/bootstrap/tls.key
-    ts "boundary bootstrap staged (uid=${OPENSHELL_WORKLOAD_UID}, gid=${OPENSHELL_WORKLOAD_GID})"
+
+    # G1: the boundary reads and deletes these as the workload uid.
+    chown -R "${uid}:${gid}" /.openshell/state
+
+    # G2: the base64 key material must not survive into the boundary's
+    # environment or any workload child.
+    unset OPENSHELL_BOUNDARY_CONFIG_B64 \
+        OPENSHELL_BOUNDARY_CERTIFICATE_B64 \
+        OPENSHELL_BOUNDARY_PRIVATE_KEY_B64 \
+        OPENSHELL_WORKLOAD_UID OPENSHELL_WORKLOAD_GID
+
+    ts "boundary bootstrap staged on tmpfs (uid=${uid}, gid=${gid})"
 }
 
 main

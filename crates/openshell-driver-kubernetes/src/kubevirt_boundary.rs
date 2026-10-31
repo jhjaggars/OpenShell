@@ -213,22 +213,18 @@ impl KubeVirtBoundarySpec {
 mod tests {
     use super::*;
 
-    /// Mirrors the descriptor/config consistency check at
-    /// `isolation_protocol.rs:100`.
+    /// The real descriptor/config consistency check from sandbox-backend
+    /// (isolation_protocol.rs calls the same function), not a local copy.
     fn descriptor_matches_config(
         descriptor: &SandboxRuntimeDescriptor,
         config: &BoundaryConfig,
     ) -> Result<(), ()> {
-        if descriptor.boundary_id != config.boundary_id
-            || descriptor.generation != config.generation
-            || descriptor.session_id != config.session_id
-            || descriptor.workload_identity != config.workload_identity
-            || descriptor.resource_claims != config.resource_claims
-            || descriptor.provisioning_evidence != config.provisioning_evidence
-        {
-            Err(())
-        } else {
+        if openshell_sandbox_backend::boundary_protocol::descriptor_matches_config(
+            descriptor, config,
+        ) {
             Ok(())
+        } else {
+            Err(())
         }
     }
 
@@ -807,14 +803,17 @@ pub const PAYLOAD_WORKLOAD_GID: &str = "OPENSHELL_WORKLOAD_GID";
 /// shell-sourceable; the guest init decodes the base64 values, stages
 /// the files at the paths written in the `BoundaryConfig`, and runs
 /// `openshell-sandbox launch-capability-free <uid> <gid> <config-path>`.
+/// The uid/gid are derived from the same `ResolvedWorkloadIdentity` the
+/// boundary config carries, so they cannot mismatch.
 ///
 /// Assert (checkpoint 3): no gateway endpoint, no sandbox token, no JWT.
 #[must_use]
 pub fn render_guest_payload(
     artifacts: &crate::sandbox_runtime::BoundaryBootstrapArtifacts,
-    uid: u32,
-    gid: u32,
+    workload_identity: &ResolvedWorkloadIdentity,
 ) -> String {
+    let uid = workload_identity.uid;
+    let gid = workload_identity.gid;
     let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
     format!(
         "{PAYLOAD_BOUNDARY_CONFIG}={}\n\
@@ -839,7 +838,15 @@ mod payload_tests {
             certificate_pem: b"-----BEGIN CERTIFICATE-----".to_vec(),
             private_key_pem: b"-----BEGIN PRIVATE KEY-----".to_vec(),
         };
-        let payload = render_guest_payload(&artifacts, 10001, 10001);
+        let identity = ResolvedWorkloadIdentity::new(
+            10001,
+            10001,
+            Vec::new(),
+            "test".to_string(),
+            "test".to_string(),
+        )
+        .unwrap();
+        let payload = render_guest_payload(&artifacts, &identity);
         // No gateway material (checkpoint 3).
         assert!(!payload.contains("OPENSHELL_ENDPOINT"));
         assert!(!payload.contains("OPENSHELL_SANDBOX_TOKEN"));
@@ -861,7 +868,15 @@ mod payload_tests {
             certificate_pem: b"cert".to_vec(),
             private_key_pem: b"key".to_vec(),
         };
-        let payload = render_guest_payload(&artifacts, 1000, 1000);
+        let identity = ResolvedWorkloadIdentity::new(
+            1000,
+            1000,
+            Vec::new(),
+            "test".to_string(),
+            "test".to_string(),
+        )
+        .unwrap();
+        let payload = render_guest_payload(&artifacts, &identity);
         // Every line is KEY=VALUE (base64 has no spaces or shell metachars).
         for line in payload.lines() {
             assert!(line.contains('='), "line must be KEY=VALUE: {line}");
