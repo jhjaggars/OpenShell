@@ -150,8 +150,28 @@ main() {
     read_bootstrap_config
     materialize_token
     mount_workspace
-    ts "handing off to openshell-sandbox supervisor"
-    exec /usr/local/bin/openshell-sandbox
+    ts "starting openshell-sandbox"
+    # Run the sandbox runtime as a child rather than exec'ing it: when it
+    # exits (crash, refusal to boot, or a clean shutdown), PID 1 must power
+    # the guest off so the VMI completes instead of leaving QEMU serving a
+    # dead kernel (which keeps VM.status.ready true and the sandbox
+    # provisioning forever).
+    /usr/local/bin/openshell-sandbox &
+    SANDBOX_PID=$!
+    # `wait` returns the child's exit status, and this script runs under
+    # `set -e`: an unguarded failing wait would exit PID 1 (kernel panic)
+    # before the poweroff below.
+    SANDBOX_RC=0
+    wait "${SANDBOX_PID}" || SANDBOX_RC=$?
+    ts "openshell-sandbox exited with code ${SANDBOX_RC}; powering off"
+    sync
+    # -f skips the shutdown script hierarchy (there is none here): the
+    # kernel powers the machine off immediately, QEMU exits, and the VMI
+    # reaches Succeeded so the driver maps the sandbox to Error.
+    poweroff -f
+    # poweroff -f does not return; sleep forever as a fallback so PID 1
+    # never exits into a kernel panic if the syscall fails.
+    while true; do sleep 3600; done
 }
 
 main

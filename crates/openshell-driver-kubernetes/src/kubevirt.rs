@@ -78,19 +78,29 @@ const REASON_VM_FAILED: &str = "VMFailed";
 /// Classify a terminal VM failure from the printable status and the paired
 /// VMI's phase. Returns a human-readable summary when the VM has failed.
 ///
-/// - `CrashLoopBackOff` / `ErrorUnknnown` printable statuses are terminal on
-///   their own (`KubeVirt` reports them for restart-looping and errored VMs).
-/// - A `Failed` or `Succeeded` VMI under a not-ready VM means the guest
-///   exited (kernel panic, supervisor death, or a completed `Once` run);
-///   without the VMI signal those states are indistinguishable from a
-///   not-yet-booted VM, whose printable status is also `Stopped`.
+/// Terminal printable statuses (per `KubeVirt` v1.9's
+/// `VirtualMachinePrintableStatus`): `CrashLoopBackOff`,
+/// `ErrorUnschedulable`, `ErrorPvcNotFound`, and `DataVolumeError` mean the
+/// VM cannot run and will not recover on its own.
+///
+/// Deliberately **not** terminal:
+/// - `Unknown` (the controller could not obtain the VM state) can appear
+///   transiently during apiserver/communication hiccups; mapping it to
+///   `Error` would flip a booting sandbox to `Error` on a blip.
+/// - `ErrImagePull` / `ImagePullBackOff`: kubelet retries the pull, so they
+///   stay transient — but the condition message carries the printable
+///   status so the cause is visible while the sandbox provisions.
+/// - A `Failed` or `Succeeded` VMI under a not-ready VM **is** terminal: the
+///   guest exited (kernel panic, supervisor death, or a completed `Once`
+///   run). Without the VMI signal those states are indistinguishable from
+///   a not-yet-booted VM, whose printable status is also `Stopped`.
 pub fn terminal_vm_failure(
     printable_status: &str,
     vmi_phase: Option<&str>,
     vm_ready: bool,
 ) -> Option<String> {
     match printable_status {
-        "CrashLoopBackOff" | "ErrorUnknnown" => {
+        "CrashLoopBackOff" | "ErrorUnschedulable" | "ErrorPvcNotFound" | "DataVolumeError" => {
             return Some(format!("printableStatus {printable_status}"));
         }
         _ => {}
@@ -366,16 +376,10 @@ pub fn workspace_pvc_name(kube_name: &str) -> String {
     format!("{kube_name}-workspace")
 }
 
-/// Map a `VirtualMachine` object to a driver sandbox snapshot.
-///
-/// Backend observations only: the gateway still composes public `Ready` from
-/// the supervisor relay session, exactly as with Sandbox CRs. `vmi_phase` is
-/// the phase of the paired `VirtualMachineInstance` when known (the VMI
-/// carries the same labels); it distinguishes a failed or completed guest
-/// from one that has not booted yet.
-/// Map a `VirtualMachine` object without VMI phase context. Production
-/// paths join the VMI phase (see `sandbox_from_vm_object_with_vmi`); this
-/// convenience wrapper exists for callers with only a VM object at hand.
+/// Map a `VirtualMachine` object to a driver sandbox snapshot without VMI
+/// phase context. Production paths join the VMI phase (see
+/// [`sandbox_from_vm_object_with_vmi`]); this convenience wrapper exists for
+/// callers with only a VM object at hand.
 #[cfg(test)]
 fn sandbox_from_vm_object(
     namespace: &str,
@@ -384,6 +388,14 @@ fn sandbox_from_vm_object(
     sandbox_from_vm_object_with_vmi(namespace, obj, None)
 }
 
+/// Map a `VirtualMachine` object, joined with its paired VMI's phase, to a
+/// driver sandbox snapshot.
+///
+/// Backend observations only: the gateway still composes public `Ready` from
+/// the supervisor relay session, exactly as with Sandbox CRs. `vmi_phase` is
+/// the phase of the paired `VirtualMachineInstance` when known (the VMI
+/// carries the same labels); it distinguishes a failed or completed guest
+/// from one that has not booted yet.
 pub fn sandbox_from_vm_object_with_vmi(
     namespace: &str,
     obj: DynamicObject,
@@ -431,7 +443,7 @@ pub fn sandbox_from_vm_object_with_vmi(
 ///   invariant.
 /// - `runStrategy: Halted` becomes `Suspended=True` (public `Stopped`).
 /// - a terminal VMI phase (`Failed`/`Succeeded` while the VM is not ready) or
-///   a terminal printable status (`CrashLoopBackOff`/`ErrorUnknnown`)
+///   a terminal printable status (e.g. `CrashLoopBackOff`)
 ///   becomes `Ready=False` with the non-transient `VMFailed` reason so the
 ///   gateway surfaces the sandbox as `Error` instead of provisioning forever.
 /// - a deletion timestamp becomes `deleting`.
@@ -1038,16 +1050,57 @@ mod kubevirt_review_tests {
         // A failed or completed VMI under a not-ready VM is terminal.
         assert!(terminal_vm_failure("Stopped", Some("Failed"), false).is_some());
         assert!(terminal_vm_failure("Stopped", Some("Succeeded"), false).is_some());
-        // KubeVirt's terminal printable statuses stand on their own.
-        assert!(terminal_vm_failure("CrashLoopBackOff", None, false).is_some());
-        assert!(terminal_vm_failure("ErrorUnknnown", None, false).is_some());
+        // KubeVirt's terminal printable statuses stand on their own
+        // (VirtualMachinePrintableStatus, KubeVirt v1.9).
+        for status in [
+            "CrashLoopBackOff",
+            "ErrorUnschedulable",
+            "ErrorPvcNotFound",
+            "DataVolumeError",
+        ] {
+            assert!(
+                terminal_vm_failure(status, None, false).is_some(),
+                "{status} must be terminal"
+            );
+        }
+        // Image-pull problems are transient (kubelet retries) but visible:
+        // the caller puts the printableStatus in the condition message.
+        for status in ["ErrImagePull", "ImagePullBackOff"] {
+            assert!(
+                terminal_vm_failure(status, None, false).is_none(),
+                "{status} must stay transient"
+            );
+        }
+        // Unknown (controller could not obtain state) can appear transiently;
+        // mapping it to Error would flip a booting sandbox on a blip.
+        assert!(terminal_vm_failure("Unknown", None, false).is_none());
         // A running VM, a not-yet-booted VM, and a missing VMI are not
         // terminal: those stay provisioning.
         assert!(terminal_vm_failure("Running", Some("Running"), true).is_none());
         assert!(terminal_vm_failure("Stopped", None, false).is_none());
         assert!(terminal_vm_failure("Starting", Some("Pending"), false).is_none());
+        assert!(terminal_vm_failure("WaitingForVolumeBinding", None, false).is_none());
         // A Succeeded VMI under a ready VM is not a failure signal.
         assert!(terminal_vm_failure("Running", Some("Succeeded"), true).is_none());
+    }
+
+    #[test]
+    fn transient_image_pull_status_is_visible_in_condition_message() {
+        // ErrImagePull stays transient but the condition message must carry
+        // the printableStatus so the cause reaches the user.
+        let cfg = review_config();
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+        vm.data["status"] =
+            serde_json::json!({"ready": false, "printableStatus": "ImagePullBackOff"});
+        let (_, sbx) =
+            sandbox_from_vm_object_with_vmi("kvpoc-sandboxes", vm, None).expect("converts");
+        let ready = sbx.status.unwrap().conditions[0].clone();
+        assert_eq!(ready.reason, "Starting");
+        assert!(
+            ready.message.contains("ImagePullBackOff"),
+            "message must name the pull problem: {}",
+            ready.message
+        );
     }
 
     #[test]
@@ -1110,4 +1163,27 @@ mod kubevirt_review_tests {
         cfg.grpc_endpoint = "http://openshell-gateway.ns.svc:8080".to_string();
         assert!(cfg.validate_kubevirt_config().is_ok());
     }
+}
+
+/// Decode the gateway's launch authentication for the start-path token
+/// refresh. Empty input skips the refresh (with a warning: the guest keeps
+/// the create-time token, which expires under the gateway JWT TTL); a
+/// malformed bundle is an error rather than a silent stale-token fallback.
+pub fn decode_launch_authentication(
+    encoded: &[u8],
+) -> Result<Option<openshell_core::jwt::SandboxLaunchAuthentication>, KubernetesDriverError> {
+    if encoded.is_empty() {
+        tracing::warn!(
+            "start carried no launch authentication; the guest keeps the create-time \
+             sandbox token, which expires under the gateway JWT TTL"
+        );
+        return Ok(None);
+    }
+    serde_json::from_slice::<openshell_core::jwt::SandboxLaunchAuthentication>(encoded)
+        .map(Some)
+        .map_err(|error| {
+            KubernetesDriverError::Precondition(format!(
+                "invalid launch authentication bundle: {error}"
+            ))
+        })
 }

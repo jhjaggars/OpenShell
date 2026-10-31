@@ -30,10 +30,12 @@ KUBEVIRT_VERSION="${KUBEVIRT_VERSION:-v1.9.1}"
 
 command -v mkfs.ext4 >/dev/null || { echo "mkfs.ext4 (e2fsprogs) is required" >&2; exit 1; }
 command -v qemu-img >/dev/null || { echo "qemu-img is required" >&2; exit 1; }
-[ -x "${SUPERVISOR}" ] || {
-    echo "building supervisor first (musl static)" >&2
-    (cd "${REPO_ROOT}" && cargo build --release -p openshell-sandbox --target x86_64-unknown-linux-musl)
-}
+# Always invoke cargo build: it is incremental, and a bare [ -x ] check
+# silently ships a stale binary whenever a shared CARGO_TARGET_DIR already
+# holds one from another checkout (which is exactly how the old-branch
+# supervisor ended up in an image built from current main).
+(cd "${REPO_ROOT}" && cargo build --release -p openshell-sandbox --target x86_64-unknown-linux-musl)
+echo "==> guest supervisor: $("${SUPERVISOR}" --version)"
 
 echo "==> workdir ${WORKDIR}"
 

@@ -23,8 +23,13 @@ on a local k3d cluster with nested KVM, is the **driver lifecycle**:
    gateway's launch authentication (the create-time token would expire under
    the JWT TTL), and a dead `Once` VMI is bounced through `Halted` so start
    actually restarts it.
-4. Failed or completed guests surface as terminal `Error` conditions from
-   the VMI phase instead of provisioning forever.
+4. A guest whose runtime exits is powered off by the guest init (no kernel
+   panic, no hung QEMU): the VMI completes, the driver maps the completed
+   VMI to the terminal `VMFailed` condition, and the sandbox surfaces
+   `Error` instead of provisioning forever. Terminal printable statuses
+   (`CrashLoopBackOff`, `ErrorUnschedulable`, `ErrorPvcNotFound`,
+   `DataVolumeError`) map to `Error` as well; image-pull problems stay
+   transient but name the cause in the condition message.
 5. `sandbox delete` removes the VM, bootstrap Secret and workspace PVC with
    UID preconditions; orphaned companions are deleted and *waited for*
    before recreation.
@@ -119,17 +124,35 @@ k3d image import kvpoc/openshell-sandbox-vm:dev -c kvpoc
 e2e/kubevirt/demo.sh --demo
 ```
 
-Expected output (excerpt):
+Actual output of the current run-demo.sh (the guest boundary integration
+is the follow-up, so the in-guest runtime exits without `--bootstrap`; the
+demo verifies the driver lifecycle including the dead-guest Error path):
 
 ```
-=== 1/5 sandbox create (provisions a KubeVirt VirtualMachine) ===
-=== 2/5 waiting for supervisor connection (gateway-composed Ready) ===
-=== 3/5 exec inside the VM (via the supervisor relay) ===
-hello from Linux 6.12.114-0-virt x86_64 (PID 1: openshell-sandb)
-=== 4/5 stop / start (runStrategy Halted -> Once) ===
-=== 5/5 delete and verify teardown ===
-demo complete: sandbox ran in a KubeVirt VM and tore down cleanly
+=== 1/3 sandbox create and the dead-guest Error path ===
+VMI phase after guest exit (no QEMU kill): Succeeded
+sandbox after guest exit:   Phase: Error
+=== 2/3 stop / start and the dead-Once-VMI bounce ===
+✓ Stopped sandbox kvpoc-demo
+sandbox after stop:   Phase: Stopped
+VMI uid after start #1: 2b5d567d-fa5d-47d8-9b83-4c6ed6acc1b5
+VMI uid after start #2: 8cb0634e-9c17-4f4b-ac21-5ea029476ad9
+dead-Once-VMI bounce verified: Halted -> Once booted a fresh VMI
+=== 3/3 delete and verify teardown ===
+✓ Sandbox kvpoc-demo deletion accepted; cleanup is pending
+demo complete: dead-guest Error path, start/bounce, and teardown verified
 ```
+
+When `BounceHaltedThenOnce` is reachable: the gateway admits `start` from
+the Stopped / Suspended / Completed / Starting phases. After an explicit
+stop the runStrategy is `Halted`, so start takes the single `PatchOnce`
+path. The bounce only fires when the gateway phase admits start while the
+VM still holds `runStrategy: Once` and is not ready — concretely, a second
+`start` issued during the boot window (phase `Starting`), which is how the
+demo exercises it. A dead guest lands the sandbox in `Error` (the gateway
+makes infrastructure errors sticky to driver snapshots), where start is
+rejected with "stop the sandbox before retrying start" — the same
+semantics as a failed pod sandbox.
 
 Run `e2e/kubevirt/demo.sh` (without `--demo`) to keep the gateway in the
 foreground and drive the CLI by hand; it registers gateway `kvpoc`

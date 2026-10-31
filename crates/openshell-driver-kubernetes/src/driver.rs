@@ -4302,20 +4302,22 @@ impl KubernetesComputeDriver {
         // Refresh the guest's sandbox token before booting: the create-time
         // token frozen in the bootstrap Secret expires under the gateway's
         // JWT TTL, leaving a restarted sandbox provisioning forever. The
-        // gateway mints fresh launch credentials for every start.
-        if !encoded_authentication.is_empty()
-            && let Ok(authentication) = serde_json::from_slice::<
-                openshell_core::jwt::SandboxLaunchAuthentication,
-            >(encoded_authentication)
-        {
-            let fresh_token = authentication.supervisor.sandbox_token.expose_secret();
-            crate::kubevirt::refresh_bootstrap_secret_token(
-                &self.client,
-                &namespace,
-                &kube_name,
-                fresh_token,
-            )
-            .await?;
+        // gateway mints fresh launch credentials for every start. A malformed
+        // bundle is an error rather than a silent fallback to the stale
+        // token, which would only fail later inside the guest.
+        match crate::kubevirt::decode_launch_authentication(encoded_authentication) {
+            Ok(Some(authentication)) => {
+                let fresh_token = authentication.supervisor.sandbox_token.expose_secret();
+                crate::kubevirt::refresh_bootstrap_secret_token(
+                    &self.client,
+                    &namespace,
+                    &kube_name,
+                    fresh_token,
+                )
+                .await?;
+            }
+            Ok(None) => {}
+            Err(error) => return Err(error),
         }
         let vm_ready = object
             .data
@@ -4491,6 +4493,12 @@ impl KubernetesComputeDriver {
         .map_err(|err| err.to_string())?;
         let Some(object) = list.items.into_iter().next() else {
             debug!(sandbox_id = %sandbox_id, "VirtualMachine not found (already deleted)");
+            // The VM may have been deleted out of band, which cascades the
+            // VMI and launcher pod but leaves the labelled companions (the
+            // bootstrap Secret holds the sandbox JWT). Clean them up by
+            // label so this path does not leak credentials.
+            self.delete_kubevirt_companions_by_selector(&namespace, &selector)
+                .await;
             return Ok(false);
         };
         let kube_name = object
@@ -4547,6 +4555,40 @@ impl KubernetesComputeDriver {
                 .await;
         }
         Ok(true)
+    }
+
+    /// Best-effort deletion of labelled companion resources (bootstrap
+    /// Secret, workspace PVC) by sandbox-id selector, used when the VM is
+    /// already gone and its name — hence the companions' derived names — is
+    /// unknown.
+    async fn delete_kubevirt_companions_by_selector(&self, namespace: &str, selector: &str) {
+        for (resource, plural) in [("", "secrets"), ("", "persistentvolumeclaims")] {
+            let api_resource = ApiResource {
+                group: resource.to_string(),
+                version: "v1".to_string(),
+                api_version: "v1".to_string(),
+                kind: if plural == "secrets" {
+                    "Secret"
+                } else {
+                    "PersistentVolumeClaim"
+                }
+                .to_string(),
+                plural: plural.to_string(),
+            };
+            let api = Api::<DynamicObject>::namespaced_with(
+                self.client.clone(),
+                namespace,
+                &api_resource,
+            );
+            let Ok(list) = api.list(&ListParams::default().labels(selector)).await else {
+                continue;
+            };
+            for item in list.items {
+                if let Some(name) = item.metadata.name {
+                    let _ = api.delete(&name, &DeleteParams::default()).await;
+                }
+            }
+        }
     }
 
     /// `KubeVirt` runtime mode watch: label-selected watchers for
@@ -4663,6 +4705,11 @@ impl KubernetesComputeDriver {
                             }
                             // Re-emit the paired VM snapshot with the new
                             // phase so terminal VMI states surface promptly.
+                            // PoC note: this re-GETs the VM inside the
+                            // select loop for every VMI event — a plain GET
+                            // per phase change, not a watch join. Fine at
+                            // PoC scale; a shared snapshot cache is the
+                            // follow-up if VMI churn ever matters.
                             if let Some(name) = obj.metadata.name.clone() {
                                 let vm_api = crate::kubevirt::virtual_machine_api(
                                     &watch_client,

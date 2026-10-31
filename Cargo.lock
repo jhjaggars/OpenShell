@@ -4488,7 +4488,6 @@ dependencies = [
 name = "openshell-driver-kubernetes"
 version = "0.0.0"
 dependencies = [
- "base64 0.22.1",
  "bytes",
  "clap",
  "futures",
