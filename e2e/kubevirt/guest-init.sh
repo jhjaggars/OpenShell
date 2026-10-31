@@ -13,8 +13,9 @@
 #                          lost when the VMI goes away)
 #   /dev/vdb  config disk (cloudInitNoCloud ISO rendered from the driver's
 #                          bootstrap Secret; shell-sourceable user-data)
-#   /dev/vdc  workspace   (per-sandbox PVC, ext4, seeded from the image on
-#                          first boot)
+#   workspace  virtio-fs share backed by the per-sandbox PVC (filesystem
+#              PVCs are not exposed as block disks by KubeVirt), mounted at
+#              /sandbox and seeded from the image on first boot
 #
 # After setup it execs the static openshell-sandbox supervisor, which becomes
 # PID 1 and owns the gateway relay, exec, policy, and logs from there on.

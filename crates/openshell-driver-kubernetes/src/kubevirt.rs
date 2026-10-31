@@ -28,12 +28,16 @@
 
 use std::collections::BTreeMap;
 
+use std::time::Duration;
+
 use k8s_openapi::api::core::v1::{
     PersistentVolumeClaim, PersistentVolumeClaimSpec, Secret, VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{Api, ApiResource, ListParams, ObjectList};
+use kube::api::{
+    Api, ApiResource, DeleteParams, ListParams, ObjectList, Patch, PatchParams, Preconditions,
+};
 use kube::core::DynamicObject;
 use kube::{Client, Error as KubeError};
 use openshell_core::driver_utils::{
@@ -47,6 +51,7 @@ use openshell_core::sandbox_env;
 
 use crate::KubernetesDriverError;
 use crate::config::{KubernetesComputeConfig, KubernetesRuntimeMode, WorkspaceMode};
+use crate::driver::KUBE_API_TIMEOUT;
 use crate::driver::{sandbox_annotations, sandbox_labels};
 
 pub const KUBEVIRT_GROUP: &str = "kubevirt.io";
@@ -65,6 +70,42 @@ const KUBEVIRT_KERNEL_ARGS: &str =
 /// gateway's transient-reason vocabulary so the sandbox stays `Provisioning`
 /// rather than `Error`.
 const REASON_VM_NOT_READY: &str = "Starting";
+
+/// Non-transient condition reason: the gateway's phase mapper maps this to
+/// the public `Error` phase rather than leaving the sandbox provisioning.
+const REASON_VM_FAILED: &str = "VMFailed";
+
+/// Classify a terminal VM failure from the printable status and the paired
+/// VMI's phase. Returns a human-readable summary when the VM has failed.
+///
+/// - `CrashLoopBackOff` / `ErrorUnknnown` printable statuses are terminal on
+///   their own (`KubeVirt` reports them for restart-looping and errored VMs).
+/// - A `Failed` or `Succeeded` VMI under a not-ready VM means the guest
+///   exited (kernel panic, supervisor death, or a completed `Once` run);
+///   without the VMI signal those states are indistinguishable from a
+///   not-yet-booted VM, whose printable status is also `Stopped`.
+pub fn terminal_vm_failure(
+    printable_status: &str,
+    vmi_phase: Option<&str>,
+    vm_ready: bool,
+) -> Option<String> {
+    match printable_status {
+        "CrashLoopBackOff" | "ErrorUnknnown" => {
+            return Some(format!("printableStatus {printable_status}"));
+        }
+        _ => {}
+    }
+    if !vm_ready {
+        match vmi_phase {
+            Some("Failed") => return Some("VirtualMachineInstance phase Failed".to_string()),
+            Some("Succeeded") => {
+                return Some("VirtualMachineInstance phase Succeeded (guest exited)".to_string());
+            }
+            _ => {}
+        }
+    }
+    None
+}
 
 /// Namespaced API for `kubevirt.io/v1` `virtualmachines`.
 pub fn virtual_machine_api(client: &Client, namespace: &str) -> Api<DynamicObject> {
@@ -328,10 +369,25 @@ pub fn workspace_pvc_name(kube_name: &str) -> String {
 /// Map a `VirtualMachine` object to a driver sandbox snapshot.
 ///
 /// Backend observations only: the gateway still composes public `Ready` from
-/// the supervisor relay session, exactly as with Sandbox CRs.
-pub fn sandbox_from_vm_object(
+/// the supervisor relay session, exactly as with Sandbox CRs. `vmi_phase` is
+/// the phase of the paired `VirtualMachineInstance` when known (the VMI
+/// carries the same labels); it distinguishes a failed or completed guest
+/// from one that has not booted yet.
+/// Map a `VirtualMachine` object without VMI phase context. Production
+/// paths join the VMI phase (see `sandbox_from_vm_object_with_vmi`); this
+/// convenience wrapper exists for callers with only a VM object at hand.
+#[cfg(test)]
+fn sandbox_from_vm_object(
     namespace: &str,
     obj: DynamicObject,
+) -> Result<(String, Sandbox), String> {
+    sandbox_from_vm_object_with_vmi(namespace, obj, None)
+}
+
+pub fn sandbox_from_vm_object_with_vmi(
+    namespace: &str,
+    obj: DynamicObject,
+    vmi_phase: Option<&str>,
 ) -> Result<(String, Sandbox), String> {
     let kube_name = obj.metadata.name.clone().unwrap_or_default();
 
@@ -353,7 +409,7 @@ pub fn sandbox_from_vm_object(
         .namespace
         .clone()
         .unwrap_or_else(|| namespace.to_string());
-    let status = vm_status_from_object(&obj, &name);
+    let status = vm_status_from_object(&obj, &name, vmi_phase);
 
     Ok((
         kube_name,
@@ -369,13 +425,21 @@ pub fn sandbox_from_vm_object(
 }
 
 /// Translate VM status into driver conditions:
-/// - `status.ready == true` (VMI Running and guest agent reported up) becomes
-///   a backend `Ready=True` observation. Without a connected supervisor
-///   session the gateway still reports `Provisioning`
-///   ("`SupervisorNotConnected`") — the central readiness invariant.
+/// - `status.ready == true` becomes a backend `Ready=True` observation.
+///   Without a connected supervisor session the gateway still reports
+///   `Provisioning` ("`SupervisorNotConnected`") — the central readiness
+///   invariant.
 /// - `runStrategy: Halted` becomes `Suspended=True` (public `Stopped`).
+/// - a terminal VMI phase (`Failed`/`Succeeded` while the VM is not ready) or
+///   a terminal printable status (`CrashLoopBackOff`/`ErrorUnknnown`)
+///   becomes `Ready=False` with the non-transient `VMFailed` reason so the
+///   gateway surfaces the sandbox as `Error` instead of provisioning forever.
 /// - a deletion timestamp becomes `deleting`.
-fn vm_status_from_object(obj: &DynamicObject, sandbox_name: &str) -> Option<SandboxStatus> {
+fn vm_status_from_object(
+    obj: &DynamicObject,
+    sandbox_name: &str,
+    vmi_phase: Option<&str>,
+) -> Option<SandboxStatus> {
     let status = obj.data.get("status")?;
     let status_obj = status.as_object()?;
 
@@ -400,17 +464,23 @@ fn vm_status_from_object(obj: &DynamicObject, sandbox_name: &str) -> Option<Sand
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
 
+    let terminal = terminal_vm_failure(printable, vmi_phase, ready);
+
     let mut conditions = Vec::new();
     conditions.push(DriverCondition {
         r#type: "Ready".to_string(),
         status: if ready { "True" } else { "False" }.to_string(),
         reason: if ready {
             "VMReady".to_string()
+        } else if terminal.is_some() {
+            REASON_VM_FAILED.to_string()
         } else {
             REASON_VM_NOT_READY.to_string()
         },
         message: if ready {
             "VirtualMachineInstance is running".to_string()
+        } else if let Some(terminal) = terminal {
+            format!("VirtualMachine failed: {terminal}")
         } else {
             format!("VirtualMachine status: {printable}")
         },
@@ -718,5 +788,326 @@ mod tests {
         assert_eq!(shell_quote("simple-value.1"), "simple-value.1");
         assert_eq!(shell_quote("has space"), "'has space'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+}
+
+/// How `start` should drive a `runStrategy: Once` VM back to running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KubeVirtStartPlan {
+    /// The VM is not running under `Once` (halted, or never started): a
+    /// single `runStrategy: Once` patch boots a fresh VMI.
+    PatchOnce,
+    /// The VM already says `Once` but is not running (a completed `Once` VMI
+    /// makes an `Once` -> `Once` patch a no-op). Boot requires bouncing
+    /// through `Halted` first so `KubeVirt` discards the dead VMI.
+    BounceHaltedThenOnce,
+}
+
+/// Decide how `start` must drive the VM. Extracted for unit tests: a
+/// not-ready VM whose strategy is already `Once` needs the halt bounce or
+/// the patch is silently ignored.
+#[must_use]
+pub fn kubevirt_start_plan(run_strategy: &str, vm_ready: bool) -> KubeVirtStartPlan {
+    if run_strategy == "Once" && !vm_ready {
+        KubeVirtStartPlan::BounceHaltedThenOnce
+    } else {
+        KubeVirtStartPlan::PatchOnce
+    }
+}
+
+/// Namespaced API for `kubevirt.io/v1` `virtualmachineinstances`.
+pub fn virtual_machine_instance_api(client: &Client, namespace: &str) -> Api<DynamicObject> {
+    Api::namespaced_with(
+        client.clone(),
+        namespace,
+        &ApiResource {
+            group: KUBEVIRT_GROUP.to_string(),
+            version: KUBEVIRT_VERSION.to_string(),
+            api_version: format!("{KUBEVIRT_GROUP}/{KUBEVIRT_VERSION}"),
+            kind: "VirtualMachineInstance".to_string(),
+            plural: "virtualmachineinstances".to_string(),
+        },
+    )
+}
+
+/// Delete an object and wait until it is actually gone from the API.
+///
+/// Companion resources (the bootstrap Secret, the workspace PVC with its
+/// `pvc-protection` finalizer and provisioner cleanup, proxy companions)
+/// take time to terminate; an immediate recreate collides with the dying
+/// object and surfaces as a confusing `AlreadyExists`. Fails with a clear
+/// error when the object is still present after `timeout`.
+pub async fn delete_and_wait(
+    api: &Api<DynamicObject>,
+    name: &str,
+    what: &str,
+    timeout: Duration,
+) -> Result<(), KubernetesDriverError> {
+    let _ = api.delete(name, &DeleteParams::default()).await;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match api.get(name).await {
+            Err(KubeError::Api(err)) if err.code == 404 => return Ok(()),
+            Err(err) => {
+                return Err(KubernetesDriverError::Message(format!(
+                    "failed to confirm deletion of {what} {name}: {err}"
+                )));
+            }
+            Ok(_) => {}
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(KubernetesDriverError::Message(format!(
+                "timed out after {}s waiting for {what} {name} to terminate",
+                timeout.as_secs()
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// A companion resource this create path provisioned, identified by its API
+/// resource and UID so rollback only ever deletes objects this create made
+/// (a concurrent create may have replaced an orphan with its own).
+#[derive(Debug, Clone)]
+pub struct CreatedCompanion {
+    pub resource: ApiResource,
+    pub name: String,
+    pub uid: String,
+}
+
+/// Best-effort rollback of exactly the companions this create made. Deletes
+/// carry UID preconditions, so a companion already replaced by a concurrent
+/// create is left alone.
+pub async fn rollback_companions(client: &Client, namespace: &str, created: &[CreatedCompanion]) {
+    for companion in created {
+        let api =
+            Api::<DynamicObject>::namespaced_with(client.clone(), namespace, &companion.resource);
+        let preconditions = DeleteParams::default().preconditions(Preconditions {
+            uid: Some(companion.uid.clone()),
+            resource_version: None,
+        });
+        let _ = api.delete(&companion.name, &preconditions).await;
+    }
+}
+
+/// Replace the `OPENSHELL_SANDBOX_TOKEN=...` line in a rendered `userData`
+/// bootstrap payload with a freshly minted token. Extracted for unit tests.
+///
+/// A restarted guest re-reads the bootstrap Secret from scratch, so the
+/// token frozen at create time would expire under the gateway's JWT TTL and
+/// leave the restarted sandbox provisioning forever. `start` refreshes it.
+#[must_use]
+pub fn replace_user_data_token(user_data: &str, token: &str) -> String {
+    let mut replaced = false;
+    let mut lines = Vec::new();
+    for line in user_data.lines() {
+        if line.starts_with("OPENSHELL_SANDBOX_TOKEN=") {
+            if !replaced {
+                lines.push(format!("OPENSHELL_SANDBOX_TOKEN={token}"));
+                replaced = true;
+            }
+            // A duplicated token line (never rendered today) collapses to the
+            // fresh value rather than leaking the stale one.
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !replaced {
+        // The create-time render always carries the token line; tolerate a
+        // hand-edited payload by appending it.
+        lines.push(format!("OPENSHELL_SANDBOX_TOKEN={token}"));
+    }
+    lines.join("\n") + "\n"
+}
+
+/// Refresh the bootstrap Secret's sandbox token from the gateway's launch
+/// authentication. Reads the stored `data.userData` (the apiserver persists
+/// `stringData` there), swaps the token line, and patches the Secret.
+pub async fn refresh_bootstrap_secret_token(
+    client: &Client,
+    namespace: &str,
+    kube_name: &str,
+    token: &str,
+) -> Result<(), KubernetesDriverError> {
+    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let secret_name = bootstrap_secret_name(kube_name);
+    let secret = tokio::time::timeout(KUBE_API_TIMEOUT, api.get(&secret_name))
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out reading bootstrap Secret {secret_name}"
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+    // k8s-openapi's `ByteString` already holds the decoded content bytes;
+    // `Secret.data` values arrive base64-decoded.
+    let user_data = secret
+        .data
+        .as_ref()
+        .and_then(|data| data.get("userData"))
+        .and_then(|value| String::from_utf8(value.0.clone()).ok())
+        .unwrap_or_default();
+    let refreshed = replace_user_data_token(&user_data, token);
+    let patch = serde_json::json!({
+        "stringData": {"userData": refreshed}
+    });
+    tokio::time::timeout(
+        KUBE_API_TIMEOUT,
+        api.patch(&secret_name, &PatchParams::default(), &Patch::Merge(&patch)),
+    )
+    .await
+    .map_err(|_| {
+        KubernetesDriverError::Message(format!("timed out patching bootstrap Secret {secret_name}"))
+    })?
+    .map_err(KubernetesDriverError::from_kube)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod kubevirt_review_tests {
+    use super::*;
+    use crate::KubernetesComputeConfig;
+    use openshell_core::proto::compute::v1::DriverSandbox as Sandbox;
+
+    fn review_sandbox() -> Sandbox {
+        Sandbox {
+            id: "sbx-id".to_string(),
+            name: "demo".to_string(),
+            namespace: "kvpoc-sandboxes".to_string(),
+            spec: None,
+            status: None,
+            workspace: "default".to_string(),
+        }
+    }
+
+    fn review_config() -> KubernetesComputeConfig {
+        KubernetesComputeConfig {
+            runtime: KubernetesRuntimeMode::KubeVirt,
+            namespace: "kvpoc-sandboxes".to_string(),
+            gateway_id: "kvpoc".to_string(),
+            grpc_endpoint: "http://172.18.0.1:18085/".to_string(),
+            kubevirt: crate::KubeVirtConfig {
+                guest_image: "kvpoc/openshell-sandbox-vm:dev".to_string(),
+                guest_image_pull_policy: "IfNotPresent".to_string(),
+                cpu_cores: 2,
+                memory: "2Gi".to_string(),
+                workspace_pvc: true,
+            },
+            ..KubernetesComputeConfig::default()
+        }
+    }
+
+    fn review_params<'a>(
+        sandbox: &'a Sandbox,
+        config: &'a KubernetesComputeConfig,
+    ) -> KubeVirtSandboxParams<'a> {
+        KubeVirtSandboxParams {
+            sandbox,
+            config,
+            namespace: "kvpoc-sandboxes",
+            kube_name: "default--demo",
+        }
+    }
+
+    #[test]
+    fn start_plan_bounces_dead_once_vm() {
+        // A completed `Once` VMI makes an `Once`->`Once` patch a no-op.
+        use super::KubeVirtStartPlan;
+        assert_eq!(
+            kubevirt_start_plan("Once", false),
+            KubeVirtStartPlan::BounceHaltedThenOnce
+        );
+        // Halted, never-started, or already-running VMs boot with one patch.
+        assert_eq!(
+            kubevirt_start_plan("Halted", false),
+            KubeVirtStartPlan::PatchOnce
+        );
+        assert_eq!(
+            kubevirt_start_plan("Once", true),
+            KubeVirtStartPlan::PatchOnce
+        );
+        assert_eq!(
+            kubevirt_start_plan("Always", true),
+            KubeVirtStartPlan::PatchOnce
+        );
+    }
+
+    #[test]
+    fn terminal_failure_maps_vmi_and_printable_states() {
+        // A failed or completed VMI under a not-ready VM is terminal.
+        assert!(terminal_vm_failure("Stopped", Some("Failed"), false).is_some());
+        assert!(terminal_vm_failure("Stopped", Some("Succeeded"), false).is_some());
+        // KubeVirt's terminal printable statuses stand on their own.
+        assert!(terminal_vm_failure("CrashLoopBackOff", None, false).is_some());
+        assert!(terminal_vm_failure("ErrorUnknnown", None, false).is_some());
+        // A running VM, a not-yet-booted VM, and a missing VMI are not
+        // terminal: those stay provisioning.
+        assert!(terminal_vm_failure("Running", Some("Running"), true).is_none());
+        assert!(terminal_vm_failure("Stopped", None, false).is_none());
+        assert!(terminal_vm_failure("Starting", Some("Pending"), false).is_none());
+        // A Succeeded VMI under a ready VM is not a failure signal.
+        assert!(terminal_vm_failure("Running", Some("Succeeded"), true).is_none());
+    }
+
+    #[test]
+    fn vm_status_marks_terminal_vmi_as_error() {
+        let cfg = review_config();
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+        vm.data["spec"]["runStrategy"] = serde_json::json!("Once");
+        vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Stopped"});
+
+        // Without the VMI phase the not-ready VM stays transient (Starting).
+        let (_, sbx) =
+            sandbox_from_vm_object_with_vmi("kvpoc-sandboxes", vm.clone(), None).expect("converts");
+        let ready = sbx.status.unwrap().conditions[0].clone();
+        assert_eq!(ready.reason, "Starting");
+
+        // With a Failed VMI the same VM reports the non-transient VMFailed
+        // reason, which the gateway maps to the public Error phase.
+        let (_, sbx) = sandbox_from_vm_object_with_vmi("kvpoc-sandboxes", vm, Some("Failed"))
+            .expect("converts");
+        let ready = sbx.status.unwrap().conditions[0].clone();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "VMFailed");
+        assert!(ready.message.contains("Failed"));
+    }
+
+    #[test]
+    fn replace_user_data_token_swaps_stale_token() {
+        let user_data = "OPENSHELL_SANDBOX_ID=sbx-id\nOPENSHELL_SANDBOX_TOKEN=stale-jwt\nOPENSHELL_ENDPOINT=http://gw\n";
+        let refreshed = replace_user_data_token(user_data, "fresh-jwt");
+        assert!(refreshed.contains("OPENSHELL_SANDBOX_TOKEN=fresh-jwt"));
+        assert!(!refreshed.contains("stale-jwt"));
+        assert!(refreshed.contains("OPENSHELL_SANDBOX_ID=sbx-id"));
+        assert!(refreshed.contains("OPENSHELL_ENDPOINT=http://gw"));
+        assert!(refreshed.ends_with('\n'));
+    }
+
+    #[test]
+    fn replace_user_data_token_appends_when_missing() {
+        let user_data = "OPENSHELL_SANDBOX_ID=sbx-id\n";
+        let refreshed = replace_user_data_token(user_data, "fresh-jwt");
+        assert!(refreshed.contains("OPENSHELL_SANDBOX_TOKEN=fresh-jwt"));
+        assert!(refreshed.contains("OPENSHELL_SANDBOX_ID=sbx-id"));
+    }
+
+    #[test]
+    fn replace_user_data_token_collapses_duplicates() {
+        let user_data = "OPENSHELL_SANDBOX_TOKEN=a\nOPENSHELL_SANDBOX_TOKEN=b\n";
+        let refreshed = replace_user_data_token(user_data, "fresh");
+        assert_eq!(refreshed.matches("OPENSHELL_SANDBOX_TOKEN=").count(), 1);
+        assert!(refreshed.contains("OPENSHELL_SANDBOX_TOKEN=fresh"));
+    }
+
+    #[test]
+    fn https_endpoint_is_rejected_with_clear_message() {
+        let mut cfg = review_config();
+        cfg.grpc_endpoint = "https://openshell-gateway.ns.svc:8080".to_string();
+        let err = cfg.validate_kubevirt_config().expect_err("https rejected");
+        assert!(err.contains("https://"), "message should name TLS: {err}");
+        // A plain http endpoint with any host shape passes endpoint checks.
+        cfg.grpc_endpoint = "http://openshell-gateway.ns.svc:8080".to_string();
+        assert!(cfg.validate_kubevirt_config().is_ok());
     }
 }

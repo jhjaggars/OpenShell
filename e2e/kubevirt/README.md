@@ -4,26 +4,35 @@ This directory contains the proof of concept for running OpenShell sandboxes as
 **KubeVirt VirtualMachines** through the Kubernetes compute driver, instead of
 `agents.x-k8s.io` Sandbox CRs reconciled into pods.
 
-It demonstrates, end to end on a local k3d cluster with nested KVM:
+This is the `-v2` port of the PoC onto current `main`. Main has since
+replaced the supervisor/guest split the original branch was built on with
+the **isolation boundary architecture** (an in-workload `openshell-sandbox`
+boundary plus a host-side `openshell-supervisor`; see
+`crates/openshell-sandbox-backend`). The guest integration with that
+architecture is the follow-up (below). What this branch demonstrates today,
+on a local k3d cluster with nested KVM, is the **driver lifecycle**:
 
 1. `openshell sandbox create` provisions a `kubevirt.io/v1` `VirtualMachine`
    (plus a bootstrap Secret and a workspace PVC) carrying the standard
-   OpenShell ownership labels.
-2. The guest boots from a purpose-built containerDisk, a small init script
-   consumes the driver-rendered bootstrap config, and the static
-   `openshell-sandbox` supervisor takes over as guest PID 1.
-3. The supervisor connects back to the gateway with the pre-minted sandbox
-   JWT (same delivery model as the libkrun VM driver); the gateway composes
-   `Ready` from that session.
-4. `openshell sandbox exec` runs a command **inside the VM** through the
-   supervisor relay (SSH over the relay — no KubeVirt console involved).
-5. `sandbox stop` / `start` maps to the VM `runStrategy` (`Halted`/`Once`);
-   `sandbox delete` removes the VM, bootstrap Secret and workspace PVC.
+   OpenShell ownership labels, and returns the VM UID as the runtime
+   identity.
+2. The guest boots from a purpose-built containerDisk (a small init script
+   consumes the driver-rendered bootstrap config).
+3. `sandbox stop` / `start` maps to the VM `runStrategy`
+   (`Halted`/`Once`); start refreshes the guest's sandbox token from the
+   gateway's launch authentication (the create-time token would expire under
+   the JWT TTL), and a dead `Once` VMI is bounced through `Halted` so start
+   actually restarts it.
+4. Failed or completed guests surface as terminal `Error` conditions from
+   the VMI phase instead of provisioning forever.
+5. `sandbox delete` removes the VM, bootstrap Secret and workspace PVC with
+   UID preconditions; orphaned companions are deleted and *waited for*
+   before recreation.
 
 Everything here is explicitly **proof-of-concept quality**: single shared
-namespace mode, plaintext gateway, no mTLS, no GPU, no NetworkPolicy coverage
-for virt-launcher pods, no migration handling, and no support for arbitrary
-OCI sandbox images as VM disks (the guest image is purpose-built).
+namespace mode, plaintext http gateway only, no mTLS, no GPU, no NetworkPolicy
+coverage for virt-launcher pods, no migration handling, and no support for
+arbitrary OCI sandbox images as VM disks (the guest image is purpose-built).
 
 ## How it works
 
@@ -171,3 +180,26 @@ material); delete it to fully reset.
   `runtimeBackend: VirtualMachine` Sandbox CR extension (unmerged POC fork).
   If that lands, the driver could switch from direct VM creation back to the
   Sandbox CR with a VM workload.
+
+## Follow-up: guest integration with main's boundary architecture
+
+The original branch's guest model (a supervisor binary as guest PID 1
+connecting to the gateway with the pre-minted sandbox JWT, plus a per-sandbox
+network-enforcement proxy pod) no longer exists on main. The remaining work,
+modeled on how `crates/openshell-driver-vm` now runs its host supervisor:
+
+- The guest runs the in-workload `openshell-sandbox` boundary; the driver
+  injects a `BoundaryConfig` (listener TLS material + connection details)
+  through the bootstrap channel instead of raw environment.
+- A supervisor runs in a **pod** (per-sandbox, or the gateway-shared
+  supervisor) with `--role=isolation-backend`, `--backend-descriptor-file`
+  and `--auth-bundle-file` mounted from driver-created Secrets — the token
+  then never appears in a pod spec and refreshes by patching the Secret,
+  matching main's `SharedSupervisorConfig` token flow.
+- The network-enforcement proxy (L4/L7 policy, TLS interception) lives with
+  that supervisor, its CA delivered to the guest through the boundary
+  channel, replacing the original branch's per-sandbox proxy pod, its
+  NetworkPolicy fence, and the `PROXY_BIND_ADDR` standalone-bind mode.
+- DNS tunnelling through kube-dns and the deliberate workload-to-gateway
+  egress allowance are inherited concerns of that topology and must be
+  documented with it.

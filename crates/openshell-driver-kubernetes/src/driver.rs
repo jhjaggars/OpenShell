@@ -592,7 +592,17 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
 /// Timeout for individual Kubernetes API calls (create, delete, get).
 /// This prevents gRPC handlers from blocking indefinitely when the k8s
 /// API server is unreachable or slow.
-const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound on waiting for a companion resource (bootstrap Secret,
+/// workspace PVC) to terminate during create-path orphan cleanup. Bound PVCs
+/// carry the `pvc-protection` finalizer and provisioner cleanup, so this is
+/// deliberately generous.
+const COMPANION_DELETE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Upper bound on waiting for a dead `VirtualMachineInstance` to terminate
+/// during the start-path halt bounce.
+const VMI_TERMINATION_TIMEOUT: Duration = Duration::from_mins(2);
 /// How long an operator-mode workspace check waits for the namespace label
 /// watcher's first full listing before reporting the driver unavailable.
 const OPERATOR_ALLOWLIST_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2316,13 +2326,26 @@ impl KubernetesComputeDriver {
             )
             .await
             .map_err(|err| err.to_string())?;
+            let vmi_phases = self
+                .kubevirt_vmi_phases(&namespace, &self.openshell_sandbox_selector())
+                .await;
             return Ok(list
                 .items
                 .into_iter()
                 .filter_map(|obj| {
-                    crate::kubevirt::sandbox_from_vm_object(&namespace, obj)
-                        .map(|(_, sandbox)| sandbox)
-                        .ok()
+                    let phase = obj
+                        .metadata
+                        .name
+                        .as_deref()
+                        .and_then(|name| vmi_phases.get(name))
+                        .cloned();
+                    crate::kubevirt::sandbox_from_vm_object_with_vmi(
+                        &namespace,
+                        obj,
+                        phase.as_deref(),
+                    )
+                    .map(|(_, sandbox)| sandbox)
+                    .ok()
                 })
                 .collect());
         }
@@ -3959,9 +3982,9 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
-    /// `KubeVirt` runtime mode: create the bootstrap Secret, workspace PVC,
-    /// proxy-pod companions and `VirtualMachine` for one sandbox. Returns the
-    /// VM's UID as the opaque runtime identity (stable across stop/start).
+    /// `KubeVirt` runtime mode: create the bootstrap Secret, workspace PVC
+    /// and `VirtualMachine` for one sandbox. Returns the VM's UID as the
+    /// opaque runtime identity (stable across stop/start).
     async fn create_kubevirt_sandbox(
         &self,
         sandbox: &Sandbox,
@@ -3992,9 +4015,7 @@ impl KubernetesComputeDriver {
 
         let vm_api = crate::kubevirt::virtual_machine_api(&self.client, &namespace);
         // The VM is the owning resource: if it already exists this sandbox
-        // already exists. Companion Secret/PVC are replaced when orphaned
-        // (e.g. after an out-of-band `kubectl delete vm`), so a retried
-        // create converges instead of colliding with stale labelled state.
+        // already exists.
         match tokio::time::timeout(KUBE_API_TIMEOUT, vm_api.get(&kube_name)).await {
             Ok(Ok(_)) => return Err(KubernetesDriverError::AlreadyExists),
             Ok(Err(KubeError::Api(err))) if err.code == 404 => {}
@@ -4007,23 +4028,46 @@ impl KubernetesComputeDriver {
             }
         }
 
+        // Companions this create provisions, for UID-guarded rollback. A
+        // concurrent create may own same-named replacements of orphans, so
+        // rollback only ever deletes objects this create made.
+        let mut created: Vec<crate::kubevirt::CreatedCompanion> = Vec::new();
+
         // Bootstrap Secret first: the VM references it and the KubeVirt
-        // controller waits for referenced volumes to exist.
-        let secret = crate::kubevirt::render_bootstrap_secret(&params);
+        // controller waits for referenced volumes to exist. An orphan from an
+        // out-of-band VM deletion is deleted and waited for, so the recreate
+        // cannot collide with a terminating object.
+        let core_secret_resource = ApiResource {
+            group: String::new(),
+            version: "v1".to_string(),
+            api_version: "v1".to_string(),
+            kind: "Secret".to_string(),
+            plural: "secrets".to_string(),
+        };
         let secret_api: Api<Secret> = Api::namespaced(self.client.clone(), &namespace);
-        let _ = secret_api
-            .delete(
-                &crate::kubevirt::bootstrap_secret_name(&kube_name),
-                &DeleteParams::default(),
-            )
-            .await;
+        crate::kubevirt::delete_and_wait(
+            &Api::<DynamicObject>::namespaced_with(
+                self.client.clone(),
+                &namespace,
+                &core_secret_resource,
+            ),
+            &crate::kubevirt::bootstrap_secret_name(&kube_name),
+            "bootstrap Secret",
+            COMPANION_DELETE_TIMEOUT,
+        )
+        .await?;
+        let secret = crate::kubevirt::render_bootstrap_secret(&params);
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
             secret_api.create(&PostParams::default(), &secret),
         )
         .await
         {
-            Ok(Ok(_)) => {}
+            Ok(Ok(result)) => created.push(crate::kubevirt::CreatedCompanion {
+                resource: core_secret_resource,
+                name: crate::kubevirt::bootstrap_secret_name(&kube_name),
+                uid: result.metadata.uid.unwrap_or_default(),
+            }),
             Ok(Err(KubeError::Api(err))) if err.code == 409 => {
                 return Err(KubernetesDriverError::AlreadyExists);
             }
@@ -4037,27 +4081,52 @@ impl KubernetesComputeDriver {
         }
 
         if self.config.kubevirt.workspace_pvc {
-            let pvc = crate::kubevirt::render_workspace_pvc(&params);
+            let core_pvc_resource = ApiResource {
+                group: String::new(),
+                version: "v1".to_string(),
+                api_version: "v1".to_string(),
+                kind: "PersistentVolumeClaim".to_string(),
+                plural: "persistentvolumeclaims".to_string(),
+            };
             let pvc_api: Api<PersistentVolumeClaim> =
                 Api::namespaced(self.client.clone(), &namespace);
-            let _ = pvc_api
-                .delete(
-                    &crate::kubevirt::workspace_pvc_name(&kube_name),
-                    &DeleteParams::default(),
-                )
-                .await;
+            // Bound PVCs terminate slowly (pvc-protection finalizer plus
+            // provisioner cleanup); wait out the deletion before recreating.
+            crate::kubevirt::delete_and_wait(
+                &Api::<DynamicObject>::namespaced_with(
+                    self.client.clone(),
+                    &namespace,
+                    &core_pvc_resource,
+                ),
+                &crate::kubevirt::workspace_pvc_name(&kube_name),
+                "workspace PVC",
+                COMPANION_DELETE_TIMEOUT,
+            )
+            .await?;
+            let pvc = crate::kubevirt::render_workspace_pvc(&params);
             match tokio::time::timeout(
                 KUBE_API_TIMEOUT,
                 pvc_api.create(&PostParams::default(), &pvc),
             )
             .await
             {
-                Ok(Ok(_)) => {}
+                Ok(Ok(result)) => created.push(crate::kubevirt::CreatedCompanion {
+                    resource: core_pvc_resource,
+                    name: crate::kubevirt::workspace_pvc_name(&kube_name),
+                    uid: result.metadata.uid.unwrap_or_default(),
+                }),
                 Ok(Err(KubeError::Api(err))) if err.code == 409 => {
+                    // A concurrent create owns the claim; roll back only what
+                    // this create made (the Secret above).
+                    crate::kubevirt::rollback_companions(&self.client, &namespace, &created).await;
                     return Err(KubernetesDriverError::AlreadyExists);
                 }
-                Ok(Err(err)) => return Err(KubernetesDriverError::from_kube(err)),
+                Ok(Err(err)) => {
+                    crate::kubevirt::rollback_companions(&self.client, &namespace, &created).await;
+                    return Err(KubernetesDriverError::from_kube(err));
+                }
                 Err(_elapsed) => {
+                    crate::kubevirt::rollback_companions(&self.client, &namespace, &created).await;
                     return Err(KubernetesDriverError::Message(format!(
                         "timed out after {}s creating workspace PVC",
                         KUBE_API_TIMEOUT.as_secs()
@@ -4067,7 +4136,7 @@ impl KubernetesComputeDriver {
         }
 
         let vm = crate::kubevirt::render_virtual_machine(&params);
-        let created = match tokio::time::timeout(
+        let created_vm = match tokio::time::timeout(
             KUBE_API_TIMEOUT,
             vm_api.create(&PostParams::default(), &vm),
         )
@@ -4098,44 +4167,20 @@ impl KubernetesComputeDriver {
             ))),
         };
 
-        let vm = match created {
-            Ok(vm) => vm,
+        match created_vm {
+            Ok(vm) => Ok(vm.metadata.uid.unwrap_or_else(|| kube_name.clone())),
             Err(error) => {
-                // The VM is the owning resource: if it could not be created,
-                // roll back the companion Secret and PVC so a retried create
-                // does not collide with orphaned state.
-                let secret_api: Api<Secret> = Api::namespaced(self.client.clone(), &namespace);
-                let _ = secret_api
-                    .delete(
-                        &crate::kubevirt::bootstrap_secret_name(&kube_name),
-                        &DeleteParams::default(),
-                    )
-                    .await;
-                if self.config.kubevirt.workspace_pvc {
-                    let pvc_api: Api<PersistentVolumeClaim> =
-                        Api::namespaced(self.client.clone(), &namespace);
-                    let _ = pvc_api
-                        .delete(
-                            &crate::kubevirt::workspace_pvc_name(&kube_name),
-                            &DeleteParams::default(),
-                        )
-                        .await;
-                }
-                return Err(error);
+                // The VM is the owning resource: when it could not be
+                // created, roll back the companions this create made so a
+                // retried create does not collide with orphaned state.
+                crate::kubevirt::rollback_companions(&self.client, &namespace, &created).await;
+                Err(error)
             }
-        };
-
-        Ok(vm
-            .metadata
-            .uid
-            .unwrap_or_else(|| kube_name.clone()))
+        }
     }
 
     /// `KubeVirt` runtime mode lookup by sandbox-id label.
-    async fn get_kubevirt_sandbox(
-        &self,
-        sandbox_id: &str,
-    ) -> Result<Option<Sandbox>, String> {
+    async fn get_kubevirt_sandbox(&self, sandbox_id: &str) -> Result<Option<Sandbox>, String> {
         let namespace = crate::kubevirt::kubevirt_namespace(&self.config)?;
         let api = crate::kubevirt::virtual_machine_api(&self.client, &namespace);
         let selector = self.sandbox_lookup_selector(sandbox_id);
@@ -4151,21 +4196,76 @@ impl KubernetesComputeDriver {
             )
         })?
         .map_err(|err| err.to_string())?;
-        Ok(list
-            .items
-            .into_iter()
-            .next()
-            .and_then(|obj| crate::kubevirt::sandbox_from_vm_object(&namespace, obj).ok()
-                .map(|(_, sandbox)| sandbox)))
+        let Some(vm) = list.items.into_iter().next() else {
+            return Ok(None);
+        };
+        let vmi_phase = self
+            .kubevirt_vmi_phase(&namespace, vm.metadata.name.as_deref().unwrap_or_default())
+            .await;
+        Ok(
+            crate::kubevirt::sandbox_from_vm_object_with_vmi(&namespace, vm, vmi_phase.as_deref())
+                .ok()
+                .map(|(_, sandbox)| sandbox),
+        )
     }
 
-    /// `KubeVirt` runtime mode start: patch the VM run strategy to `Once`.
-    /// The launch authentication and runtime-generation identity are
-    /// handled by the follow-up token-refresh work.
+    /// Phase of the paired `VirtualMachineInstance` (same name as the VM),
+    /// when it exists. `None` covers both a missing and an unreadable VMI.
+    async fn kubevirt_vmi_phase(&self, namespace: &str, kube_name: &str) -> Option<String> {
+        let api = crate::kubevirt::virtual_machine_instance_api(&self.client, namespace);
+        let vmi = tokio::time::timeout(KUBE_API_TIMEOUT, api.get(kube_name))
+            .await
+            .ok()?
+            .ok()?;
+        vmi.data
+            .get("status")
+            .and_then(|status| status.get("phase"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// Map of VM name -> VMI phase for all driver-owned VMIs matching
+    /// `selector` (the VMI carries the VM template labels).
+    async fn kubevirt_vmi_phases(
+        &self,
+        namespace: &str,
+        selector: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let api = crate::kubevirt::virtual_machine_instance_api(&self.client, namespace);
+        let Ok(list) = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            api.list(&ListParams::default().labels(selector)),
+        )
+        .await
+        else {
+            return std::collections::HashMap::new();
+        };
+        let Ok(list) = list else {
+            return std::collections::HashMap::new();
+        };
+        list.items
+            .into_iter()
+            .filter_map(|vmi| {
+                let name = vmi.metadata.name?;
+                let phase = vmi
+                    .data
+                    .get("status")?
+                    .get("phase")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)?;
+                Some((name, phase))
+            })
+            .collect()
+    }
+
+    /// `KubeVirt` runtime mode start: boot the VM. A simple `Once` patch
+    /// boots a halted or never-started VM, but a completed `Once` VMI makes
+    /// `Once` -> `Once` a silent no-op, so a not-ready `Once` VM is bounced
+    /// through `Halted` first.
     async fn start_kubevirt_sandbox(
         &self,
         sandbox_id: &str,
-        _encoded_authentication: &[u8],
+        encoded_authentication: &[u8],
         _encoded_expected_runtime_identity: &str,
     ) -> Result<String, KubernetesDriverError> {
         let namespace = crate::kubevirt::kubevirt_namespace(&self.config)
@@ -4189,33 +4289,103 @@ impl KubernetesComputeDriver {
             .into_iter()
             .next()
             .ok_or(KubernetesDriverError::NotFound)?;
+        let kube_name = object.metadata.name.clone().ok_or_else(|| {
+            KubernetesDriverError::Message("VirtualMachine has no name".to_string())
+        })?;
+        let run_strategy = object
+            .data
+            .get("spec")
+            .and_then(|spec| spec.get("runStrategy"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Once");
 
-        let patch = serde_json::json!({"spec": {"runStrategy": "Once"}});
-        tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            api.patch(
-                object.metadata.name.as_deref().unwrap_or_default(),
-                &PatchParams::default(),
-                &Patch::Merge(&patch),
-            ),
-        )
-        .await
-        .map_err(|_| {
-            KubernetesDriverError::Message(format!(
-                "timed out after {}s patching VirtualMachine run strategy",
-                KUBE_API_TIMEOUT.as_secs()
-            ))
-        })?
-        .map_err(KubernetesDriverError::from_kube)?;
+        // Refresh the guest's sandbox token before booting: the create-time
+        // token frozen in the bootstrap Secret expires under the gateway's
+        // JWT TTL, leaving a restarted sandbox provisioning forever. The
+        // gateway mints fresh launch credentials for every start.
+        if !encoded_authentication.is_empty()
+            && let Ok(authentication) = serde_json::from_slice::<
+                openshell_core::jwt::SandboxLaunchAuthentication,
+            >(encoded_authentication)
+        {
+            let fresh_token = authentication.supervisor.sandbox_token.expose_secret();
+            crate::kubevirt::refresh_bootstrap_secret_token(
+                &self.client,
+                &namespace,
+                &kube_name,
+                fresh_token,
+            )
+            .await?;
+        }
+        let vm_ready = object
+            .data
+            .get("status")
+            .and_then(|status| status.get("ready"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        let patch_strategy = |strategy: String| {
+            let api = api.clone();
+            let kube_name = kube_name.clone();
+            async move {
+                let patch = serde_json::json!({"spec": {"runStrategy": strategy}});
+                tokio::time::timeout(
+                    KUBE_API_TIMEOUT,
+                    api.patch(&kube_name, &PatchParams::default(), &Patch::Merge(&patch)),
+                )
+                .await
+                .map_err(|_| {
+                    KubernetesDriverError::Message(format!(
+                        "timed out after {}s patching VirtualMachine run strategy",
+                        KUBE_API_TIMEOUT.as_secs()
+                    ))
+                })?
+                .map_err(KubernetesDriverError::from_kube)
+            }
+        };
+
+        match crate::kubevirt::kubevirt_start_plan(run_strategy, vm_ready) {
+            crate::kubevirt::KubeVirtStartPlan::PatchOnce => {
+                patch_strategy("Once".to_string()).await?;
+            }
+            crate::kubevirt::KubeVirtStartPlan::BounceHaltedThenOnce => {
+                // A completed `Once` VMI makes an `Once`->`Once` patch a
+                // no-op: halt first so KubeVirt discards the dead VMI, wait
+                // for it to go away, then boot a fresh one.
+                patch_strategy("Halted".to_string()).await?;
+                let vmi_api =
+                    crate::kubevirt::virtual_machine_instance_api(&self.client, &namespace);
+                let deadline = tokio::time::Instant::now() + VMI_TERMINATION_TIMEOUT;
+                loop {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        return Err(KubernetesDriverError::Message(
+                            "timed out waiting for the completed VirtualMachineInstance to                              terminate before restart"
+                                .to_string(),
+                        ));
+                    }
+                    match tokio::time::timeout(
+                        KUBE_API_TIMEOUT.min(deadline.saturating_duration_since(now)),
+                        vmi_api.get(&kube_name),
+                    )
+                    .await
+                    {
+                        Ok(Err(KubeError::Api(err))) if err.code == 404 => break,
+                        Ok(Err(err)) => return Err(KubernetesDriverError::from_kube(err)),
+                        Ok(_) | Err(_) => {}
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                patch_strategy("Once".to_string()).await?;
+            }
+        }
 
         info!(
             sandbox_id,
-            "Patched KubeVirt VirtualMachine run strategy to Once"
+            vm = %kube_name,
+            "Patched KubeVirt VirtualMachine run strategy to start"
         );
-        Ok(object
-            .metadata
-            .uid
-            .unwrap_or_default())
+        Ok(object.metadata.uid.unwrap_or_default())
     }
 
     /// `KubeVirt` runtime mode stop: halt the VM and wait for the guest to go
@@ -4243,11 +4413,9 @@ impl KubernetesComputeDriver {
             .into_iter()
             .next()
             .ok_or(KubernetesDriverError::NotFound)?;
-        let kube_name = object
-            .metadata
-            .name
-            .clone()
-            .ok_or_else(|| KubernetesDriverError::Message("VirtualMachine has no name".to_string()))?;
+        let kube_name = object.metadata.name.clone().ok_or_else(|| {
+            KubernetesDriverError::Message("VirtualMachine has no name".to_string())
+        })?;
 
         let patch = serde_json::json!({"spec": {"runStrategy": "Halted"}});
         tokio::time::timeout(
@@ -4270,7 +4438,7 @@ impl KubernetesComputeDriver {
             "Patched KubeVirt VirtualMachine run strategy"
         );
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let deadline = tokio::time::Instant::now() + VMI_TERMINATION_TIMEOUT;
         let mut poll_interval = Duration::from_millis(500);
         loop {
             let now = tokio::time::Instant::now();
@@ -4338,7 +4506,10 @@ impl KubernetesComputeDriver {
         info!(sandbox_id = %sandbox_id, vm = %kube_name, "Deleting KubeVirt VirtualMachine sandbox");
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
-            api.delete(&kube_name, &DeleteParams::default().preconditions(preconditions)),
+            api.delete(
+                &kube_name,
+                &DeleteParams::default().preconditions(preconditions),
+            ),
         )
         .await
         {
@@ -4378,62 +4549,147 @@ impl KubernetesComputeDriver {
         Ok(true)
     }
 
-    /// `KubeVirt` runtime mode watch: label-selected VirtualMachine watcher.
-    /// The KubeVirt controller updates `VM.status` as the VMI progresses, so
-    /// VM objects alone carry enough signal for driver snapshots; the
-    /// gateway still composes public readiness from the supervisor session.
+    /// `KubeVirt` runtime mode watch: label-selected watchers for
+    /// `VirtualMachine` and `VirtualMachineInstance` objects. The `KubeVirt`
+    /// controller updates `VM.status` as the VMI progresses; the VMI stream
+    /// additionally supplies the VMI phase, which distinguishes a failed or
+    /// completed guest from one that has not booted yet (both show
+    /// `printableStatus: Stopped`). The gateway still composes public
+    /// readiness from the supervisor session.
     #[allow(clippy::unused_async)]
     async fn watch_sandboxes_kubevirt(&self) -> Result<WatchStream, String> {
         let namespace = crate::kubevirt::kubevirt_namespace(&self.config)?;
+        let selector = openshell_sandbox_label_selector();
         let vm_api = crate::kubevirt::virtual_machine_api(&self.watch_client.clone(), &namespace);
-        let watcher_config = watcher::Config::default().labels(&openshell_sandbox_label_selector());
+        let instance_api =
+            crate::kubevirt::virtual_machine_instance_api(&self.watch_client.clone(), &namespace);
+        let watcher_config = watcher::Config::default().labels(&selector);
         let mut vm_stream = recovering_watcher_stream(
-            watcher::watcher(vm_api, watcher_config),
+            watcher::watcher(vm_api, watcher_config.clone()),
             "kubevirt-virtualmachine",
         )
         .boxed();
+        let mut instance_stream = recovering_watcher_stream(
+            watcher::watcher(instance_api, watcher_config),
+            "kubevirt-virtualmachineinstance",
+        )
+        .boxed();
         let (tx, rx) = mpsc::channel(256);
+        let watch_client = self.watch_client.clone();
 
         tokio::spawn(async move {
+            async fn emit(
+                vm: DynamicObject,
+                namespace: &str,
+                vmi_phases: &std::collections::HashMap<String, String>,
+                tx: &mpsc::Sender<Result<WatchSandboxesEvent, KubernetesDriverError>>,
+            ) -> bool {
+                let Some(kube_name) = vm.metadata.name.clone() else {
+                    return true;
+                };
+                let phase = vmi_phases.get(&kube_name).cloned();
+                let Ok((_, sandbox)) = crate::kubevirt::sandbox_from_vm_object_with_vmi(
+                    namespace,
+                    vm,
+                    phase.as_deref(),
+                ) else {
+                    return true;
+                };
+                let event = WatchSandboxesEvent {
+                    payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                        WatchSandboxesSandboxEvent {
+                            sandbox: Some(sandbox),
+                        },
+                    )),
+                };
+                tx.send(Ok(event)).await.is_ok()
+            }
+
+            // VM name -> current VMI phase, maintained by the instance
+            // stream.
+            let mut vmi_phases: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+
             loop {
-                match vm_stream.next().await {
-                    Some(Event::Apply(obj) | Event::InitApply(obj)) => {
-                        if let Ok((_, sandbox)) =
-                            crate::kubevirt::sandbox_from_vm_object(&namespace, obj)
-                        {
-                            let event = WatchSandboxesEvent {
-                                payload: Some(watch_sandboxes_event::Payload::Sandbox(
-                                    WatchSandboxesSandboxEvent { sandbox: Some(sandbox) },
-                                )),
-                            };
-                            if tx.send(Ok(event)).await.is_err() {
+                tokio::select! {
+                    event = vm_stream.next() => match event {
+                        Some(Event::Apply(obj) | Event::InitApply(obj)) => {
+                            if !emit(obj, &namespace, &vmi_phases, &tx).await {
+                                break;
+                            }
+                        }
+                        Some(Event::Delete(obj)) => {
+                            if is_openshell_managed(&obj)
+                                && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
+                            {
+                                let event = WatchSandboxesEvent {
+                                    payload: Some(watch_sandboxes_event::Payload::Deleted(
+                                        WatchSandboxesDeletedEvent { sandbox_id },
+                                    )),
+                                };
+                                if tx.send(Ok(event)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Some(Event::Init | Event::InitDone) => {}
+                        None => {
+                            let _ = tx
+                                .send(Err(KubernetesDriverError::Message(
+                                    "VirtualMachine watcher stream ended unexpectedly".to_string(),
+                                )))
+                                .await;
+                            break;
+                        }
+                    },
+                    vmi_event = instance_stream.next() => {
+                        let is_delete = matches!(vmi_event, Some(Event::Delete(_)));
+                        match vmi_event {
+                            Some(Event::Apply(obj) | Event::InitApply(obj) | Event::Delete(obj)) => {
+                            if let Some(name) = obj.metadata.name.clone() {
+                                if is_delete {
+                                    vmi_phases.remove(&name);
+                                } else {
+                                    let phase = obj
+                                        .data
+                                        .get("status")
+                                        .and_then(|status| status.get("phase"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_string);
+                                    if let Some(phase) = phase {
+                                        vmi_phases.insert(name, phase);
+                                    }
+                                }
+                            }
+                            // Re-emit the paired VM snapshot with the new
+                            // phase so terminal VMI states surface promptly.
+                            if let Some(name) = obj.metadata.name.clone() {
+                                let vm_api = crate::kubevirt::virtual_machine_api(
+                                    &watch_client,
+                                    &namespace,
+                                );
+                                if let Ok(vm) =
+                                    tokio::time::timeout(KUBE_API_TIMEOUT, vm_api.get(&name)).await
+                                    && let Ok(vm) = vm
+                                    && !emit(vm, &namespace, &vmi_phases, &tx).await
+                                {
+                                    break;
+                                }
+                            }
+                            }
+                            Some(Event::Init | Event::InitDone) => {}
+                            None => {
+                                let _ = tx
+                                    .send(Err(KubernetesDriverError::Message(
+                                        "VirtualMachineInstance watcher stream ended unexpectedly"
+                                            .to_string(),
+                                    )))
+                                    .await;
                                 break;
                             }
                         }
                     }
-                    Some(Event::Delete(obj)) => {
-                        if is_openshell_managed(&obj)
-                            && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
-                        {
-                            let event = WatchSandboxesEvent {
-                                payload: Some(watch_sandboxes_event::Payload::Deleted(
-                                    WatchSandboxesDeletedEvent { sandbox_id },
-                                )),
-                            };
-                            if tx.send(Ok(event)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Some(Event::Init | Event::InitDone) => {}
-                    None => {
-                        let _ = tx
-                            .send(Err(KubernetesDriverError::Message(
-                                "VirtualMachine watcher stream ended unexpectedly".to_string(),
-                            )))
-                            .await;
-                        break;
-                    }
+                    () = tx.closed() => break,
                 }
             }
         });
@@ -6693,7 +6949,10 @@ fn openshell_sandbox_selector_for(gateway_id: &str) -> String {
     selector
 }
 
-pub(crate) fn sandbox_labels(sandbox: &Sandbox, gateway_id: Option<&str>) -> BTreeMap<String, String> {
+pub(crate) fn sandbox_labels(
+    sandbox: &Sandbox,
+    gateway_id: Option<&str>,
+) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_SANDBOX_ID.to_string(), sandbox.id.clone());
     labels.insert(LABEL_SANDBOX_NAME.to_string(), sandbox.name.clone());

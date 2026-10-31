@@ -42,7 +42,7 @@ BRIDGE_IP="$(docker network inspect k3d-kvpoc -f '{{(index .IPAM.Config 0).Gatew
 GRPC_ENDPOINT="http://${BRIDGE_IP}:${PORT}"
 
 echo "==> Building openshell-gateway and openshell CLI"
-cargo build --release -p openshell-server -p openshell-cli
+cargo build --release -p openshell-gateway -p openshell-cli
 
 TLS_DIR="${STATE_DIR}/tls"
 if [ ! -f "${TLS_DIR}/jwt/signing.pem" ]; then
@@ -59,10 +59,11 @@ CONFIG_PATH="${STATE_DIR}/gateway.toml"
 cat >"${CONFIG_PATH}" <<EOF
 # OpenShell gateway for the KubeVirt compute-driver PoC (e2e/kubevirt/).
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
-compute_drivers = ["kubernetes"]
+# Driver selection moved to the OPENSHELL_DRIVERS environment variable on
+# current main (a single `compute_driver` file key also exists).
 disable_tls = true
 # 0.0.0.0: guests reach the gateway through the k3d docker bridge
 # (http://172.18.0.1:PORT); the CLI uses 127.0.0.1.
@@ -92,8 +93,18 @@ cpu_cores = 1
 memory = "1Gi"
 EOF
 
-# Register the gateway for the CLI (plaintext, like gateway-vm.sh).
+# Register the gateway for the CLI (plaintext, like gateway-vm.sh). The
+# previous active gateway selection is restored when the demo exits.
 CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
+ACTIVE_GATEWAY_PATH="${CONFIG_HOME}/openshell/active_gateway"
+PREVIOUS_ACTIVE_GATEWAY="$(cat "${ACTIVE_GATEWAY_PATH}" 2>/dev/null || true)"
+restore_active_gateway() {
+    if [ -n "${PREVIOUS_ACTIVE_GATEWAY}" ]; then
+        printf '%s' "${PREVIOUS_ACTIVE_GATEWAY}" > "${ACTIVE_GATEWAY_PATH}"
+    else
+        rm -f "${ACTIVE_GATEWAY_PATH}"
+    fi
+}
 GATEWAY_DIR="${CONFIG_HOME}/openshell/gateways/${GATEWAY_NAME}"
 mkdir -p "${GATEWAY_DIR}"
 cat >"${GATEWAY_DIR}/metadata.json" <<EOF
@@ -114,6 +125,7 @@ cleanup() {
     if [ "${RUN_DEMO}" = "1" ] && [ -n "${GATEWAY_PID:-}" ]; then
         kill "${GATEWAY_PID}" 2>/dev/null || true
     fi
+    restore_active_gateway
 }
 trap cleanup EXIT
 
@@ -125,13 +137,11 @@ echo "  namespace:  ${SANDBOX_NAMESPACE}"
 echo "  guest disk: ${GUEST_IMAGE}"
 echo
 
-"${GATEWAY_BIN}" \
+OPENSHELL_DRIVERS=kubernetes "${GATEWAY_BIN}" \
     --config "${CONFIG_PATH}" \
     --port "${PORT}" \
     --log-level "${LOG_LEVEL}" \
-    --drivers kubernetes \
-    --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc" \
-    --disable-tls &
+    --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc" &
 GATEWAY_PID=$!
 
 # Wait for the gateway to accept requests.

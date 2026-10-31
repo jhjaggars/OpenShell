@@ -140,7 +140,6 @@ impl KubernetesSandboxRuntimeConfig {
     }
 }
 
-/// How workspaces map to Kubernetes namespaces.
 /// Runtime substrate the Kubernetes driver provisions sandboxes on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -716,6 +715,14 @@ impl KubernetesComputeConfig {
             return Err(
                 "kubevirt runtime requires grpc_endpoint: the guest supervisor must be \
                  able to reach the gateway"
+                    .to_string(),
+            );
+        }
+        if self.grpc_endpoint.trim_start().starts_with("https://") {
+            return Err(
+                "kubevirt runtime does not yet support https:// grpc_endpoints: the guest \
+                 bootstrap delivers no client TLS material. Use an http:// endpoint local \
+                 to the cluster network"
                     .to_string(),
             );
         }
