@@ -22,6 +22,14 @@
 
 set -eu
 
+# Every exit of PID 1 must power the guest off: a dead init means either a
+# kernel panic (QEMU serves a dead kernel, the VM reports ready forever) or
+# a hung guest. The trap makes any `set -e` failure path, and the script's
+# normal end, end the VMI so the driver maps the sandbox to Error. The
+# normal poweroff path below fires the trap too; poweroff -f is idempotent
+# enough at that point (the machine is already going down).
+trap 'ts "init exiting (rc=$?); powering off"; sync; poweroff -f' EXIT
+
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root
 export TERM=xterm
@@ -76,7 +84,7 @@ read_bootstrap_config() {
     if ! mount -t iso9660 -o ro /dev/vdb /config 2>/dev/null; then
         mount -o ro /dev/vdb /config 2>/dev/null || {
             ts "FATAL: cannot mount bootstrap config disk"
-            exec sleep infinity
+            return 1
         }
     fi
     # The bootstrap payload is the shell-sourceable file rendered by the
@@ -100,7 +108,7 @@ read_bootstrap_config() {
     else
         ts "FATAL: no bootstrap payload on config disk"
         ls -la /config || true
-        exec sleep infinity
+        return 1
     fi
     ts "bootstrap config loaded (sandbox ${OPENSHELL_SANDBOX:-unknown})"
     umount /config

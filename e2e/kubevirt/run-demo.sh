@@ -133,44 +133,82 @@ echo "sandbox after stop: $(sandbox_phase)"
 # Start #1: Halted -> PatchOnce boots a fresh VMI; the phase goes Starting.
 # The Ready-wait cannot succeed on this branch (the in-guest runtime exits
 # without --bootstrap), so use a short lifecycle timeout purely to let the
-# start RPC through and return quickly.
+# start RPC through and return quickly. A REJECTED start fails the demo.
 START1_LOG="$(mktemp /tmp/kvpoc-start1-XXXX.log)"
 OPENSHELL_LIFECYCLE_TIMEOUT=3 \
-    "${OPENSHELL_CLI}" sandbox start "${NAME}" >"${START1_LOG}" 2>&1 || true
-start_wait_failure_is_expected "${START1_LOG}" \
-    && echo "(start #1 Ready-wait failed as expected without a guest supervisor session)"
+    "${OPENSHELL_CLI}" sandbox start "${NAME}" >"${START1_LOG}" 2>&1 \
+    || start_wait_failure_is_expected "${START1_LOG}" \
+    || { cat "${START1_LOG}" >&2; echo "FAIL: start #1 was rejected" >&2; exit 1; }
+echo "(start #1 Ready-wait failed as expected without a guest supervisor session)"
 UID_BEFORE="$(vmi_uid)"
-echo "VMI uid after start #1: ${UID_BEFORE}"
-
-# Start #2 during the boot window: the gateway admits a start from Starting,
-# and the driver sees runStrategy=Once on a not-ready VM — an Once->Once
-# patch would be a no-op, so it bounces Halted -> wait for VMI termination
-# -> Once. Prove the bounce by the VMI uid changing. A rejected RPC here
-# fails the demo.
-START2_LOG="$(mktemp /tmp/kvpoc-start2-XXXX.log)"
-if OPENSHELL_LIFECYCLE_TIMEOUT="${OPENSHELL_KVPOC_CREATE_TIMEOUT:-60}" \
-    "${OPENSHELL_CLI}" sandbox start "${NAME}" >"${START2_LOG}" 2>&1; then
-    cat "${START2_LOG}"
-elif start_wait_failure_is_expected "${START2_LOG}"; then
-    echo "(start #2 Ready-wait failed as expected without a guest supervisor session)"
-    grep -a "VMFailed\|Error" "${START2_LOG}" | tail -2 || true
-else
-    cat "${START2_LOG}" >&2
-    echo "FAIL: start #2 was rejected — that is an RPC failure, not a Ready wait" >&2
-    exit 1
-fi
-DEADLINE=$(( $(date +%s) + TIMEOUT_SECS ))
-while [ "$(date +%s)" -lt "${DEADLINE}" ]; do
-    UID_AFTER="$(vmi_uid)"
-    [ -n "${UID_AFTER}" ] && [ "${UID_AFTER}" != "${UID_BEFORE}" ] && break
-    sleep 5
-done
-echo "VMI uid after start #2: ${UID_AFTER:-none}"
-[ -n "${UID_AFTER}" ] && [ "${UID_AFTER}" != "${UID_BEFORE}" ] || {
-    echo "FAIL: expected the bounce to replace the VMI (uid unchanged)" >&2
+[ -n "${UID_BEFORE}" ] || {
+    echo "FAIL: start #1 booted no VMI (empty uid); cannot verify what follows" >&2
     exit 1
 }
-echo "dead-Once-VMI bounce verified: Halted -> Once booted a fresh VMI"
+echo "VMI uid after start #1: ${UID_BEFORE}"
+
+# Start #2 back to back during the boot window: the gateway admits retries
+# from Starting, and the driver must treat the booting VMI as idempotent —
+# a healthy boot must NOT be restarted. The VMI uid must not change.
+START2_LOG="$(mktemp /tmp/kvpoc-start2-XXXX.log)"
+OPENSHELL_LIFECYCLE_TIMEOUT=3 \
+    "${OPENSHELL_CLI}" sandbox start "${NAME}" >"${START2_LOG}" 2>&1 \
+    || start_wait_failure_is_expected "${START2_LOG}" \
+    || { cat "${START2_LOG}" >&2; echo "FAIL: start #2 was rejected" >&2; exit 1; }
+sleep 10
+UID_DURING_BOOT="$(vmi_uid)"
+echo "VMI uid after idempotent start #2: ${UID_DURING_BOOT:-none}"
+[ "${UID_DURING_BOOT}" = "${UID_BEFORE}" ] || {
+    echo "FAIL: start #2 restarted a healthy booting VM (uid changed)" >&2
+    exit 1
+}
+echo "idempotent start verified: a booting VirtualMachineInstance is not restarted"
+
+# Dead-Once-VMI bounce (best-effort race): the guest runtime exits and the
+# init powers off, so the VMI goes Succeeded and the gateway maps the
+# sandbox to a sticky Error. The bounce is only reachable in the window
+# between the VMI completing and the Error snapshot landing. Watch the VMI
+# phase and fire a start the instant it goes terminal.
+echo "waiting for the guest to exit (VMI terminal) to attempt the bounce race..."
+VM_NAME2="$(kubectl get vm -l "${VM_SELECTOR}" -n "${SANDBOX_NAMESPACE}" \
+    -o jsonpath='{.items[0].metadata.name}')"
+BOUNCE_LOG="$(mktemp /tmp/kvpoc-bounce-XXXX.log)"
+kubectl get vmi "${VM_NAME2}" -n "${SANDBOX_NAMESPACE}" -w \
+    -o jsonpath='{.status.phase}' 2>/dev/null | while read -r PHASE; do
+    if [ "${PHASE}" = "Succeeded" ] || [ "${PHASE}" = "Failed" ]; then
+        echo "terminal" > /tmp/kvpoc-bounce-race-flag
+        break
+    fi
+done &
+WATCH_PID=$!
+DEADLINE=$(( $(date +%s) + TIMEOUT_SECS ))
+while [ "$(date +%s)" -lt "${DEADLINE}" ]; do
+    [ -f /tmp/kvpoc-bounce-race-flag ] && break
+    sleep 1
+done
+kill "${WATCH_PID}" 2>/dev/null || true
+rm -f /tmp/kvpoc-bounce-race-flag
+if OPENSHELL_LIFECYCLE_TIMEOUT="${OPENSHELL_KVPOC_CREATE_TIMEOUT:-60}" \
+    "${OPENSHELL_CLI}" sandbox start "${NAME}" >"${BOUNCE_LOG}" 2>&1; then
+    cat "${BOUNCE_LOG}"
+elif start_wait_failure_is_expected "${BOUNCE_LOG}"; then
+    echo "(bounce-start Ready-wait failed as expected without a guest supervisor session)"
+    grep -a "VMFailed\|Error" "${BOUNCE_LOG}" | tail -2 || true
+else
+    # A rejection here means the Error snapshot won the race: expected and
+    # reported, not a demo failure.
+    echo "(bounce race lost: the Error snapshot landed before the start;"
+    echo " the gateway rejected the start from the sticky Error phase:"
+    grep -a "must be\|current phase" "${BOUNCE_LOG}" | tail -2 || true
+    echo ")"
+fi
+UID_AFTER_RACE="$(vmi_uid)"
+echo "VMI uid after the bounce race: ${UID_AFTER_RACE:-none}"
+if [ -n "${UID_AFTER_RACE}" ] && [ "${UID_AFTER_RACE}" != "${UID_BEFORE}" ]; then
+    echo "dead-Once-VMI bounce landed: Halted -> Once booted a fresh VMI"
+else
+    echo "bounce did not land this run (race window missed); see unit tests for the plan"
+fi
 
 step "3/3 delete and verify teardown"
 "${OPENSHELL_CLI}" sandbox delete "${NAME}"

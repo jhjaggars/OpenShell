@@ -135,24 +135,33 @@ sandbox after guest exit:   Phase: Error
 === 2/3 stop / start and the dead-Once-VMI bounce ===
 ✓ Stopped sandbox kvpoc-demo
 sandbox after stop:   Phase: Stopped
-VMI uid after start #1: 2b5d567d-fa5d-47d8-9b83-4c6ed6acc1b5
-VMI uid after start #2: 8cb0634e-9c17-4f4b-ac21-5ea029476ad9
-dead-Once-VMI bounce verified: Halted -> Once booted a fresh VMI
+VMI uid after start #1: 61d24ce2-00b7-47c7-9b80-375945556ffe
+VMI uid after idempotent start #2: 61d24ce2-00b7-47c7-9b80-375945556ffe
+idempotent start verified: a booting VirtualMachineInstance is not restarted
+(bounce race lost: the Error snapshot landed before the start;
+ the gateway rejected the start from the sticky Error phase — see below)
+VMI uid after the bounce race: 61d24ce2-00b7-47c7-9b80-375945556ffe
+bounce did not land this run (race window missed); see unit tests for the plan
 === 3/3 delete and verify teardown ===
 ✓ Sandbox kvpoc-demo deletion accepted; cleanup is pending
 demo complete: dead-guest Error path, start/bounce, and teardown verified
 ```
 
-When `BounceHaltedThenOnce` is reachable: the gateway admits `start` from
-the Stopped / Suspended / Completed / Starting phases. After an explicit
-stop the runStrategy is `Halted`, so start takes the single `PatchOnce`
-path. The bounce only fires when the gateway phase admits start while the
-VM still holds `runStrategy: Once` and is not ready — concretely, a second
-`start` issued during the boot window (phase `Starting`), which is how the
-demo exercises it. A dead guest lands the sandbox in `Error` (the gateway
-makes infrastructure errors sticky to driver snapshots), where start is
-rejected with "stop the sandbox before retrying start" — the same
-semantics as a failed pod sandbox.
+Start semantics: the plan is decided from the run strategy, the VM status,
+and the paired VMI's phase. A halted VM boots with a single `Once` patch
+(`PatchOnce`). A live or booting VMI makes start idempotent
+(`AlreadyRunning`) — the gateway admits retries from the `Starting` phase,
+and a retry must not restart a healthy boot. The `BounceHaltedThenOnce`
+path fires only for a terminal VMI (`Succeeded`/`Failed`) or a gone VMI
+under `Once` with `printableStatus: Stopped` — a completed VMI makes an
+`Once`->`Once` patch a silent no-op. In practice that window is narrow: a
+dead guest lands the sandbox in a sticky `Error` (the gateway ignores
+driver snapshots once the phase is `Error`), so the bounce is reachable
+only between the VMI completing and the Error snapshot landing — e.g. a
+start retry that arrives just as the guest dies. After an explicit stop
+the runStrategy is `Halted`, so start takes `PatchOnce`. A start from the
+sticky `Error` is rejected with "stop the sandbox before retrying start" —
+the same semantics as a failed pod sandbox.
 
 Run `e2e/kubevirt/demo.sh` (without `--demo`) to keep the gateway in the
 foreground and drive the CLI by hand; it registers gateway `kvpoc`

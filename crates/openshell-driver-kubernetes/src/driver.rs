@@ -4325,6 +4325,13 @@ impl KubernetesComputeDriver {
             .and_then(|status| status.get("ready"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        let printable_status = object
+            .data
+            .get("status")
+            .and_then(|status| status.get("printableStatus"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let vmi_phase = self.kubevirt_vmi_phase(&namespace, &kube_name).await;
 
         let patch_strategy = |strategy: String| {
             let api = api.clone();
@@ -4346,9 +4353,26 @@ impl KubernetesComputeDriver {
             }
         };
 
-        match crate::kubevirt::kubevirt_start_plan(run_strategy, vm_ready) {
+        match crate::kubevirt::kubevirt_start_plan(
+            run_strategy,
+            vm_ready,
+            vmi_phase.as_deref(),
+            printable_status,
+        ) {
             crate::kubevirt::KubeVirtStartPlan::PatchOnce => {
                 patch_strategy("Once".to_string()).await?;
+            }
+            crate::kubevirt::KubeVirtStartPlan::AlreadyRunning => {
+                // The VMI is live or booting: start is idempotent. The
+                // gateway admits retries from the Starting phase, and
+                // tearing down a healthy boot would turn every retry into a
+                // restart.
+                info!(
+                    sandbox_id,
+                    vm = %kube_name,
+                    vmi_phase = vmi_phase.as_deref().unwrap_or("absent"),
+                    "KubeVirt start is idempotent: the VirtualMachineInstance is live or booting"
+                );
             }
             crate::kubevirt::KubeVirtStartPlan::BounceHaltedThenOnce => {
                 // A completed `Once` VMI makes an `Once`->`Once` patch a
@@ -4362,7 +4386,7 @@ impl KubernetesComputeDriver {
                     let now = tokio::time::Instant::now();
                     if now >= deadline {
                         return Err(KubernetesDriverError::Message(
-                            "timed out waiting for the completed VirtualMachineInstance to                              terminate before restart"
+                            "timed out waiting for the completed VirtualMachineInstance to terminate before restart"
                                 .to_string(),
                         ));
                     }

@@ -806,24 +806,58 @@ mod tests {
 /// How `start` should drive a `runStrategy: Once` VM back to running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KubeVirtStartPlan {
-    /// The VM is not running under `Once` (halted, or never started): a
-    /// single `runStrategy: Once` patch boots a fresh VMI.
+    /// The VM is halted: a single `runStrategy: Once` patch boots a fresh
+    /// VMI.
     PatchOnce,
-    /// The VM already says `Once` but is not running (a completed `Once` VMI
-    /// makes an `Once` -> `Once` patch a no-op). Boot requires bouncing
+    /// The VMI is live or booting (Pending/Scheduling/Scheduled/Running):
+    /// start is idempotent. The gateway admits retries from the `Starting`
+    /// phase, and tearing down a healthy boot to "really start" would turn
+    /// every retry into a restart. The start returns the current runtime
+    /// identity.
+    AlreadyRunning,
+    /// The VMI is terminal (`Succeeded`/`Failed`) or gone while the strategy
+    /// is `Once` and the VM reports `Stopped`: a completed VMI makes an
+    /// `Once` -> `Once` patch a silent no-op, so boot requires bouncing
     /// through `Halted` first so `KubeVirt` discards the dead VMI.
     BounceHaltedThenOnce,
 }
 
-/// Decide how `start` must drive the VM. Extracted for unit tests: a
-/// not-ready VM whose strategy is already `Once` needs the halt bounce or
-/// the patch is silently ignored.
+/// Decide how `start` must drive the VM, from the run strategy, the VM's
+/// ready flag and printable status, and the paired VMI's phase. Extracted
+/// for unit tests. Never tears down a VMI it does not positively know is
+/// terminal: unknown phases and missing-context combinations are treated as
+/// a boot in progress.
 #[must_use]
-pub fn kubevirt_start_plan(run_strategy: &str, vm_ready: bool) -> KubeVirtStartPlan {
-    if run_strategy == "Once" && !vm_ready {
-        KubeVirtStartPlan::BounceHaltedThenOnce
-    } else {
-        KubeVirtStartPlan::PatchOnce
+pub fn kubevirt_start_plan(
+    run_strategy: &str,
+    vm_ready: bool,
+    vmi_phase: Option<&str>,
+    printable_status: &str,
+) -> KubeVirtStartPlan {
+    match vmi_phase {
+        // Live or booting VMI: idempotent no-op.
+        Some("Pending" | "Scheduling" | "Scheduled" | "Running" | "WaitingForSync") => {
+            KubeVirtStartPlan::AlreadyRunning
+        }
+        // Terminal VMI: the Once->Once patch would be ignored.
+        Some("Succeeded" | "Failed") => KubeVirtStartPlan::BounceHaltedThenOnce,
+        // Unknown phase (KubeVirt could not obtain state): conservatively
+        // treat as live.
+        Some(_) => KubeVirtStartPlan::AlreadyRunning,
+        None => {
+            if run_strategy == "Halted" {
+                KubeVirtStartPlan::PatchOnce
+            } else if run_strategy == "Once" && !vm_ready && printable_status == "Stopped" {
+                // The VMI object is gone and the VM reports Stopped under
+                // Once: a dead VMI the controller will not replace on a
+                // no-op patch.
+                KubeVirtStartPlan::BounceHaltedThenOnce
+            } else {
+                // No VMI object yet under Once with a printable status that
+                // implies the controller is creating one: boot in progress.
+                KubeVirtStartPlan::AlreadyRunning
+            }
+        }
     }
 }
 
@@ -1023,25 +1057,58 @@ mod kubevirt_review_tests {
     }
 
     #[test]
-    fn start_plan_bounces_dead_once_vm() {
-        // A completed `Once` VMI makes an `Once`->`Once` patch a no-op.
+    fn start_plan_is_idempotent_during_boot() {
         use super::KubeVirtStartPlan;
+        // A start admitted from Starting during the boot window must not
+        // restart a healthy, booting VM (the gateway admits retries from
+        // Starting, and the VM is Once + not ready throughout the window).
+        for phase in ["Pending", "Scheduling", "Scheduled", "Running"] {
+            assert_eq!(
+                kubevirt_start_plan("Once", false, Some(phase), "Starting"),
+                KubeVirtStartPlan::AlreadyRunning,
+                "a booting VMI ({phase}) must not be bounced"
+            );
+        }
+        // So is a ready VM and an unrecognized VMI phase.
         assert_eq!(
-            kubevirt_start_plan("Once", false),
+            kubevirt_start_plan("Once", true, Some("Running"), "Running"),
+            KubeVirtStartPlan::AlreadyRunning
+        );
+        assert_eq!(
+            kubevirt_start_plan("Once", false, Some("Unknown"), "Unknown"),
+            KubeVirtStartPlan::AlreadyRunning
+        );
+        // No VMI object yet while the controller creates one: boot starting.
+        assert_eq!(
+            kubevirt_start_plan("Once", false, None, "Provisioning"),
+            KubeVirtStartPlan::AlreadyRunning
+        );
+    }
+
+    #[test]
+    fn start_plan_bounces_dead_once_vm() {
+        use super::KubeVirtStartPlan;
+        // A terminal VMI under Once makes the Once->Once patch a no-op.
+        for phase in ["Succeeded", "Failed"] {
+            assert_eq!(
+                kubevirt_start_plan("Once", false, Some(phase), "Stopped"),
+                KubeVirtStartPlan::BounceHaltedThenOnce,
+                "a terminal VMI ({phase}) must be bounced"
+            );
+        }
+        // A gone VMI with a Stopped printable under Once is also dead.
+        assert_eq!(
+            kubevirt_start_plan("Once", false, None, "Stopped"),
             KubeVirtStartPlan::BounceHaltedThenOnce
         );
-        // Halted, never-started, or already-running VMs boot with one patch.
+        // A halted VM boots with one patch; a ready VM is left alone.
         assert_eq!(
-            kubevirt_start_plan("Halted", false),
+            kubevirt_start_plan("Halted", false, None, "Stopped"),
             KubeVirtStartPlan::PatchOnce
         );
         assert_eq!(
-            kubevirt_start_plan("Once", true),
-            KubeVirtStartPlan::PatchOnce
-        );
-        assert_eq!(
-            kubevirt_start_plan("Always", true),
-            KubeVirtStartPlan::PatchOnce
+            kubevirt_start_plan("Once", true, None, "Running"),
+            KubeVirtStartPlan::AlreadyRunning
         );
     }
 
