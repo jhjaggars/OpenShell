@@ -428,7 +428,7 @@ mod linux {
         config: &BoundaryConfig,
         policy: &SandboxPolicyWire,
     ) -> Result<(), String> {
-        if !config.resource_claims.contains_key("vm.generation") {
+        if !openshell_sandbox_backend::boundary_protocol::is_vm_guest(&config.resource_claims) {
             return Ok(());
         }
         let identity = &config.workload_identity;
@@ -6579,9 +6579,27 @@ mod linux {
             let config = &mut Arc::get_mut(&mut boundary)
                 .expect("test boundary has one owner")
                 .config;
+            config.resource_claims.insert(
+                openshell_sandbox_backend::boundary_protocol::VM_GENERATION_CLAIM.to_string(),
+                config.generation.clone(),
+            );
+            (process_runtime, boundary)
+        }
+
+        fn kubevirt_identity_test_runtime() -> (tokio::runtime::Runtime, Arc<BoundaryRuntime>) {
+            let (process_runtime, mut boundary) = vm_identity_test_runtime();
+            let config = &mut Arc::get_mut(&mut boundary)
+                .expect("test boundary has one owner")
+                .config;
+            // Swap the libkrun marker for the KubeVirt one; the predicate
+            // must treat both as VM guests.
             config
                 .resource_claims
-                .insert("vm.generation".to_string(), config.generation.clone());
+                .remove(openshell_sandbox_backend::boundary_protocol::VM_GENERATION_CLAIM);
+            config.resource_claims.insert(
+                openshell_sandbox_backend::boundary_protocol::KUBEVIRT_GENERATION_CLAIM.to_string(),
+                config.generation.clone(),
+            );
             (process_runtime, boundary)
         }
 
@@ -6596,6 +6614,33 @@ mod linux {
                     run_as_group: group.map(str::to_string),
                 },
             })
+        }
+
+        #[test]
+        fn kubevirt_claimed_guest_gets_vm_policy_identity_validation() {
+            let (_runtime, boundary) = kubevirt_identity_test_runtime();
+            let uid = boundary.config.workload_identity.uid.to_string();
+            let gid = boundary.config.workload_identity.gid.to_string();
+            // Matching and omitted selectors pass.
+            for (user, group) in [
+                (None, None),
+                (Some(uid.as_str()), Some(gid.as_str())),
+                (Some("sandbox"), Some("sandbox")),
+            ] {
+                validate_vm_policy_identity(
+                    &boundary.config,
+                    &vm_identity_test_policy(user, group),
+                )
+                .expect("matching or omitted VM selectors for a KubeVirt guest");
+            }
+            // Conflicting selectors are denied, exactly like a libkrun VM.
+            let wrong = if uid == "10000" { "10001" } else { "10000" };
+            let error = validate_vm_policy_identity(
+                &boundary.config,
+                &vm_identity_test_policy(Some(wrong), Some(wrong)),
+            )
+            .expect_err("conflicting VM selectors must be denied");
+            assert!(error.contains("conflicts with the resolved workload identity"));
         }
 
         #[test]
@@ -6659,7 +6704,7 @@ mod linux {
                 .expect("test boundary has one owner")
                 .config
                 .resource_claims
-                .remove("vm.generation");
+                .remove(openshell_sandbox_backend::boundary_protocol::VM_GENERATION_CLAIM);
             validate_vm_policy_identity(
                 &boundary.config,
                 &vm_identity_test_policy(Some(wrong_user), Some("image-user")),

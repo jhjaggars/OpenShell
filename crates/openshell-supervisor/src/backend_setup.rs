@@ -227,13 +227,13 @@ impl BackendSetup for OpenShellBackendSetup {
             generation: descriptor.generation.clone(),
             session_id: descriptor.session_id,
             workload_identity: descriptor.workload_identity.clone(),
-            vm_policy_identity: descriptor
-                .resource_claims
-                .contains_key("vm.generation")
-                .then_some(super::VmPolicyIdentity {
-                    uid: descriptor.workload_identity.uid,
-                    gid: descriptor.workload_identity.gid,
-                }),
+            vm_policy_identity: openshell_sandbox_backend::boundary_protocol::is_vm_guest(
+                &descriptor.resource_claims,
+            )
+            .then_some(super::VmPolicyIdentity {
+                uid: descriptor.workload_identity.uid,
+                gid: descriptor.workload_identity.gid,
+            }),
         };
         let transport = openshell_sandbox_backend::BoundaryTransport::for_descriptor(&descriptor)?;
         Ok((

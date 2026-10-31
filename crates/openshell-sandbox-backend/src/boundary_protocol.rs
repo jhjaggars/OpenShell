@@ -1994,3 +1994,66 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// VM-guest claim markers
+// ---------------------------------------------------------------------------
+
+/// Resource-claim key marking a libkrun VM guest generation (emitted by
+/// `openshell-driver-vm`).
+pub const VM_GENERATION_CLAIM: &str = "vm.generation";
+
+/// Resource-claim key marking a `KubeVirt` VM guest generation (emitted by
+/// the Kubernetes driver's kubevirt runtime).
+pub const KUBEVIRT_GENERATION_CLAIM: &str = "kubevirt.generation";
+
+/// Whether the boundary's resource claims mark it as a VM guest (libkrun or
+/// `KubeVirt`).
+///
+/// VM guests get VM policy-identity semantics: the `run_as_user`/
+/// `run_as_group` policy selectors must be `sandbox` or the resolved guest
+/// uid/gid, not arbitrary account lookups.
+pub fn is_vm_guest(resource_claims: &std::collections::BTreeMap<String, String>) -> bool {
+    resource_claims.contains_key(VM_GENERATION_CLAIM)
+        || resource_claims.contains_key(KUBEVIRT_GENERATION_CLAIM)
+}
+
+#[cfg(test)]
+mod vm_guest_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn claims(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn is_vm_guest_accepts_vm_generation_claim() {
+        assert!(is_vm_guest(&claims(&[("vm.generation", "g1")])));
+    }
+
+    #[test]
+    fn is_vm_guest_accepts_kubevirt_generation_claim() {
+        assert!(is_vm_guest(&claims(&[("kubevirt.generation", "g1")])));
+    }
+
+    #[test]
+    fn is_vm_guest_rejects_no_marker() {
+        assert!(!is_vm_guest(&claims(&[(
+            "kubernetes.workload_pod_uid",
+            "x"
+        )])));
+        assert!(!is_vm_guest(&BTreeMap::new()));
+    }
+
+    #[test]
+    fn is_vm_guest_accepts_both_markers() {
+        assert!(is_vm_guest(&claims(&[
+            ("vm.generation", "g1"),
+            ("kubevirt.generation", "g2")
+        ])));
+    }
+}
