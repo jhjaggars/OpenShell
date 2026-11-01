@@ -166,6 +166,17 @@ kubectl rollout status deployment/kvpoc-openshell-supervisor -n openshell --time
 e2e/kubevirt/demo.sh --demo
 ```
 
+The demo gateway's PKI lives in `.cache/gateway-kubevirt/tls/pki/`; deleting
+it (or running from a fresh checkout) mints a new CA, which demo.sh syncs into
+the supervisor's `kvpoc-server-tls` Secret. The supervisor reads that CA at
+startup, so an already-running supervisor pod predating the new PKI keeps
+failing to attach (`could not open the supervisor host stream`) — restart it
+after wiping the gateway state:
+
+```shell
+kubectl rollout restart deployment/kvpoc-openshell-supervisor -n openshell
+```
+
 Actual output of one clean `run-demo.sh` run (every step fails the demo on
 error — there is no Ready-wait tolerance):
 
