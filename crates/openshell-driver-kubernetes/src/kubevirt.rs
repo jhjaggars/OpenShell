@@ -240,6 +240,14 @@ pub fn render_virtual_machine(params: &KubeVirtSandboxParams<'_>) -> DynamicObje
         crate::isolation::BOUNDARY_ROLE_LABEL.to_string(),
         "workload".to_string(),
     );
+    // The boundary-pair label binds the launcher pod to this sandbox's pair,
+    // exactly as the pod path's workload pods carry it: the dedicated
+    // topology's control NetworkPolicy and egress fence select the pair's
+    // two roles with it (isolation.rs pair_role_labels).
+    labels.insert(
+        crate::isolation::BOUNDARY_PAIR_LABEL.to_string(),
+        crate::sandbox_runtime::pair_label_value(&sandbox.id),
+    );
 
     // Direct kernel boot: the guest image is purpose-built (see
     // `e2e/kubevirt/`), so no bootloader is installed in the rootfs. The
@@ -654,6 +662,20 @@ mod tests {
         assert_eq!(
             volumes[2]["persistentVolumeClaim"]["claimName"],
             "default--demo-workspace"
+        );
+
+        // The template labels carry the boundary pair and workload role:
+        // KubeVirt propagates them to the VMI and virt-launcher pod, where
+        // the pod path's control NetworkPolicy and the egress fence select
+        // the pair's two roles (isolation.rs pair_role_labels).
+        let template_labels = &vm.data["spec"]["template"]["metadata"]["labels"];
+        assert_eq!(
+            template_labels["openshell.ai/boundary-pair"], "sbx-id",
+            "the launcher pod must carry this sandbox's pair label"
+        );
+        assert_eq!(
+            template_labels["openshell.ai/boundary-role"], "workload",
+            "the launcher pod must carry the workload role label"
         );
 
         let filesystems = vm.data["spec"]["template"]["spec"]["domain"]["devices"]["filesystems"]
@@ -1154,32 +1176,72 @@ mod kubevirt_review_tests {
     }
 
     #[test]
-    fn grpc_endpoint_is_not_validated_in_kubevirt_mode() {
-        // The guest never learns the gateway endpoint: the boundary resolves
-        // the shared supervisor's Service through the API and dials it on the
-        // routed runtime connection. grpc_endpoint serves the pod path's
-        // per-sandbox supervisor pods only, so kubevirt mode neither requires
-        // nor restricts it — including the https:// shape the TLS demo uses.
+    fn grpc_endpoint_is_required_only_for_the_dedicated_topology() {
+        // The dedicated topology's supervisor Pod must reach the gateway,
+        // exactly as the pod path's supervisor Pods do, so grpc_endpoint is
+        // required (and any scheme is fine: the supervisor carries client
+        // TLS material, so the https:// shape the TLS demo uses is valid).
         let mut cfg = review_config();
+        cfg.shared_supervisor = None;
         cfg.grpc_endpoint = "https://openshell-gateway.ns.svc:8080".to_string();
         assert!(cfg.validate_kubevirt_config().is_ok());
+        cfg.grpc_endpoint = String::new();
+        let err = cfg
+            .validate_kubevirt_config()
+            .expect_err("dedicated without grpc_endpoint is refused");
+        assert!(
+            err.contains("grpc_endpoint"),
+            "message should name the key: {err}"
+        );
+        // The shared topology's guest never learns the gateway endpoint
+        // (the boundary resolves the shared supervisor's Service through
+        // the API), so grpc_endpoint is neither required nor restricted.
+        let mut cfg = review_config();
+        cfg.supervisor_topology = Some(crate::SupervisorTopology::Gateway);
         cfg.grpc_endpoint = String::new();
         assert!(cfg.validate_kubevirt_config().is_ok());
     }
 
     #[test]
     fn validate_configuration_surfaces_kubevirt_rules() {
-        // The startup validation entry point must include the kubevirt rules,
-        // so an invalid runtime=kubevirt config cannot pass construction.
+        // The startup validation entry point must include the kubevirt
+        // rules and the shared topology rules for the kubevirt runtime.
+        // The default (dedicated) topology validates cleanly.
         let mut cfg = review_config();
+        cfg.shared_supervisor = None;
+        assert!(cfg.validate_configuration().is_ok());
+
+        // A dedicated generation without grpc_endpoint cannot run its
+        // supervisor Pod.
+        let mut cfg = review_config();
+        cfg.shared_supervisor = None;
+        cfg.grpc_endpoint = String::new();
+        let err = cfg
+            .validate_configuration()
+            .expect_err("dedicated without grpc_endpoint is refused");
+        assert!(
+            err.contains("grpc_endpoint"),
+            "message should name the key: {err}"
+        );
+
+        // The gateway topology requires shared_supervisor (enforced by the
+        // shared validate_supervisor_topology, not kubevirt-specific rules).
+        let mut cfg = review_config();
+        cfg.supervisor_topology = Some(crate::SupervisorTopology::Gateway);
         cfg.shared_supervisor = None;
         let err = cfg
             .validate_configuration()
-            .expect_err("missing shared supervisor is refused");
+            .expect_err("gateway topology without shared supervisor is refused");
         assert!(
-            err.contains("kubevirt runtime requires the gateway shared supervisor"),
+            err.contains("requires shared_supervisor"),
             "message should name the requirement: {err}"
         );
+
+        // The workspace topology is rejected, as on the pod path.
+        let mut cfg = review_config();
+        cfg.supervisor_topology = Some(crate::SupervisorTopology::Workspace);
+        cfg.shared_supervisor = None;
+        assert!(cfg.validate_configuration().is_err());
 
         let mut cfg = review_config();
         cfg.supervisor_topology = Some(crate::SupervisorTopology::Gateway);

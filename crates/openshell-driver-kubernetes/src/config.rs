@@ -689,20 +689,32 @@ impl KubernetesComputeConfig {
 
     /// Validate the `KubeVirt` runtime mode configuration (`PoC` constraints).
     ///
-    /// `grpc_endpoint` is deliberately neither required nor restricted here:
-    /// the pod path uses it to point per-sandbox supervisor pods at the
-    /// gateway, while a `KubeVirt` guest never learns the gateway endpoint at
-    /// all — the boundary resolves the shared supervisor's Service through
-    /// the API and dials it on the routed runtime connection, so an
-    /// `https://` endpoint (the TLS demo's shape) is as valid as none.
+    /// The `KubeVirt` runtime supports the same supervisor topologies as the
+    /// pod path: the default is a dedicated supervisor Pod per sandbox
+    /// (`supervisor_topology` unset), and `supervisor_topology = "gateway"`
+    /// places each generation on the gateway's shared supervisor. Which
+    /// objects the driver provisions differs per topology, but the topology
+    /// rules themselves (`gateway` requires `shared_supervisor`; `workspace`
+    /// is not implemented) are enforced by [`Self::validate_supervisor_topology`]
+    /// for both runtimes, so they are not repeated here.
+    ///
+    /// `grpc_endpoint` is required for the dedicated topology — its
+    /// supervisor Pod must reach the gateway, exactly as the pod path's
+    /// supervisor Pods do — but not for the shared topology, whose guest
+    /// never learns the gateway endpoint (the boundary resolves the shared
+    /// supervisor's Service through the API). Any scheme is accepted: a
+    /// dedicated supervisor carries client TLS material, so an `https://`
+    /// endpoint (the TLS demo's shape) is as valid as an `http://` one.
     pub fn validate_kubevirt_config(&self) -> Result<(), String> {
         if self.runtime != KubernetesRuntimeMode::KubeVirt {
             return Ok(());
         }
-        if self.shared_supervisor.is_none() {
-            return Err("kubevirt runtime requires the gateway shared supervisor \
-                 (supervisor_topology = \"gateway\"); configure shared_supervisor"
-                .to_string());
+        if self.supervisor_topology.is_none() && self.grpc_endpoint.trim().is_empty() {
+            return Err(
+                "kubevirt runtime with a dedicated supervisor Pod requires grpc_endpoint: the \
+                 supervisor Pod must be able to reach the gateway"
+                    .to_string(),
+            );
         }
         if self.kubevirt.guest_image.trim().is_empty() {
             return Err(

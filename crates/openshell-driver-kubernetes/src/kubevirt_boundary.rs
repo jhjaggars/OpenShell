@@ -60,6 +60,9 @@ pub const CLAIM_VM_UID: &str = "kubevirt.vm_uid";
 pub const CLAIM_GENERATION: &str =
     openshell_sandbox_backend::boundary_protocol::KUBEVIRT_GENERATION_CLAIM;
 pub const CLAIM_IMAGE_IDENTITY: &str = "kubevirt.image_identity";
+/// The dedicated supervisor Pod's UID, claimed only in the dedicated
+/// topology (mirrors the pod path's `kubernetes.supervisor_pod_uid`).
+pub const CLAIM_SUPERVISOR_POD_UID: &str = "kubevirt.supervisor_pod_uid";
 
 /// Where the guest init stages the boundary bootstrap artifacts. These are
 /// the paths written into the `BoundaryConfig`'s TLS config and read by the
@@ -99,6 +102,99 @@ impl KubeVirtOuterFenceEvidence<'_> {
     }
 }
 
+/// Where a `KubeVirt` boundary dials its supervisor, and what the fence
+/// admits egress to.
+///
+/// Mirrors the pod path's two supervisor topologies: a dedicated supervisor
+/// Pod per sandbox (the default), or a sandbox instance on the gateway's
+/// shared supervisor.
+#[derive(Clone, Debug)]
+pub enum KubeVirtSupervisorTarget {
+    /// This sandbox's dedicated supervisor Pod, fronted by its per-sandbox
+    /// Service (`os-supervisor-<id>`) in the sandbox namespace.
+    Dedicated {
+        /// The per-sandbox Service's DNS authority
+        /// (`os-supervisor-<id>.<ns>.svc:<port>`).
+        authority: String,
+        /// The Service's `ClusterIP` endpoint.
+        address: SocketAddr,
+        /// The supervisor Pod's UID, claimed as `kubevirt.supervisor_pod_uid`
+        /// and re-bound on every start (a new generation gets a new Pod).
+        supervisor_pod_uid: String,
+        /// Labels selecting the supervisor Pod (the boundary pair's
+        /// supervisor role); the fence's egress target.
+        pod_selector: BTreeMap<String, String>,
+        /// The boundary port the supervisor listens on.
+        port: u16,
+    },
+    /// A sandbox instance on the gateway's shared supervisor, fronted by
+    /// its Service.
+    Shared {
+        /// The shared supervisor Service's DNS authority
+        /// (`{service}.{ns}.svc:{port}`).
+        authority: String,
+        /// The Service's `ClusterIP` endpoint.
+        address: SocketAddr,
+        /// Route handle for this sandbox instance.
+        route: String,
+        /// Namespace of the shared supervisor Service.
+        namespace: String,
+        /// The Service's `spec.selector` (pod labels).
+        pod_selector: BTreeMap<String, String>,
+        /// The runtime port.
+        port: u16,
+    },
+}
+
+impl KubeVirtSupervisorTarget {
+    fn authority(&self) -> &str {
+        match self {
+            Self::Dedicated { authority, .. } | Self::Shared { authority, .. } => authority,
+        }
+    }
+
+    fn address(&self) -> SocketAddr {
+        match self {
+            Self::Dedicated { address, .. } | Self::Shared { address, .. } => *address,
+        }
+    }
+
+    fn port(&self) -> u16 {
+        match self {
+            Self::Dedicated { port, .. } | Self::Shared { port, .. } => *port,
+        }
+    }
+
+    /// The egress `to` peers the fence admits: this sandbox's dedicated
+    /// supervisor Pod (same namespace, pair-scoped selector) or the shared
+    /// supervisor's Pods (cross-namespace, Service selector).
+    fn fence_egress_to(&self) -> Vec<serde_json::Value> {
+        let selector = |labels: &BTreeMap<String, String>| {
+            labels
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+        };
+        match self {
+            Self::Dedicated { pod_selector, .. } => vec![serde_json::json!({
+                "podSelector": {"matchLabels": selector(pod_selector)}
+            })],
+            Self::Shared {
+                namespace,
+                pod_selector,
+                ..
+            } => vec![serde_json::json!({
+                "namespaceSelector": {
+                    "matchLabels": {
+                        "kubernetes.io/metadata.name": namespace
+                    }
+                },
+                "podSelector": {"matchLabels": selector(pod_selector)}
+            })],
+        }
+    }
+}
+
 /// Driver-owned inputs that bind one `KubeVirt` VM generation to one
 /// supervisor boundary.
 pub struct KubeVirtBoundarySpec {
@@ -118,15 +214,10 @@ pub struct KubeVirtBoundarySpec {
     pub network_policy_uid: String,
     /// resourceVersion of the fence `NetworkPolicy` at render time.
     pub network_policy_resource_version: String,
-    /// The supervisor Service authority the boundary dials
-    /// (`RuntimeInitiatedTlsTcp`), e.g. `supervisor.openshell.svc:5500`.
-    pub supervisor_authority: String,
-    /// Resolved supervisor endpoint addresses, tried in order.
-    pub supervisor_addresses: Vec<SocketAddr>,
-    /// Route handle for this sandbox instance on the gateway-shared
-    /// supervisor. Required: the user's decision is shared-supervisor-only,
-    /// and an empty route would route ambiguously.
-    pub route: String,
+    /// Where the boundary dials its supervisor: the per-sandbox Service of
+    /// a dedicated supervisor Pod, or the gateway-shared supervisor's
+    /// Service with this sandbox's route handle.
+    pub supervisor: KubeVirtSupervisorTarget,
     /// TLS client config the supervisor uses to authenticate the boundary.
     pub supervisor_tls: SandboxTlsClientConfig,
     /// The workload identity (uid/gid) the boundary runs as.
@@ -146,13 +237,7 @@ impl KubeVirtBoundarySpec {
     /// Produce both sides of the common protocol from one set of immutable
     /// driver inputs so their identity claims cannot drift.
     pub fn provision(self) -> Result<KubeVirtBoundaryProvisioning, BackendError> {
-        if self.route.trim().is_empty() {
-            return Err(BackendError::Descriptor(
-                "KubeVirt boundary requires a shared-supervisor route handle; an empty                  route would route ambiguously"
-                    .to_string(),
-            ));
-        }
-        let resource_claims = BTreeMap::from([
+        let mut resource_claims = BTreeMap::from([
             (CLAIM_VM_UID.to_string(), self.vm_uid.clone()),
             (CLAIM_GENERATION.to_string(), self.generation.clone()),
             (
@@ -160,6 +245,58 @@ impl KubeVirtBoundarySpec {
                 self.image_identity.clone(),
             ),
         ]);
+        // The dedicated topology claims the supervisor Pod's UID (mirroring
+        // the pod path's `kubernetes.supervisor_pod_uid`); the shared
+        // topology instead names its instance by the route handle carried in
+        // the transport. No control-policy UID is claimed in either
+        // topology (user decision).
+        let listener_route = match &self.supervisor {
+            KubeVirtSupervisorTarget::Dedicated {
+                supervisor_pod_uid, ..
+            } => {
+                if supervisor_pod_uid.trim().is_empty() {
+                    return Err(BackendError::Descriptor(
+                        "KubeVirt boundary requires the dedicated supervisor Pod's UID; an \
+                         empty claim would bind the boundary to no supervisor"
+                            .to_string(),
+                    ));
+                }
+                resource_claims.insert(
+                    CLAIM_SUPERVISOR_POD_UID.to_string(),
+                    supervisor_pod_uid.clone(),
+                );
+                None
+            }
+            KubeVirtSupervisorTarget::Shared { route, .. } => {
+                if route.trim().is_empty() {
+                    return Err(BackendError::Descriptor(
+                        "KubeVirt boundary requires a shared-supervisor route handle; an \
+                         empty route would route ambiguously"
+                            .to_string(),
+                    ));
+                }
+                Some(route.clone())
+            }
+        };
+        let transport = match &self.supervisor {
+            // A dedicated supervisor serves its one boundary on a plain
+            // runtime-initiated TCP listener (the pod path's dedicated
+            // transport); no route preface names an instance.
+            KubeVirtSupervisorTarget::Dedicated {
+                authority, port, ..
+            } => SandboxTransport::RuntimeInitiatedTcp {
+                authority: authority.clone(),
+                listen_address: SocketAddr::from(([0, 0, 0, 0], *port)),
+            },
+            // The shared supervisor routes the connection to this sandbox's
+            // instance by the preface route handle.
+            KubeVirtSupervisorTarget::Shared {
+                authority, route, ..
+            } => SandboxTransport::RuntimeInitiatedRouted {
+                authority: authority.clone(),
+                route: route.clone(),
+            },
+        };
         let provisioning_evidence = KubeVirtOuterFenceEvidence {
             generation: &self.generation,
             network_policy_uid: &self.network_policy_uid,
@@ -180,10 +317,10 @@ impl KubeVirtBoundarySpec {
                 gateway_id: self.gateway_id,
                 verification_keys: self.verification_keys,
                 listener: BoundaryListener::RuntimeInitiatedTlsTcp {
-                    authority: self.supervisor_authority.clone(),
-                    addresses: self.supervisor_addresses,
+                    authority: self.supervisor.authority().to_string(),
+                    addresses: vec![self.supervisor.address()],
                     tls: sandbox_tls,
-                    route: Some(self.route.clone()),
+                    route: listener_route,
                 },
                 resource_claims: resource_claims.clone(),
                 resource_claim_files: BTreeMap::new(),
@@ -196,10 +333,7 @@ impl KubeVirtBoundarySpec {
                 generation: self.generation,
                 session_id: self.session_id,
                 workload_identity: self.workload_identity,
-                transport: SandboxTransport::RuntimeInitiatedRouted {
-                    authority: self.supervisor_authority,
-                    route: self.route,
-                },
+                transport,
                 tls: self.supervisor_tls,
                 host_gateway_ip: None,
                 resource_claims,
@@ -228,7 +362,46 @@ mod tests {
         }
     }
 
-    fn spec() -> KubeVirtBoundarySpec {
+    fn shared_target() -> KubeVirtSupervisorTarget {
+        KubeVirtSupervisorTarget::Shared {
+            authority: "supervisor.openshell.svc:5500".to_string(),
+            address: "10.43.0.10:5500".parse().unwrap(),
+            route: "route-1".to_string(),
+            namespace: "openshell".to_string(),
+            pod_selector: BTreeMap::from([
+                (
+                    "app.kubernetes.io/name".to_string(),
+                    "openshell-supervisor".to_string(),
+                ),
+                (
+                    "app.kubernetes.io/component".to_string(),
+                    "supervisor".to_string(),
+                ),
+            ]),
+            port: 5500,
+        }
+    }
+
+    fn dedicated_target() -> KubeVirtSupervisorTarget {
+        KubeVirtSupervisorTarget::Dedicated {
+            authority: "os-supervisor-sbx-1.kvpoc-sandboxes.svc:5500".to_string(),
+            address: "10.43.5.10:5500".parse().unwrap(),
+            supervisor_pod_uid: "supervisor-pod-uid-1".to_string(),
+            pod_selector: BTreeMap::from([
+                (
+                    "openshell.ai/boundary-pair".to_string(),
+                    "sbx-1".to_string(),
+                ),
+                (
+                    "openshell.ai/boundary-role".to_string(),
+                    "supervisor".to_string(),
+                ),
+            ]),
+            port: 5500,
+        }
+    }
+
+    fn spec_with(supervisor: KubeVirtSupervisorTarget) -> KubeVirtBoundarySpec {
         KubeVirtBoundarySpec {
             boundary_id: "sandbox-1".to_string(),
             generation: "generation-1".to_string(),
@@ -244,9 +417,7 @@ mod tests {
             image_identity: "kvpoc/openshell-sandbox-vm:dev".to_string(),
             network_policy_uid: "np-uid-1".to_string(),
             network_policy_resource_version: "1945".to_string(),
-            supervisor_authority: "supervisor.openshell.svc:5500".to_string(),
-            supervisor_addresses: vec!["10.43.0.10:5500".parse().unwrap()],
-            route: "route-1".to_string(),
+            supervisor,
             supervisor_tls: SandboxTlsClientConfig {
                 server_name: "boundary.sandbox.openshell".to_string(),
                 trust_anchor_pem: "test-ca".to_string(),
@@ -261,6 +432,14 @@ mod tests {
             .unwrap(),
             child_env: HashMap::new(),
         }
+    }
+
+    fn spec() -> KubeVirtBoundarySpec {
+        spec_with(shared_target())
+    }
+
+    fn dedicated_spec() -> KubeVirtBoundarySpec {
+        spec_with(dedicated_target())
     }
 
     #[test]
@@ -412,6 +591,130 @@ mod tests {
     }
 
     #[test]
+    fn dedicated_provision_claims_the_supervisor_pod_uid() {
+        let provisioned = dedicated_spec().provision().expect("provision");
+        // Both sides carry the claim, so descriptor/config consistency
+        // (isolation_protocol.rs) binds the boundary to this supervisor Pod.
+        assert_eq!(
+            provisioned.boundary_config.resource_claims[CLAIM_SUPERVISOR_POD_UID],
+            "supervisor-pod-uid-1"
+        );
+        assert_eq!(
+            provisioned.runtime_descriptor.resource_claims[CLAIM_SUPERVISOR_POD_UID],
+            "supervisor-pod-uid-1"
+        );
+        assert!(
+            descriptor_matches_config(
+                &provisioned.runtime_descriptor,
+                &provisioned.boundary_config
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn shared_provision_carries_no_supervisor_pod_uid_claim() {
+        let provisioned = spec().provision().expect("provision");
+        assert!(
+            !provisioned
+                .boundary_config
+                .resource_claims
+                .contains_key(CLAIM_SUPERVISOR_POD_UID)
+        );
+        assert!(
+            !provisioned
+                .runtime_descriptor
+                .resource_claims
+                .contains_key(CLAIM_SUPERVISOR_POD_UID)
+        );
+    }
+
+    #[test]
+    fn dedicated_listener_omits_the_route_and_uses_plain_tcp_transport() {
+        let provisioned = dedicated_spec().provision().expect("provision");
+        match &provisioned.boundary_config.listener {
+            BoundaryListener::RuntimeInitiatedTlsTcp { route, .. } => {
+                assert!(
+                    route.is_none(),
+                    "a dedicated supervisor is not routed: {route:?}"
+                );
+            }
+            other => panic!("expected RuntimeInitiatedTlsTcp listener, got {other:?}"),
+        }
+        // The dedicated descriptor transport mirrors the pod path's
+        // dedicated KubernetesControlPath (isolation.rs): a plain
+        // runtime-initiated TCP listener with no route preface.
+        match &provisioned.runtime_descriptor.transport {
+            SandboxTransport::RuntimeInitiatedTcp { listen_address, .. } => {
+                assert_eq!(listen_address.port(), 5500);
+            }
+            other => panic!("expected RuntimeInitiatedTcp transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_transport_stays_routed() {
+        let provisioned = spec().provision().expect("provision");
+        match &provisioned.runtime_descriptor.transport {
+            SandboxTransport::RuntimeInitiatedRouted { route, .. } => {
+                assert_eq!(route, "route-1");
+            }
+            other => panic!("expected RuntimeInitiatedRouted transport, got {other:?}"),
+        }
+    }
+
+    fn with_dedicated_pod_uid(uid: &str) -> KubeVirtSupervisorTarget {
+        let mut target = dedicated_target();
+        if let KubeVirtSupervisorTarget::Dedicated {
+            supervisor_pod_uid, ..
+        } = &mut target
+        {
+            *supervisor_pod_uid = uid.to_string();
+        }
+        target
+    }
+
+    #[test]
+    fn dedicated_rejects_an_empty_supervisor_pod_uid() {
+        let Err(error) = spec_with(with_dedicated_pod_uid("")).provision() else {
+            panic!("an empty pod UID must fail closed")
+        };
+        assert!(
+            error.to_string().contains("supervisor Pod's UID"),
+            "message should name the claim: {error}"
+        );
+    }
+
+    #[test]
+    fn dedicated_descriptor_does_not_match_a_config_for_another_supervisor_pod() {
+        let original = dedicated_spec().provision().expect("provision");
+        let replaced = spec_with(with_dedicated_pod_uid("supervisor-pod-uid-2"))
+            .provision()
+            .expect("provision");
+        assert!(
+            descriptor_matches_config(&replaced.runtime_descriptor, &original.boundary_config)
+                .is_err(),
+            "a descriptor rendered for another supervisor Pod must not match"
+        );
+    }
+
+    #[test]
+    fn dedicated_and_shared_configs_never_match() {
+        let dedicated = dedicated_spec().provision().expect("provision");
+        let shared = spec().provision().expect("provision");
+        assert!(
+            descriptor_matches_config(&shared.runtime_descriptor, &dedicated.boundary_config)
+                .is_err(),
+            "a shared descriptor must not match a dedicated config"
+        );
+        assert!(
+            descriptor_matches_config(&dedicated.runtime_descriptor, &shared.boundary_config)
+                .is_err(),
+            "a dedicated descriptor must not match a shared config"
+        );
+    }
+
+    #[test]
     fn guest_tls_paths_match_staging_constants() {
         let provisioned = spec().provision().expect("provision");
         match &provisioned.boundary_config.listener {
@@ -437,24 +740,6 @@ mod tests {
 use kube::Client;
 use kube::api::Api;
 use kube::core::DynamicObject;
-
-/// Inputs describing the shared supervisor the fence allows egress to,
-/// read from the configured Service at render time.
-pub struct SupervisorEndpoint {
-    /// Namespace of the shared supervisor Service.
-    pub namespace: String,
-    /// The supervisor Service's DNS authority, carried verbatim from the
-    /// pod path's `shared_supervisor_target` resolution
-    /// (`{service}.{namespace}.svc:{port}`).
-    pub authority: String,
-    /// The Service's `spec.selector` (pod labels), used verbatim as the
-    /// egress podSelector. Read from the live Service, never hard-coded.
-    pub pod_selector: BTreeMap<String, String>,
-    /// The Service's runtime port.
-    pub port: u16,
-    /// The Service's `ClusterIP` (resolved through the API at render time).
-    pub address: SocketAddr,
-}
 
 /// The fence's observed state: UID, resourceVersion, and the full spec
 /// (for drift comparison).
@@ -527,12 +812,14 @@ impl ExpectedFence {
 
 /// Render the virt-launcher fence `NetworkPolicy`.
 ///
-/// The sandbox's only permitted egress is the shared supervisor's runtime
-/// port (matched by the supervisor Service's own pod selector, read at
-/// render time — never hard-coded, because the Helm chart's supervisor
-/// labels vary by release). No DNS, no gateway: the boundary's in-guest
-/// DNS relay forwards through the supervisor's network mediation, and the
-/// supervisor connection uses driver-resolved addresses.
+/// The sandbox's only permitted egress is its supervisor on the boundary
+/// port — the dedicated topology's own supervisor Pod (pair-scoped
+/// selector, same namespace), or the shared supervisor's Pods (the
+/// Service's own pod selector, read at render time — never hard-coded,
+/// because the Helm chart's supervisor labels vary by release). No DNS, no
+/// gateway: the boundary's in-guest DNS relay forwards through the
+/// supervisor's network mediation, and the supervisor connection uses
+/// driver-resolved addresses.
 ///
 /// Ingress is deny-all (`policyTypes: [Ingress, Egress]` with no ingress
 /// rules): the boundary dials out (`RuntimeInitiatedTlsTcp`), so the guest
@@ -547,7 +834,7 @@ pub fn render_fence(
     namespace: &str,
     sandbox_id: &str,
     gateway_id: Option<&str>,
-    supervisor: &SupervisorEndpoint,
+    target: &KubeVirtSupervisorTarget,
 ) -> serde_json::Value {
     let mut labels = BTreeMap::new();
     labels.insert(
@@ -564,12 +851,6 @@ pub fn render_fence(
             gw_id.to_string(),
         );
     }
-
-    let supervisor_selector: serde_json::Map<String, serde_json::Value> = supervisor
-        .pod_selector
-        .iter()
-        .map(|(k, v)| (k.clone(), serde_json::json!(v)))
-        .collect();
 
     serde_json::json!({
         "apiVersion": "networking.k8s.io/v1",
@@ -588,16 +869,9 @@ pub fn render_fence(
             },
             "policyTypes": ["Ingress", "Egress"],
             "egress": [{
-                "to": [{
-                    "namespaceSelector": {
-                        "matchLabels": {
-                            "kubernetes.io/metadata.name": supervisor.namespace
-                        }
-                    },
-                    "podSelector": {"matchLabels": supervisor_selector}
-                }],
+                "to": target.fence_egress_to(),
                 "ports": [{
-                    "port": supervisor.port,
+                    "port": target.port(),
                     "protocol": "TCP"
                 }]
             }]
@@ -701,10 +975,12 @@ pub async fn verify_fence(
 mod fence_tests {
     use super::*;
 
-    pub(super) fn supervisor() -> SupervisorEndpoint {
-        SupervisorEndpoint {
-            namespace: "openshell".to_string(),
+    pub(super) fn supervisor() -> KubeVirtSupervisorTarget {
+        KubeVirtSupervisorTarget::Shared {
             authority: "openshell-supervisor.openshell.svc:5500".to_string(),
+            address: "10.43.0.10:5500".parse().unwrap(),
+            route: "route-1".to_string(),
+            namespace: "openshell".to_string(),
             pod_selector: BTreeMap::from([
                 (
                     "app.kubernetes.io/name".to_string(),
@@ -716,12 +992,35 @@ mod fence_tests {
                 ),
             ]),
             port: 5500,
-            address: "10.43.0.10:5500".parse().unwrap(),
         }
     }
 
     fn rendered_fence() -> serde_json::Value {
         render_fence("kvpoc-sandboxes", "sbx-1", Some("gw"), &supervisor())
+    }
+
+    fn dedicated_fence() -> serde_json::Value {
+        render_fence(
+            "kvpoc-sandboxes",
+            "sbx-1",
+            Some("gw"),
+            &KubeVirtSupervisorTarget::Dedicated {
+                authority: "os-supervisor-sbx-1.kvpoc-sandboxes.svc:5500".to_string(),
+                address: "10.43.5.10:5500".parse().unwrap(),
+                supervisor_pod_uid: "supervisor-pod-uid-1".to_string(),
+                pod_selector: BTreeMap::from([
+                    (
+                        "openshell.ai/boundary-pair".to_string(),
+                        "sbx-1".to_string(),
+                    ),
+                    (
+                        "openshell.ai/boundary-role".to_string(),
+                        "supervisor".to_string(),
+                    ),
+                ]),
+                port: 5500,
+            },
+        )
     }
 
     fn observed(uid: &str, rv: &str, spec: serde_json::Value) -> ObservedFence {
@@ -779,6 +1078,42 @@ mod fence_tests {
     #[test]
     fn fence_name_is_derived_from_sandbox_id() {
         assert_eq!(fence_name("sbx-1"), "openshell-kubevirt-fence-sbx-1");
+    }
+
+    #[test]
+    fn dedicated_fence_selects_only_this_sandboxes_supervisor_pod() {
+        let fence = dedicated_fence();
+        let policy_types = fence["spec"]["policyTypes"].as_array().unwrap();
+        assert!(policy_types.contains(&serde_json::json!("Ingress")));
+        assert!(policy_types.contains(&serde_json::json!("Egress")));
+        // No ingress rules: deny-all ingress, same as the shared fence.
+        assert!(fence["spec"]["ingress"].is_null());
+        // The egress peer is a same-namespace podSelector (no
+        // namespaceSelector): only this sandbox's dedicated supervisor Pod.
+        let to = &fence["spec"]["egress"][0]["to"][0];
+        assert!(
+            to.get("namespaceSelector").is_none(),
+            "a dedicated supervisor lives in the sandbox namespace: {to}"
+        );
+        assert_eq!(
+            to["podSelector"]["matchLabels"]["openshell.ai/boundary-pair"],
+            "sbx-1"
+        );
+        assert_eq!(
+            to["podSelector"]["matchLabels"]["openshell.ai/boundary-role"],
+            "supervisor"
+        );
+        assert_eq!(fence["spec"]["egress"][0]["ports"][0]["port"], 5500);
+    }
+
+    #[test]
+    fn dedicated_and_shared_fence_specs_differ() {
+        // The two topologies render different egress targets, so a fence
+        // created for one topology fails the other's start-time
+        // verification (spec drift).
+        let dedicated = dedicated_fence();
+        let shared = rendered_fence();
+        assert_ne!(dedicated["spec"], shared["spec"]);
     }
 
     #[test]
@@ -971,6 +1306,15 @@ mod payload_tests {
         let auth = test_launch_authentication();
         let session_id = auth.supervisor.session_id;
         let supervisor = fence_tests::supervisor();
+        let target = KubeVirtSupervisorTarget::Shared {
+            authority: "openshell-supervisor.openshell.svc:5500".to_string(),
+            address: "10.43.0.10:5500".parse().unwrap(),
+            route: "route-1".to_string(),
+            namespace: "openshell".to_string(),
+            pod_selector: BTreeMap::new(),
+            port: 5500,
+        };
+        let _ = supervisor;
         let bootstrap = render_kubevirt_bootstrap(
             &auth,
             "sbx-1",
@@ -980,8 +1324,7 @@ mod payload_tests {
             "np-uid-1",
             "1945",
             serde_json::json!({}),
-            &supervisor,
-            "route-1",
+            &target,
             10001,
             10001,
         )
@@ -1067,8 +1410,7 @@ pub fn render_kubevirt_bootstrap(
     fence_uid: &str,
     fence_resource_version: &str,
     fence_spec: serde_json::Value,
-    supervisor: &SupervisorEndpoint,
-    route: &str,
+    target: &KubeVirtSupervisorTarget,
     workload_uid: u32,
     workload_gid: u32,
 ) -> Result<KubeVirtBootstrap, String> {
@@ -1099,12 +1441,10 @@ pub fn render_kubevirt_bootstrap(
         image_identity: guest_image.to_string(),
         network_policy_uid: fence_uid.to_string(),
         network_policy_resource_version: fence_resource_version.to_string(),
-        // W2: the authority is the supervisor Service's DNS name. The
-        // SupervisorEndpoint carries it; for the PoC this is the
-        // namespace-local service name.
-        supervisor_authority: supervisor.authority.clone(),
-        supervisor_addresses: vec![supervisor.address],
-        route: route.to_string(),
+        // The supervisor target carries the topology: the per-sandbox
+        // Service of a dedicated supervisor Pod, or the shared supervisor's
+        // Service plus this sandbox's route handle.
+        supervisor: target.clone(),
         // W3: the supervisor's TLS client config (how it authenticates the
         // boundary). The trust anchor is the session CA (from
         // generate_sandbox_tls_material, embedded in the certificate chain);
