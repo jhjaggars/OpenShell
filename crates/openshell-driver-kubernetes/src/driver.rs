@@ -4067,6 +4067,17 @@ impl KubernetesComputeDriver {
         // model decided.
         let mut vm = crate::kubevirt::render_virtual_machine(&params);
         vm.data["spec"]["runStrategy"] = serde_json::json!("Halted");
+        // The in-flight annotation maps the Halted window to a
+        // `Bootstrapping` condition (Provisioning), not `Suspended`
+        // (Stopped, which would withdraw the supervisor instance this
+        // create is about to register).
+        vm.metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                crate::kubevirt::KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION.to_string(),
+                "true".to_string(),
+            );
         // The main process spec is encoded once at create and persisted on
         // the VM so the start path can re-register the shared instance
         // (the driver's start API does not carry the sandbox spec).
@@ -4385,10 +4396,16 @@ impl KubernetesComputeDriver {
             return Err(error);
         }
 
-        // Start the VM: patch runStrategy from Halted to Once.
+        // Start the VM: patch runStrategy from Halted to Once and clear the
+        // in-flight annotation (a later Halted without it is a user stop).
         patch_dynamic_object_with_resource_version_retry(&vm_api, &kube_name, |version| {
             serde_json::json!({
-                "metadata": {"resourceVersion": version},
+                "metadata": {
+                    "resourceVersion": version,
+                    "annotations": {
+                        crate::kubevirt::KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION: null
+                    }
+                },
                 "spec": {"runStrategy": "Once"}
             })
         })
@@ -4815,7 +4832,12 @@ impl KubernetesComputeDriver {
             let api = api.clone();
             let kube_name = kube_name.clone();
             async move {
-                let patch = serde_json::json!({"spec": {"runStrategy": strategy}});
+                let patch = serde_json::json!({
+                    "metadata": {"annotations": {
+                        crate::kubevirt::KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION: null
+                    }},
+                    "spec": {"runStrategy": strategy}
+                });
                 tokio::time::timeout(
                     KUBE_API_TIMEOUT,
                     api.patch(&kube_name, &PatchParams::default(), &Patch::Merge(&patch)),

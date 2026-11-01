@@ -305,6 +305,16 @@ const KUBEVIRT_VM_LABEL_VALUE: &str = "openshell";
 pub const KUBEVIRT_WORKLOAD_UID: u32 = 10001;
 pub const KUBEVIRT_WORKLOAD_GID: u32 = 10001;
 
+/// Set on the `VirtualMachine` while the driver's create still holds it
+/// `Halted` (the W6 window between capturing the VM's UID and patching
+/// `runStrategy` to `Once`). A `Halted` VM with this annotation maps to a
+/// `Bootstrapping=True` condition — the gateway composes `Provisioning`,
+/// the same escape the pod path uses for a starting generation — instead
+/// of `Suspended=True`, which would compose `Stopped` and withdraw the
+/// shared-supervisor instance before the guest's boundary can dial. A
+/// `Halted` VM WITHOUT the annotation is a user stop (`Suspended=True`).
+pub const KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION: &str = "openshell.ai/kubevirt-create-in-flight";
+
 pub fn bootstrap_secret_name(kube_name: &str) -> String {
     format!("{kube_name}-bootstrap")
 }
@@ -406,7 +416,20 @@ fn vm_status_from_object(
         .and_then(|spec| spec.get("runStrategy"))
         .and_then(serde_json::Value::as_str)
         == Some("Halted");
-    let stopped = halted;
+    // The create path holds the VM `Halted` while it captures the UID and
+    // builds the fence, bootstrap Secret, and shared-instance registration
+    // before patching `runStrategy` to `Once`. During that window the
+    // annotation above is present: report `Bootstrapping` (the gateway
+    // composes `Provisioning`) rather than `Suspended` (which composes
+    // `Stopped` and withdraws the supervisor instance the create just
+    // registered).
+    let create_in_flight = obj
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION))
+        .is_some_and(|value| value == "true");
+    let stopped = halted && !create_in_flight;
 
     let printable = status_obj
         .get("printableStatus")
@@ -435,6 +458,15 @@ fn vm_status_from_object(
         },
         transition_time: None,
     });
+    if halted && create_in_flight {
+        conditions.push(DriverCondition {
+            r#type: "Bootstrapping".to_string(),
+            status: "True".to_string(),
+            reason: "SandboxRuntimeGenerationStarting".to_string(),
+            message: "driver create is provisioning the VirtualMachine's companions".to_string(),
+            transition_time: None,
+        });
+    }
     if stopped {
         conditions.push(DriverCondition {
             r#type: "Suspended".to_string(),
@@ -1019,6 +1051,64 @@ mod kubevirt_review_tests {
         assert!(terminal_vm_failure("WaitingForVolumeBinding", None, false).is_none());
         // A Succeeded VMI under a ready VM is not a failure signal.
         assert!(terminal_vm_failure("Running", Some("Succeeded"), true).is_none());
+    }
+
+    #[test]
+    fn halted_vm_in_create_window_maps_to_bootstrapping_not_suspended() {
+        // The create path holds the VM Halted while it builds the fence,
+        // bootstrap Secret, and shared-instance registration. With the
+        // in-flight annotation present, the snapshot must carry
+        // `Bootstrapping=True` and no `Suspended=True` — the gateway
+        // composes Provisioning (keeping the supervisor instance) rather
+        // than Stopped (which withdraws it before the guest dials).
+        let cfg = review_config();
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+        vm.data["spec"]["runStrategy"] = serde_json::json!("Halted");
+        vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Stopped"});
+        vm.metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION.to_string(),
+                "true".to_string(),
+            );
+        let (_, sbx) =
+            sandbox_from_vm_object_with_vmi("kvpoc-sandboxes", vm, None).expect("converts");
+        let conditions = sbx.status.unwrap().conditions;
+        assert!(
+            conditions
+                .iter()
+                .any(|condition| condition.r#type == "Bootstrapping" && condition.status == "True"),
+            "in-flight Halted VM must report Bootstrapping: {conditions:?}"
+        );
+        assert!(
+            !conditions
+                .iter()
+                .any(|condition| condition.r#type == "Suspended" && condition.status == "True"),
+            "in-flight Halted VM must not report Suspended: {conditions:?}"
+        );
+
+        // Without the annotation the same Halted VM is a user stop:
+        // Suspended=True, no Bootstrapping.
+        let cfg = review_config();
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+        vm.data["spec"]["runStrategy"] = serde_json::json!("Halted");
+        vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Stopped"});
+        let (_, sbx) =
+            sandbox_from_vm_object_with_vmi("kvpoc-sandboxes", vm, None).expect("converts");
+        let conditions = sbx.status.unwrap().conditions;
+        assert!(
+            conditions
+                .iter()
+                .any(|condition| condition.r#type == "Suspended" && condition.status == "True"),
+            "user-stopped Halted VM must report Suspended: {conditions:?}"
+        );
+        assert!(
+            !conditions
+                .iter()
+                .any(|condition| condition.r#type == "Bootstrapping"),
+            "user-stopped Halted VM must not report Bootstrapping: {conditions:?}"
+        );
     }
 
     #[test]
