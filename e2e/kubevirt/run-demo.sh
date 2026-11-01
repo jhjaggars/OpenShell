@@ -39,6 +39,9 @@ FENCE_PREFIX="openshell-kubevirt-fence-"
 step() { echo; echo "=== $* ==="; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+WORKDIR="$(mktemp -d /tmp/kvpoc-demo-XXXXXX)"
+trap 'rm -rf "${WORKDIR}"' EXIT
+
 sandbox_phase() {
     "${OPENSHELL_CLI}" sandbox get "${NAME}" 2>/dev/null | grep -a "Phase:" | head -1 \
         | sed 's/^ *//' || true
@@ -85,6 +88,15 @@ fence_name() {
 # 74); each step's content assertions decide success, so only that code is
 # swallowed. The workload's own exit codes (e.g. a denied connect) still
 # propagate.
+# Assert the supervisor logged an OCSF NET:OPEN DENIED line for the
+# destination, so a network failure cannot pass as a policy deny.
+supervisor_denied() {
+    local destination="$1"
+    kubectl logs -n "${SUPERVISOR_NAMESPACE}" deployment/kvpoc-openshell-supervisor \
+        --since=2m 2>/dev/null \
+        | grep -a "OCSF NET:OPEN.*DENIED.*${destination}"
+}
+
 exec_in_sandbox() {
     "${OPENSHELL_CLI}" sandbox exec "${NAME}" -- "$@" || {
         local rc=$?
@@ -130,16 +142,16 @@ LAUNCHER_PODS="$(kubectl get pods -n "${SANDBOX_NAMESPACE}" \
 echo "exactly one virt-launcher pod matches the fence podSelector"
 
 step "3/10 exec inside the VM"
-exec_in_sandbox sh -c 'uname -a; id; cat /proc/1/comm' | tee /tmp/kvpoc-demo-exec.log
-grep -q "uid=10001(sandbox)" /tmp/kvpoc-demo-exec.log \
+exec_in_sandbox sh -c 'uname -a; id; cat /proc/1/comm' | tee ${WORKDIR}/exec.log
+grep -q "uid=10001(sandbox)" ${WORKDIR}/exec.log \
     || fail "workload does not run as the provisioned sandbox user"
-grep -q "^init$" /tmp/kvpoc-demo-exec.log || fail "PID 1 is not the guest init"
+grep -q "^init$" ${WORKDIR}/exec.log || fail "PID 1 is not the guest init"
 
 step "4/10 no gateway material in the workload environment"
 if exec_in_sandbox sh -c \
     'env | grep -iE "BOUNDARY|PRIVATE|TOKEN|OPENSHELL_ENDPOINT"' \
-    > /tmp/kvpoc-demo-env.log 2>&1; then
-    cat /tmp/kvpoc-demo-env.log >&2
+    > ${WORKDIR}/env.log 2>&1; then
+    cat ${WORKDIR}/env.log >&2
     fail "gateway material found in the workload environment"
 fi
 echo "environment clean (no BOUNDARY/PRIVATE/TOKEN/OPENSHELL_ENDPOINT vars)"
@@ -147,31 +159,62 @@ echo "environment clean (no BOUNDARY/PRIVATE/TOKEN/OPENSHELL_ENDPOINT vars)"
 step "5/10 L4 allow/deny and L7 HTTPS GET allow / POST deny"
 exec_in_sandbox sh -c \
     'nc -z -w 10 one.one.one.one 443 && echo "L4 ALLOW: connected"' \
-    | tee /tmp/kvpoc-demo-l4.log
-grep -q "L4 ALLOW: connected" /tmp/kvpoc-demo-l4.log \
+    | tee ${WORKDIR}/l4.log
+grep -q "L4 ALLOW: connected" ${WORKDIR}/l4.log \
     || fail "L4 connect to the allowed host was denied"
 if exec_in_sandbox sh -c 'nc -z -w 10 example.org 80' \
-    > /tmp/kvpoc-demo-l4deny.log 2>&1; then
+    > ${WORKDIR}/l4deny.log 2>&1; then
     fail "L4 connect to a non-allowed host succeeded"
 fi
-echo "L4 DENY: connect to example.org:80 blocked"
+supervisor_denied "example.org:80" \
+    || fail "no matching OCSF NET:OPEN DENIED line for example.org:80"
+echo "L4 DENY: connect to example.org:80 blocked (OCSF DENIED confirmed)"
 exec_in_sandbox sh -c 'wget -q -T 20 -O - https://example.com/' \
-    | tee /tmp/kvpoc-demo-l7get.log
-grep -q "Example Domain" /tmp/kvpoc-demo-l7get.log \
+    | tee ${WORKDIR}/l7get.log
+grep -q "Example Domain" ${WORKDIR}/l7get.log \
     || fail "L7 GET over HTTPS did not return the page (CA delivery or policy broken)"
 echo "L7 GET over HTTPS allowed (per-sandbox proxy CA trusted in the guest)"
 exec_in_sandbox sh -c 'wget -q -T 20 -O /dev/null --post-data=x https://example.com/' \
-    > /tmp/kvpoc-demo-l7post.log 2>&1 \
+    > ${WORKDIR}/l7post.log 2>&1 \
     && fail "L7 POST was not denied" || true
-grep -q "403" /tmp/kvpoc-demo-l7post.log \
-    || { cat /tmp/kvpoc-demo-l7post.log >&2; fail "L7 POST denial was not a policy 403"; }
+grep -q "403" ${WORKDIR}/l7post.log \
+    || { cat ${WORKDIR}/l7post.log >&2; fail "L7 POST denial was not a policy 403"; }
 echo "L7 POST denied (HTTP 403)"
 
 step "6/10 direct egress from the guest is blocked"
 if exec_in_sandbox sh -c 'nc -z -w 10 1.1.1.1 443'; then
     fail "raw TCP to 1.1.1.1:443 escaped the boundary"
 fi
-echo "direct egress to 1.1.1.1:443 blocked (no policy allow; the fence would also block it at the launcher pod)"
+supervisor_denied "1.1.1.1:443" \
+    || fail "no matching OCSF NET:OPEN DENIED line for 1.1.1.1:443"
+echo "direct egress to 1.1.1.1:443 blocked (OCSF DENIED confirmed)"
+
+# N4: prove the FENCE (not only the boundary) blocks direct egress: from
+# the launcher pod's network namespace — outside the guest, with no
+# boundary or broker — a raw connect to an external address must be
+# refused, while the supervisor Service must remain reachable.
+LAUNCHER="$(kubectl get pods -n "${SANDBOX_NAMESPACE}" \
+    -l kubevirt.io=virt-launcher,openshell.ai/sandbox-id="${SBX_ID}" \
+    -o jsonpath='{.items[0].metadata.name}')"
+[ -n "${LAUNCHER}" ] || fail "no virt-launcher pod found"
+SUPERVISOR_IP="$(kubectl get svc -n "${SUPERVISOR_NAMESPACE}" \
+    kvpoc-openshell-supervisor -o jsonpath='{.spec.clusterIP}' 2>/dev/null)"
+[ -n "${SUPERVISOR_IP}" ] || fail "shared supervisor Service has no ClusterIP"
+kubectl exec -n "${SANDBOX_NAMESPACE}" "${LAUNCHER}" -c compute -- \
+    timeout 8 openssl s_client -connect 1.1.1.1:443 \
+    > ${WORKDIR}/fence-bypass.log 2>&1 || true
+grep -q "Connection refused" ${WORKDIR}/fence-bypass.log \
+    || { cat ${WORKDIR}/fence-bypass.log >&2; \
+         fail "raw TCP from the launcher pod to 1.1.1.1:443 was not refused by the fence"; }
+echo "fence check: launcher pod -> 1.1.1.1:443 refused (Connection refused)"
+if kubectl exec -n "${SANDBOX_NAMESPACE}" "${LAUNCHER}" -c compute -- \
+    timeout 8 openssl s_client -connect "${SUPERVISOR_IP}:5500" \
+    > ${WORKDIR}/fence-control.log 2>&1 \
+    && grep -q "Connection refused" ${WORKDIR}/fence-control.log; then
+    cat ${WORKDIR}/fence-control.log >&2
+    fail "launcher pod -> supervisor Service connect was refused (fence too narrow?)"
+fi
+echo "fence check: launcher pod -> supervisor ${SUPERVISOR_IP}:5500 reachable (selective)"
 
 step "7/10 stop -> start -> Ready with VM and fence UIDs unchanged"
 "${OPENSHELL_CLI}" sandbox stop "${NAME}"
@@ -195,12 +238,12 @@ step "8/10 fence verification: spec drift fails start, label-only edit passes"
 "${OPENSHELL_CLI}" sandbox stop "${NAME}"
 kubectl patch netpol -n "${SANDBOX_NAMESPACE}" "${FENCE}" --type=json \
     -p '[{"op":"add","path":"/spec/egress/-","value":{}}]' >/dev/null
-if "${OPENSHELL_CLI}" sandbox start "${NAME}" > /tmp/kvpoc-demo-drift.log 2>&1; then
+if "${OPENSHELL_CLI}" sandbox start "${NAME}" > ${WORKDIR}/drift.log 2>&1; then
     fail "start succeeded despite fence spec drift"
 fi
-grep -q "spec drifted" /tmp/kvpoc-demo-drift.log \
-    || { cat /tmp/kvpoc-demo-drift.log >&2; fail "start failure was not the drift error"; }
-echo "spec drift rejected: $(grep -a 'drifted' /tmp/kvpoc-demo-drift.log | head -1 | tr -s ' ')"
+grep -q "spec drifted" ${WORKDIR}/drift.log \
+    || { cat ${WORKDIR}/drift.log >&2; fail "start failure was not the drift error"; }
+echo "spec drift rejected: $(grep -a 'drifted' ${WORKDIR}/drift.log | head -1 | tr -s ' ')"
 kubectl patch netpol -n "${SANDBOX_NAMESPACE}" "${FENCE}" --type=json \
     -p '[{"op":"test","path":"/spec/egress/1","value":{}},{"op":"remove","path":"/spec/egress/1"}]' \
     >/dev/null

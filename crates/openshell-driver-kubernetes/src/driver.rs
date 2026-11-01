@@ -7236,15 +7236,18 @@ fn shared_instance_registration(
     ))
 }
 
-/// The value-taking core of `shared_instance_registration`, shared by the
-/// pod path (which extracts values from the Sandbox CR) and the `KubeVirt`
 /// The pool's durable route record is removed asynchronously after a
 /// withdrawal (the gateway reconciles every ~2s), so an immediate
 /// stop -> start can race it: the launch is refused with "the sandbox
 /// instance route is recorded for another generation". The `KubeVirt`
 /// registration retries that specific refusal for a bounded window.
+/// The message is pinned by a test in `openshell-server`'s supervisor-pool
+/// suite; if the wording changes, that test fails and this constant needs
+/// updating.
 const ROUTE_RECORD_RACE_MESSAGE: &str = "route is recorded for another generation";
 
+/// The value-taking core of `shared_instance_registration`, shared by the
+/// pod path (which extracts values from the Sandbox CR) and the `KubeVirt`
 /// path (which has them from the gateway's `Sandbox` object directly).
 #[allow(clippy::too_many_arguments)]
 fn shared_instance_registration_from_values(
