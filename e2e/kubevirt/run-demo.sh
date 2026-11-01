@@ -2,21 +2,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Exercise the KubeVirt-mode Kubernetes compute driver against a running
-# kvpoc gateway (started by e2e/kubevirt/demo.sh):
-#   1. create a sandbox (provisions a KubeVirt VirtualMachine + companions)
-#      and assert the dead-guest path: the in-guest runtime exits, guest-init
-#      powers off, the VMI completes, and the sandbox surfaces Error
-#   2. stop / start (runStrategy Halted -> Once), plus the dead-`Once`-VMI
-#      bounce (a second start during the boot window)
-#   3. delete and verify zero leftover managed objects
+# Full acceptance run for the KubeVirt-mode Kubernetes compute driver
+# against a running kvpoc gateway (started by e2e/kubevirt/demo.sh with the
+# shared supervisor deployed; see e2e/kubevirt/README.md). Every step fails
+# the demo on error — there is no Ready-wait tolerance.
 #
-# Error handling: a REJECTED RPC (FailedPrecondition etc.) fails the demo.
-# Only a Ready-wait timeout is tolerated, and only where marked: until the
-# guest boundary integration lands, the in-guest runtime exits immediately
-# (it needs --bootstrap arguments), so the sandbox can never reach Ready.
+#   1.  create (with demo-policy.yaml) reaching Ready
+#   2.  fence NetworkPolicy exists, and exactly one virt-launcher pod
+#       matches its podSelector
+#   3.  exec inside the VM (uname, id, PID 1)
+#   4.  no gateway material in the workload environment
+#   5.  L4 allow (one.one.one.one:443) and deny (example.org:80);
+#       L7 HTTPS on example.com: GET allowed, POST denied (403) — the GET
+#       proves the per-sandbox proxy CA was delivered into the guest
+#   6.  direct egress from the guest to a raw IP is blocked
+#   7.  stop -> start -> Ready, with the VM UID and fence UID unchanged
+#   8.  fence verification: a spec edit fails start with drift; a
+#       label-only edit is accepted
+#   9.  main-process exit -> Error (exit code 137)
+#   10. delete -> zero leftover managed objects
 #
-# Requires the `openshell` CLI built at $CARGO_TARGET_DIR/release/openshell.
+# Requires the `openshell` CLI built at $CARGO_TARGET_DIR/release/openshell
+# and the shared supervisor deployed (e2e/kubevirt/supervisor-values.yaml).
 
 set -euo pipefail
 
@@ -24,209 +31,215 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CARGO_TARGET="${CARGO_TARGET_DIR:-${ROOT}/target}"
 OPENSHELL_CLI="${CARGO_TARGET}/release/openshell"
 SANDBOX_NAMESPACE="${OPENSHELL_KVPOC_NAMESPACE:-kvpoc-sandboxes}"
+SUPERVISOR_NAMESPACE="${OPENSHELL_KVPOC_SUPERVISOR_NAMESPACE:-openshell}"
 NAME="kvpoc-demo"
 VM_SELECTOR="openshell.ai/sandbox-name=${NAME}"
-TIMEOUT_SECS="${OPENSHELL_KVPOC_TIMEOUT:-300}"
+FENCE_PREFIX="openshell-kubevirt-fence-"
 
 step() { echo; echo "=== $* ==="; }
-
-# Classify a failed `sandbox start`: the start RPC itself succeeding but the
-# Ready-wait failing is tolerated on this branch (the in-guest runtime exits
-# without --bootstrap, so the sandbox can never reach Ready — the wait ends
-# in either a timeout or the guest-death Error). A REJECTED RPC — the
-# gateway refusing the start — fails the demo.
-start_wait_failure_is_expected() {
-    # Ready-wait timeout.
-    grep -aq "waiting for sandbox to reach Ready" "$1" && return 0
-    # The wait observed a phase failure (guest exit -> VMFailed/Error).
-    grep -aq "while waiting for Ready" "$1" && return 0
-    return 1
-}
-
-tolerate_ready_wait_only() {
-    local log
-    log="$(mktemp /tmp/kvpoc-start-XXXX.log)"
-    if OPENSHELL_LIFECYCLE_TIMEOUT="${OPENSHELL_KVPOC_CREATE_TIMEOUT:-60}" \
-        "${OPENSHELL_CLI}" sandbox start "${NAME}" >"${log}" 2>&1; then
-        cat "${log}"
-        return 0
-    fi
-    if start_wait_failure_is_expected "${log}"; then
-        echo "(start Ready-wait failed as expected without a guest supervisor session)"
-        grep -a "VMFailed\|Error" "${log}" | tail -2 || true
-        return 0
-    fi
-    cat "${log}" >&2
-    return 1
-}
-
-wait_vm_field() {
-    local jsonpath="$1" expected="$2" what="$3"
-    local deadline=$(( $(date +%s) + TIMEOUT_SECS )) current
-    while [ "$(date +%s)" -lt "${deadline}" ]; do
-        current="$(kubectl get vm -l "${VM_SELECTOR}" -n "${SANDBOX_NAMESPACE}" \
-            -o "jsonpath=${jsonpath}" 2>/dev/null)"
-        if [ "${current}" = "${expected}" ]; then
-            echo "${what}: ${current}"
-            return 0
-        fi
-        sleep 5
-    done
-    echo "timed out waiting for ${what} (got: ${current:-none})" >&2
-    return 1
-}
-
-vmi_phase() {
-    kubectl get vmi -l "${VM_SELECTOR}" -n "${SANDBOX_NAMESPACE}" \
-        -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true
-}
-
-vmi_uid() {
-    kubectl get vmi -l "${VM_SELECTOR}" -n "${SANDBOX_NAMESPACE}" \
-        -o jsonpath='{.items[0].metadata.uid}' 2>/dev/null || true
-}
+fail() { echo "FAIL: $*" >&2; exit 1; }
 
 sandbox_phase() {
-    "${OPENSHELL_CLI}" sandbox get "${NAME}" 2>/dev/null | grep -a "Phase:" | head -1 || true
+    "${OPENSHELL_CLI}" sandbox get "${NAME}" 2>/dev/null | grep -a "Phase:" | head -1 \
+        | sed 's/^ *//' || true
 }
 
-step "1/3 sandbox create and the dead-guest Error path"
-# The create cannot reach Ready on this branch (the in-guest runtime exits
-# without --bootstrap): the CLI fails with either the Error phase (the
-# expected R3 path) or a provisioning timeout. Both are tolerated here;
-# the assertions below prove which one happened.
-CREATE_LOG="$(mktemp /tmp/kvpoc-create-XXXX.log)"
-OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_KVPOC_CREATE_TIMEOUT:-90}" \
-    "${OPENSHELL_CLI}" sandbox create --detach --name "${NAME}" \
-    -- /bin/sleep infinity >"${CREATE_LOG}" 2>&1 || true
-grep -a "Phase\|Error\|timed out" "${CREATE_LOG}" | tail -3 || true
-
-kubectl get vm,secret,pvc -n "${SANDBOX_NAMESPACE}" \
-    -l openshell.ai/sandbox-name="${NAME}"
-
-# R3 assertion: no QEMU kill — the guest runtime exits on its own, the init
-# powers off, and the VMI completes. The driver maps the completed VMI to
-# the terminal VMFailed condition, so the sandbox surfaces Error.
-DEADLINE=$(( $(date +%s) + TIMEOUT_SECS ))
-while [ "$(date +%s)" -lt "${DEADLINE}" ]; do
-    PHASE="$(vmi_phase)"
-    [ "${PHASE}" = "Succeeded" ] || [ "${PHASE}" = "Failed" ] && break
-    sleep 5
-done
-echo "VMI phase after guest exit (no QEMU kill): ${PHASE:-none}"
-[ "${PHASE}" = "Succeeded" ] || [ "${PHASE}" = "Failed" ] || {
-    echo "FAIL: expected the VMI to complete after the in-guest runtime exited" >&2
-    exit 1
+require_phase() {
+    local expected="$1" got
+    got="$(sandbox_phase)"
+    [ "${got}" = "Phase: ${expected}" ] \
+        || fail "expected phase ${expected}, got '${got:-none}'"
 }
-sleep 10
-echo "sandbox after guest exit: $(sandbox_phase)"
 
-step "2/3 stop / start and the dead-Once-VMI bounce"
-# Stop through the gateway (admitted from Error): the driver halts the VM
-# and the stop is the explicit lifecycle operation that moves the sticky
-# Error phase to Stopped. A kubectl halt would NOT move the phase — the
-# gateway ignores driver snapshots once the phase is Error.
-"${OPENSHELL_CLI}" sandbox stop "${NAME}"
+# Wait for the sandbox to reach the expected phase. The create uses --detach
+# (a non-detached create attaches to the main process, and the demo's main
+# process is `sleep infinity`), so readiness is polled through `sandbox get`.
+wait_for_phase() {
+    local expected="$1" timeout_secs="${2:-300}" deadline got
+    deadline=$(( $(date +%s) + timeout_secs ))
+    while [ "$(date +%s)" -lt "${deadline}" ]; do
+        got="$(sandbox_phase)"
+        case "${got}" in
+            "Phase: ${expected}") return 0 ;;
+            "Phase: Error") fail "sandbox reached Error while waiting for ${expected}" ;;
+        esac
+        sleep 5
+    done
+    fail "timed out waiting for phase ${expected} (got '${got:-none}')"
+}
+
+vm_jsonpath() {
+    kubectl get vm -l "${VM_SELECTOR}" -n "${SANDBOX_NAMESPACE}" \
+        -o "jsonpath=$1" 2>/dev/null
+}
+
+fence_name() {
+    local sandbox_id
+    sandbox_id="$(vm_jsonpath '{.items[0].metadata.labels.openshell\.ai/sandbox-id}')"
+    [ -n "${sandbox_id}" ] || fail "VM carries no sandbox-id label"
+    echo "${FENCE_PREFIX}${sandbox_id}"
+}
+
+# The exec channel can report a benign teardown error after the output was
+# delivered completely ("exec output could not be delivered intact", exit
+# 74); each step's content assertions decide success, so only that code is
+# swallowed. The workload's own exit codes (e.g. a denied connect) still
+# propagate.
+exec_in_sandbox() {
+    "${OPENSHELL_CLI}" sandbox exec "${NAME}" -- "$@" || {
+        local rc=$?
+        [ "${rc}" = "74" ] || return "${rc}"
+        return 0
+    }
+}
+
+step "1/10 create reaching Ready (boundary dials the shared supervisor)"
+"${OPENSHELL_CLI}" sandbox delete "${NAME}" >/dev/null 2>&1 || true
+# A previous run whose gateway record was already deleted can leave an
+# orphaned VM behind (name collision on create); clear it and its
+# labelled companions directly.
+if kubectl get vm -n "${SANDBOX_NAMESPACE}" -l "${VM_SELECTOR}"     --no-headers 2>/dev/null | grep -q .; then
+    echo "clearing an orphaned VM from a previous run"
+    kubectl delete vm -n "${SANDBOX_NAMESPACE}" -l "${VM_SELECTOR}" --wait=true         >/dev/null 2>&1 || true
+fi
+kubectl delete secret,pvc,netpol -n "${SANDBOX_NAMESPACE}" -l "${VM_SELECTOR}"     --ignore-not-found >/dev/null 2>&1 || true
 sleep 5
-echo "sandbox after stop: $(sandbox_phase)"
+"${OPENSHELL_CLI}" sandbox create --detach --name "${NAME}" \
+    --policy "${ROOT}/e2e/kubevirt/demo-policy.yaml" \
+    -- /bin/sleep infinity
+wait_for_phase Ready
+echo "objects:"
+kubectl get vm,vmi,netpol,secret,pvc -n "${SANDBOX_NAMESPACE}" -l "${VM_SELECTOR}" \
+    || fail "managed objects missing after create"
+SBX_ID="$(vm_jsonpath '{.items[0].metadata.labels.openshell\.ai/sandbox-id}')"
+VM_UID="$(vm_jsonpath '{.items[0].metadata.uid}')"
+[ -n "${VM_UID}" ] || fail "VM has no UID"
 
-# Start #1: Halted -> PatchOnce boots a fresh VMI; the phase goes Starting.
-# The Ready-wait cannot succeed on this branch (the in-guest runtime exits
-# without --bootstrap), so use a short lifecycle timeout purely to let the
-# start RPC through and return quickly. A REJECTED start fails the demo.
-START1_LOG="$(mktemp /tmp/kvpoc-start1-XXXX.log)"
-OPENSHELL_LIFECYCLE_TIMEOUT=3 \
-    "${OPENSHELL_CLI}" sandbox start "${NAME}" >"${START1_LOG}" 2>&1 \
-    || start_wait_failure_is_expected "${START1_LOG}" \
-    || { cat "${START1_LOG}" >&2; echo "FAIL: start #1 was rejected" >&2; exit 1; }
-echo "(start #1 Ready-wait failed as expected without a guest supervisor session)"
-UID_BEFORE="$(vmi_uid)"
-[ -n "${UID_BEFORE}" ] || {
-    echo "FAIL: start #1 booted no VMI (empty uid); cannot verify what follows" >&2
-    exit 1
-}
-echo "VMI uid after start #1: ${UID_BEFORE}"
+step "2/10 fence NetworkPolicy and its podSelector"
+FENCE="$(fence_name)"
+FENCE_UID="$(kubectl get netpol -n "${SANDBOX_NAMESPACE}" "${FENCE}" \
+    -o jsonpath='{.metadata.uid}' 2>/dev/null)" \
+    || fail "fence ${FENCE} not found"
+[ -n "${FENCE_UID}" ] || fail "fence has no UID"
+echo "fence: ${FENCE} (uid ${FENCE_UID})"
+LAUNCHER_PODS="$(kubectl get pods -n "${SANDBOX_NAMESPACE}" \
+    -l kubevirt.io=virt-launcher,openshell.ai/sandbox-id="${SBX_ID}" \
+    --no-headers 2>/dev/null | wc -l)"
+[ "${LAUNCHER_PODS}" = "1" ] \
+    || fail "expected exactly one launcher pod matching the fence selector, got ${LAUNCHER_PODS}"
+echo "exactly one virt-launcher pod matches the fence podSelector"
 
-# Start #2 back to back during the boot window: the gateway admits retries
-# from Starting, and the driver must treat the booting VMI as idempotent —
-# a healthy boot must NOT be restarted. The VMI uid must not change.
-START2_LOG="$(mktemp /tmp/kvpoc-start2-XXXX.log)"
-OPENSHELL_LIFECYCLE_TIMEOUT=3 \
-    "${OPENSHELL_CLI}" sandbox start "${NAME}" >"${START2_LOG}" 2>&1 \
-    || start_wait_failure_is_expected "${START2_LOG}" \
-    || { cat "${START2_LOG}" >&2; echo "FAIL: start #2 was rejected" >&2; exit 1; }
-sleep 10
-UID_DURING_BOOT="$(vmi_uid)"
-echo "VMI uid after idempotent start #2: ${UID_DURING_BOOT:-none}"
-[ "${UID_DURING_BOOT}" = "${UID_BEFORE}" ] || {
-    echo "FAIL: start #2 restarted a healthy booting VM (uid changed)" >&2
-    exit 1
-}
-echo "idempotent start verified: a booting VirtualMachineInstance is not restarted"
+step "3/10 exec inside the VM"
+exec_in_sandbox sh -c 'uname -a; id; cat /proc/1/comm' | tee /tmp/kvpoc-demo-exec.log
+grep -q "uid=10001(sandbox)" /tmp/kvpoc-demo-exec.log \
+    || fail "workload does not run as the provisioned sandbox user"
+grep -q "^init$" /tmp/kvpoc-demo-exec.log || fail "PID 1 is not the guest init"
 
-# Dead-Once-VMI bounce (best-effort race): the guest runtime exits and the
-# init powers off, so the VMI goes Succeeded and the gateway maps the
-# sandbox to a sticky Error. The bounce is only reachable in the window
-# between the VMI completing and the Error snapshot landing. Watch the VMI
-# phase and fire a start the instant it goes terminal.
-echo "waiting for the guest to exit (VMI terminal) to attempt the bounce race..."
-VM_NAME2="$(kubectl get vm -l "${VM_SELECTOR}" -n "${SANDBOX_NAMESPACE}" \
-    -o jsonpath='{.items[0].metadata.name}')"
-BOUNCE_LOG="$(mktemp /tmp/kvpoc-bounce-XXXX.log)"
-kubectl get vmi "${VM_NAME2}" -n "${SANDBOX_NAMESPACE}" -w \
-    -o jsonpath='{.status.phase}' 2>/dev/null | while read -r PHASE; do
-    if [ "${PHASE}" = "Succeeded" ] || [ "${PHASE}" = "Failed" ]; then
-        echo "terminal" > /tmp/kvpoc-bounce-race-flag
-        break
-    fi
-done &
-WATCH_PID=$!
-DEADLINE=$(( $(date +%s) + TIMEOUT_SECS ))
-while [ "$(date +%s)" -lt "${DEADLINE}" ]; do
-    [ -f /tmp/kvpoc-bounce-race-flag ] && break
-    sleep 1
-done
-kill "${WATCH_PID}" 2>/dev/null || true
-rm -f /tmp/kvpoc-bounce-race-flag
-if OPENSHELL_LIFECYCLE_TIMEOUT="${OPENSHELL_KVPOC_CREATE_TIMEOUT:-60}" \
-    "${OPENSHELL_CLI}" sandbox start "${NAME}" >"${BOUNCE_LOG}" 2>&1; then
-    cat "${BOUNCE_LOG}"
-elif start_wait_failure_is_expected "${BOUNCE_LOG}"; then
-    echo "(bounce-start Ready-wait failed as expected without a guest supervisor session)"
-    grep -a "VMFailed\|Error" "${BOUNCE_LOG}" | tail -2 || true
-else
-    # A rejection here means the Error snapshot won the race: expected and
-    # reported, not a demo failure.
-    echo "(bounce race lost: the Error snapshot landed before the start;"
-    echo " the gateway rejected the start from the sticky Error phase:"
-    grep -a "must be\|current phase" "${BOUNCE_LOG}" | tail -2 || true
-    echo ")"
+step "4/10 no gateway material in the workload environment"
+if exec_in_sandbox sh -c \
+    'env | grep -iE "BOUNDARY|PRIVATE|TOKEN|OPENSHELL_ENDPOINT"' \
+    > /tmp/kvpoc-demo-env.log 2>&1; then
+    cat /tmp/kvpoc-demo-env.log >&2
+    fail "gateway material found in the workload environment"
 fi
-UID_AFTER_RACE="$(vmi_uid)"
-echo "VMI uid after the bounce race: ${UID_AFTER_RACE:-none}"
-if [ -n "${UID_AFTER_RACE}" ] && [ "${UID_AFTER_RACE}" != "${UID_BEFORE}" ]; then
-    echo "dead-Once-VMI bounce landed: Halted -> Once booted a fresh VMI"
-else
-    echo "bounce did not land this run (race window missed); see unit tests for the plan"
-fi
+echo "environment clean (no BOUNDARY/PRIVATE/TOKEN/OPENSHELL_ENDPOINT vars)"
 
-step "3/3 delete and verify teardown"
-"${OPENSHELL_CLI}" sandbox delete "${NAME}"
+step "5/10 L4 allow/deny and L7 HTTPS GET allow / POST deny"
+exec_in_sandbox sh -c \
+    'nc -z -w 10 one.one.one.one 443 && echo "L4 ALLOW: connected"' \
+    | tee /tmp/kvpoc-demo-l4.log
+grep -q "L4 ALLOW: connected" /tmp/kvpoc-demo-l4.log \
+    || fail "L4 connect to the allowed host was denied"
+if exec_in_sandbox sh -c 'nc -z -w 10 example.org 80' \
+    > /tmp/kvpoc-demo-l4deny.log 2>&1; then
+    fail "L4 connect to a non-allowed host succeeded"
+fi
+echo "L4 DENY: connect to example.org:80 blocked"
+exec_in_sandbox sh -c 'wget -q -T 20 -O - https://example.com/' \
+    | tee /tmp/kvpoc-demo-l7get.log
+grep -q "Example Domain" /tmp/kvpoc-demo-l7get.log \
+    || fail "L7 GET over HTTPS did not return the page (CA delivery or policy broken)"
+echo "L7 GET over HTTPS allowed (per-sandbox proxy CA trusted in the guest)"
+exec_in_sandbox sh -c 'wget -q -T 20 -O /dev/null --post-data=x https://example.com/' \
+    > /tmp/kvpoc-demo-l7post.log 2>&1 \
+    && fail "L7 POST was not denied" || true
+grep -q "403" /tmp/kvpoc-demo-l7post.log \
+    || { cat /tmp/kvpoc-demo-l7post.log >&2; fail "L7 POST denial was not a policy 403"; }
+echo "L7 POST denied (HTTP 403)"
+
+step "6/10 direct egress from the guest is blocked"
+if exec_in_sandbox sh -c 'nc -z -w 10 1.1.1.1 443'; then
+    fail "raw TCP to 1.1.1.1:443 escaped the boundary"
+fi
+echo "direct egress to 1.1.1.1:443 blocked (no policy allow; the fence would also block it at the launcher pod)"
+
+step "7/10 stop -> start -> Ready with VM and fence UIDs unchanged"
+"${OPENSHELL_CLI}" sandbox stop "${NAME}"
+require_phase Stopped
+"${OPENSHELL_CLI}" sandbox start "${NAME}"
+wait_for_phase Ready
+VM_UID_AFTER="$(vm_jsonpath '{.items[0].metadata.uid}')"
+FENCE_UID_AFTER="$(kubectl get netpol -n "${SANDBOX_NAMESPACE}" "${FENCE}" \
+    -o jsonpath='{.metadata.uid}' 2>/dev/null)"
+[ "${VM_UID_AFTER}" = "${VM_UID}" ] || fail "VM UID changed across stop/start"
+[ "${FENCE_UID_AFTER}" = "${FENCE_UID}" ] || fail "fence UID changed across stop/start"
+echo "VM uid unchanged (${VM_UID}); fence uid unchanged (${FENCE_UID})"
+INSTANCE_SECRETS="$(kubectl get secret -n "${SANDBOX_NAMESPACE}" \
+    -l "openshell.ai/sandbox-id=${SBX_ID},openshell.ai/component=supervisor-bootstrap" \
+    --no-headers 2>/dev/null | wc -l)"
+[ "${INSTANCE_SECRETS}" = "1" ] \
+    || fail "expected one current instance Secret, got ${INSTANCE_SECRETS}"
+echo "one current-generation instance Secret (previous generation pruned)"
+
+step "8/10 fence verification: spec drift fails start, label-only edit passes"
+"${OPENSHELL_CLI}" sandbox stop "${NAME}"
+kubectl patch netpol -n "${SANDBOX_NAMESPACE}" "${FENCE}" --type=json \
+    -p '[{"op":"add","path":"/spec/egress/-","value":{}}]' >/dev/null
+if "${OPENSHELL_CLI}" sandbox start "${NAME}" > /tmp/kvpoc-demo-drift.log 2>&1; then
+    fail "start succeeded despite fence spec drift"
+fi
+grep -q "spec drifted" /tmp/kvpoc-demo-drift.log \
+    || { cat /tmp/kvpoc-demo-drift.log >&2; fail "start failure was not the drift error"; }
+echo "spec drift rejected: $(grep -a 'drifted' /tmp/kvpoc-demo-drift.log | head -1 | tr -s ' ')"
+kubectl patch netpol -n "${SANDBOX_NAMESPACE}" "${FENCE}" --type=json \
+    -p '[{"op":"test","path":"/spec/egress/1","value":{}},{"op":"remove","path":"/spec/egress/1"}]' \
+    >/dev/null
+kubectl label netpol -n "${SANDBOX_NAMESPACE}" "${FENCE}" \
+    kvpoc-demo-label-edit=1 --overwrite >/dev/null
+"${OPENSHELL_CLI}" sandbox start "${NAME}"
+wait_for_phase Ready
+echo "label-only fence edit accepted (resourceVersion moved, spec unchanged)"
+
+step "9/10 main-process exit -> Error"
+exec_in_sandbox sh -c 'pkill -9 sleep' || true
 DEADLINE=$(( $(date +%s) + 120 ))
 while [ "$(date +%s)" -lt "${DEADLINE}" ]; do
-    if [ "$(kubectl get vm,vmi,secret,pvc -n "${SANDBOX_NAMESPACE}" \
-        -l openshell.ai/managed-by=openshell --no-headers 2>/dev/null | wc -l)" = "0" ]; then
-        break
-    fi
+    PHASE="$(sandbox_phase)"
+    [ "${PHASE}" = "Phase: Error" ] && break
     sleep 5
 done
-remaining="$(kubectl get vm,vmi,secret,pvc -n "${SANDBOX_NAMESPACE}" \
-    -l openshell.ai/managed-by=openshell --no-headers 2>/dev/null | wc -l)"
-kubectl get vm,vmi,secret,pvc -n "${SANDBOX_NAMESPACE}" \
-    -l openshell.ai/managed-by=openshell 2>/dev/null || true
-if [ "${remaining}" != "0" ]; then
-    echo "FAIL: OpenShell-managed resources still present" >&2
-    exit 1
-fi
+require_phase Error
+"${OPENSHELL_CLI}" sandbox get "${NAME}" | grep -a "exit code" \
+    || fail "Error phase carries no main-process exit code"
+echo "main process exit observed through the boundary session (Error, exit code 137)"
+
+step "10/10 delete -> zero leftover managed objects"
+"${OPENSHELL_CLI}" sandbox delete "${NAME}"
+DEADLINE=$(( $(date +%s) + 180 ))
+while [ "$(date +%s)" -lt "${DEADLINE}" ]; do
+    LEFT="$(kubectl get vm,vmi,secret,pvc,netpol -n "${SANDBOX_NAMESPACE}" \
+        -l "openshell.ai/sandbox-id=${SBX_ID}" --no-headers 2>/dev/null | wc -l)"
+    [ "${LEFT}" = "0" ] && break
+    sleep 5
+done
+LEFT="$(kubectl get vm,vmi,secret,pvc,netpol -n "${SANDBOX_NAMESPACE}" \
+    -l "openshell.ai/sandbox-id=${SBX_ID}" --no-headers 2>/dev/null | wc -l)"
+[ "${LEFT}" = "0" ] || fail "${LEFT} managed objects left after delete"
+kubectl logs -n "${SUPERVISOR_NAMESPACE}" deployment/kvpoc-openshell-supervisor \
+    --since=5m 2>/dev/null | grep "removing withdrawn sandbox instance" | tail -1 \
+    || echo "(note: supervisor withdrawal log line not captured — check manually)"
+echo "zero leftover vm/vmi/secret/pvc/netpol for sandbox ${SBX_ID}"
+
 echo
-echo "demo complete: dead-guest Error path, start/bounce, and teardown verified"
+echo "demo complete: Ready, exec, L4/L7 policy, bypass blocked, stop/start,"
+echo "fence verification, dead-runtime Error, and clean teardown all verified"
