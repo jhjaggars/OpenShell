@@ -91,6 +91,15 @@ Prerequisites: a Linux host with KVM (`/dev/kvm`), docker, k3d, kubectl, and
 this repo built (`cargo build --release -p openshell-server -p openshell-cli`;
 the guest image build compiles the supervisor itself as static musl).
 
+E2e prerequisites (discovered the hard way):
+- `OPENSHELL_BIN=$CARGO_TARGET_DIR/debug/openshell` — the sandbox_lifecycle
+  tests spawn the CLI via this env var (default is `target/debug/openshell`
+  relative to the repo, which misses when `CARGO_TARGET_DIR` is redirected)
+- `util-linux-script` installed — the TTY tests run the CLI under a PTY via
+  `/usr/bin/script`; on minimal Fedora installs this is a separate subpackage
+- `docker pull public.ecr.aws/docker/library/python:3.13-slim` — the
+  `driver_config_volume` suite builds an OCI test image from this base
+
 ```shell
 # 1. Cluster: k3d with /dev/kvm passed to the node and working DNS.
 #    (KubeVirt >= 1.9's containerDisk flow needs the Kubernetes ImageVolume
@@ -212,6 +221,39 @@ material); delete it to fully reset.
   `runtimeBackend: VirtualMachine` Sandbox CR extension (unmerged POC fork).
   If that lands, the driver could switch from direct VM creation back to the
   Sandbox CR with a VM workload.
+
+## Claims model (option A, user decision)
+
+The KubeVirt boundary claims model follows the VM driver's approach:
+
+- **Claimed:** `kubevirt.vm_uid` (the sandbox ID — a UUID stable across
+  stop/start; the VirtualMachine's own UID is not known when the
+  bootstrap Secret is rendered, because the Secret must exist before the
+  VM references it as a cloudInit volume), `kubevirt.generation`, and
+  `kubevirt.image_identity`.
+- **Evidence:** the virt-launcher egress NetworkPolicy's UID and
+  resourceVersion, projected against the generation via
+  `ProvisioningEvidence::from_enforcement_evidence`. The driver re-reads
+  the NetworkPolicy on every start and fails when the fence was
+  deleted, replaced (UID changed), or its spec drifted.
+- **Why the virt-launcher pod UID cannot be claimed:** KubeVirt creates
+  that pod asynchronously from the VM template, so its UID does not exist
+  when the boundary config is rendered.
+
+Who verifies the fence:
+- the driver attests it by re-reading the NetworkPolicy each generation
+  (`verify_fence` / `check_fence`);
+- the boundary checks the evidence's generation binding
+  (`contract.rs:254`);
+- descriptor/config consistency is enforced at
+  `isolation_protocol.rs:100` and on confirmation (`runtime.rs:757`);
+- neither the boundary nor the supervisor can independently query the
+  cluster.
+
+Image identity note: the VM driver claims the registry digest; the
+KubeVirt PoC claims the configured `guest_image` tag, which is weaker
+(a tag does not identify an image). The production path is a
+digest-pinned guest image.
 
 ## Follow-up: guest integration with main's boundary architecture
 

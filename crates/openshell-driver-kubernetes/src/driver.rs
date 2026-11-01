@@ -3991,6 +3991,31 @@ impl KubernetesComputeDriver {
             "Creating KubeVirt VirtualMachine sandbox"
         );
 
+        // Boundary bootstrap: when the sandbox spec carries launch
+        // authentication, render the boundary-config bootstrap (config +
+        // TLS + guest payload) instead of the legacy env-var userData.
+        // The fence NetworkPolicy is created before the VM so the
+        // boundary evidence can carry its UID.
+        let launch_authentication: Option<openshell_core::jwt::SandboxLaunchAuthentication> =
+            sandbox
+                .spec
+                .as_ref()
+                .filter(|spec| !spec.launch_authentication.is_empty())
+                .map(|spec| {
+                    crate::kubevirt::decode_launch_authentication(
+                        spec.launch_authentication.as_slice(),
+                    )
+                    .and_then(|opt| {
+                        opt.ok_or_else(|| {
+                            KubernetesDriverError::Precondition(
+                                "launch authentication was non-empty but decoded to None"
+                                    .to_string(),
+                            )
+                        })
+                    })
+                })
+                .transpose()?;
+
         let vm_api = crate::kubevirt::virtual_machine_api(&self.client, &namespace);
         // The VM is the owning resource: if it already exists this sandbox
         // already exists.
@@ -4015,6 +4040,91 @@ impl KubernetesComputeDriver {
         // controller waits for referenced volumes to exist. An orphan from an
         // out-of-band VM deletion is deleted and waited for, so the recreate
         // cannot collide with a terminating object.
+        //
+        // When the boundary path is active, the Secret's userData carries
+        // the boundary bootstrap (base64 artifacts + workload identity)
+        // instead of the legacy env-var payload. The fence NetworkPolicy
+        // is created first so its UID feeds the evidence.
+        let mut created_fence: Option<(String, String, serde_json::Value)> = None;
+        let user_data: String = if let Some(ref auth) = launch_authentication {
+            let supervisor = crate::kubevirt_boundary::SupervisorEndpoint {
+                namespace: self.config.kubevirt.supervisor_namespace.clone(),
+                pod_selector: self.config.kubevirt.supervisor_pod_selector.clone(),
+                port: self.config.kubevirt.supervisor_port,
+            };
+            // Create the fence NetworkPolicy (before the VM).
+            let fence_json = crate::kubevirt_boundary::render_fence(
+                &namespace,
+                &sandbox.id,
+                Some(&self.config.gateway_id),
+                &supervisor,
+            );
+            let fence_api: Api<DynamicObject> = Api::namespaced_with(
+                self.client.clone(),
+                &namespace,
+                &crate::kubevirt_boundary::fence_api_resource(),
+            );
+            let fence_name = crate::kubevirt_boundary::fence_name(&sandbox.id);
+            // Delete any orphaned fence and wait for it to be gone.
+            crate::kubevirt_boundary::delete_and_wait(&fence_api, &fence_name)
+                .await
+                .map_err(KubernetesDriverError::Message)?;
+            let mut fence_obj =
+                DynamicObject::new(&fence_name, &crate::kubevirt_boundary::fence_api_resource());
+            fence_obj.data = fence_json.clone();
+            let created_fence_obj = tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                fence_api.create(&PostParams::default(), &fence_obj),
+            )
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message(format!(
+                    "timed out after {}s creating the egress fence",
+                    KUBE_API_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(KubernetesDriverError::from_kube)?;
+            let fence_uid = created_fence_obj.metadata.uid.unwrap_or_default();
+            let fence_rv = created_fence_obj
+                .metadata
+                .resource_version
+                .unwrap_or_default();
+            let fence_spec = fence_json["spec"].clone();
+            created_fence = Some((fence_uid.clone(), fence_rv.clone(), fence_spec.clone()));
+
+            // Render the boundary bootstrap.
+            // PoC note: the vm_uid claim uses the sandbox ID (a UUID,
+            // stable across stop/start) rather than the VirtualMachine's
+            // UID, because the Secret must exist before the VM (the
+            // cloudInit volume references it) and the VM UID is only
+            // known after creation. The stability property the claims
+            // need (same identity across stop/start) is preserved.
+            let bootstrap = crate::kubevirt_boundary::render_kubevirt_bootstrap(
+                auth,
+                &sandbox.id,
+                &sandbox.name,
+                &sandbox.id, // vm_uid (PoC: the sandbox ID)
+                &self.config.kubevirt.guest_image,
+                &fence_uid,
+                &fence_rv,
+                fence_spec,
+                &supervisor,
+                &sandbox.id, // route (PoC: the sandbox ID as the route handle)
+                10001,       // workload uid
+                10001,       // workload gid
+            )
+            .map_err(KubernetesDriverError::Precondition)?;
+            bootstrap.guest_payload
+        } else {
+            // Legacy path: the env-var userData for the R3 dead-guest
+            // path and the capability probe.
+            crate::kubevirt::render_bootstrap_secret(&params)
+                .string_data
+                .as_ref()
+                .and_then(|data| data.get("userData"))
+                .cloned()
+                .unwrap_or_default()
+        };
         let core_secret_resource = ApiResource {
             group: String::new(),
             version: "v1".to_string(),
@@ -4034,7 +4144,17 @@ impl KubernetesComputeDriver {
             COMPANION_DELETE_TIMEOUT,
         )
         .await?;
-        let secret = crate::kubevirt::render_bootstrap_secret(&params);
+        let secret = Secret {
+            metadata: ObjectMeta {
+                name: Some(crate::kubevirt::bootstrap_secret_name(&kube_name)),
+                namespace: Some(namespace.clone()),
+                labels: Some(sandbox_labels(sandbox, Some(&self.config.gateway_id))),
+                ..Default::default()
+            },
+            string_data: Some(BTreeMap::from([("userData".to_string(), user_data)])),
+            type_: Some("Opaque".to_string()),
+            ..Default::default()
+        };
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
             secret_api.create(&PostParams::default(), &secret),
@@ -4152,6 +4272,22 @@ impl KubernetesComputeDriver {
                 // created, roll back the companions this create made so a
                 // retried create does not collide with orphaned state.
                 crate::kubevirt::rollback_companions(&self.client, &namespace, &created).await;
+                // Also roll back the fence (it's not a "companion" in the
+                // rollback list because its name is derived from the
+                // sandbox ID, not the kube resource name).
+                if created_fence.is_some() {
+                    let fence_api: Api<DynamicObject> = Api::namespaced_with(
+                        self.client.clone(),
+                        &namespace,
+                        &crate::kubevirt_boundary::fence_api_resource(),
+                    );
+                    let _ = fence_api
+                        .delete(
+                            &crate::kubevirt_boundary::fence_name(&sandbox.id),
+                            &DeleteParams::default(),
+                        )
+                        .await;
+                }
                 Err(error)
             }
         }
@@ -4508,6 +4644,19 @@ impl KubernetesComputeDriver {
             // bootstrap Secret holds the sandbox JWT). Clean them up by
             // label so this path does not leak credentials.
             self.delete_kubevirt_companions_by_selector(&namespace, &selector)
+                .await;
+            // Also delete the egress fence (its name derives from the
+            // sandbox ID, so the selector-based cleanup misses it).
+            let fence_api: Api<DynamicObject> = Api::namespaced_with(
+                self.client.clone(),
+                &namespace,
+                &crate::kubevirt_boundary::fence_api_resource(),
+            );
+            let _ = fence_api
+                .delete(
+                    &crate::kubevirt_boundary::fence_name(sandbox_id),
+                    &DeleteParams::default(),
+                )
                 .await;
             return Ok(false);
         };

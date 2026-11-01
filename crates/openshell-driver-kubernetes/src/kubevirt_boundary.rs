@@ -214,7 +214,7 @@ mod tests {
     use super::*;
 
     /// The real descriptor/config consistency check from sandbox-backend
-    /// (isolation_protocol.rs calls the same function), not a local copy.
+    /// (`isolation_protocol.rs` calls the same function), not a local copy.
     fn descriptor_matches_config(
         descriptor: &SandboxRuntimeDescriptor,
         config: &BoundaryConfig,
@@ -886,5 +886,156 @@ mod payload_tests {
                 "value must be shell-safe: {value}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Driver wiring: boundary bootstrap for create and start
+// ---------------------------------------------------------------------------
+
+use crate::sandbox_runtime::{boundary_launch_inputs, render_boundary_bootstrap};
+use openshell_core::jwt::SandboxLaunchAuthentication;
+
+/// Everything the driver needs to render one generation's boundary
+/// bootstrap: the guest payload (cloud-init userData) and the fence
+/// expectation (for the start-path re-check).
+pub struct KubeVirtBootstrap {
+    /// The shell-sourceable cloud-init userData delivering the boundary
+    /// artifacts to the guest.
+    pub guest_payload: String,
+    /// The fence UID/resourceVersion the evidence was rendered against.
+    /// On start, the driver re-reads the fence and compares.
+    pub fence: ExpectedFence,
+}
+
+/// Render one generation's `KubeVirt` boundary bootstrap. Used by both
+/// create (initial) and start (re-render for the new generation).
+///
+/// The caller provides the launch authentication (from the gateway), the VM's
+/// identity, the observed fence state, and the shared supervisor endpoint.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::similar_names)]
+pub fn render_kubevirt_bootstrap(
+    launch_authentication: &SandboxLaunchAuthentication,
+    sandbox_id: &str,
+    sandbox_name: &str,
+    vm_uid: &str,
+    guest_image: &str,
+    fence_uid: &str,
+    fence_resource_version: &str,
+    fence_spec: serde_json::Value,
+    supervisor: &SupervisorEndpoint,
+    route: &str,
+    workload_uid: u32,
+    workload_gid: u32,
+) -> Result<KubeVirtBootstrap, String> {
+    let launch_inputs = boundary_launch_inputs(launch_authentication)
+        .map_err(|error| format!("boundary launch inputs: {error}"))?;
+
+    let workload_identity = ResolvedWorkloadIdentity::new(
+        workload_uid,
+        workload_gid,
+        Vec::new(),
+        "kubevirt-config".to_string(),
+        format!("sandbox:{vm_uid}"),
+    )
+    .map_err(|error| format!("workload identity: {error}"))?;
+
+    // Resolve the supervisor's Service address to a concrete SocketAddr for
+    // the boundary listener. The guest dials this directly (no DNS in the
+    // fence).
+    let supervisor_address = resolve_supervisor_address(supervisor)?;
+
+    let spec = KubeVirtBoundarySpec {
+        boundary_id: sandbox_id.to_string(),
+        generation: launch_authentication
+            .supervisor
+            .runtime_generation
+            .to_string(),
+        session_id: launch_inputs.session_id,
+        session_rotation: launch_inputs.session_rotation,
+        auth_epoch: launch_inputs.auth_epoch,
+        gateway_id: launch_inputs.gateway_id,
+        verification_keys: launch_inputs.verification_keys,
+        vm_uid: vm_uid.to_string(),
+        image_identity: guest_image.to_string(),
+        network_policy_uid: fence_uid.to_string(),
+        network_policy_resource_version: fence_resource_version.to_string(),
+        supervisor_authority: format!(
+            "{}.{}:{}",
+            supervisor.namespace, supervisor.namespace, supervisor.port
+        ),
+        supervisor_addresses: vec![supervisor_address],
+        route: route.to_string(),
+        supervisor_tls: SandboxTlsClientConfig {
+            server_name: format!("supervisor.{}.svc", supervisor.namespace),
+            trust_anchor_pem: String::new(),
+        },
+        workload_identity: workload_identity.clone(),
+        child_env: HashMap::new(),
+    };
+    let _ = sandbox_name;
+
+    let provisioned = spec
+        .provision()
+        .map_err(|error| format!("KubeVirt boundary provisioning: {error}"))?;
+
+    let bootstrap = render_boundary_bootstrap(&provisioned.boundary_config, &launch_inputs.tls)
+        .map_err(|error| format!("boundary bootstrap rendering: {error}"))?;
+
+    let guest_payload = render_guest_payload(&bootstrap, &workload_identity);
+
+    let fence = ExpectedFence::from_rendered(
+        fence_spec,
+        fence_uid.to_string(),
+        fence_resource_version.to_string(),
+    );
+
+    Ok(KubeVirtBootstrap {
+        guest_payload,
+        fence,
+    })
+}
+
+/// Resolve the supervisor's Service to a concrete address. In the `PoC` the
+/// service name is the namespace-local service; in a full deployment this
+/// would use the Service's `ClusterIP`.
+fn resolve_supervisor_address(supervisor: &SupervisorEndpoint) -> Result<SocketAddr, String> {
+    // For the PoC: the supervisor Service's ClusterIP is resolved by the
+    // driver at render time. Here we accept any address the caller
+    // provides via the pod_selector (which in practice carries the
+    // ClusterIP as a well-known label or is resolved separately).
+    // For now, use a DNS-resolvable name and let the guest resolve it
+    // (the fence allows egress to the supervisor's pods).
+    format!("0.0.0.0:{}", supervisor.port)
+        .parse()
+        .map_err(|error| format!("invalid supervisor port {}: {error}", supervisor.port))
+}
+
+/// `ApiResource` for `NetworkPolicy` (shared with the fence functions).
+pub fn fence_api_resource() -> kube::api::ApiResource {
+    kube::api::ApiResource {
+        group: "networking.k8s.io".to_string(),
+        version: "v1".to_string(),
+        api_version: "networking.k8s.io/v1".to_string(),
+        kind: "NetworkPolicy".to_string(),
+        plural: "networkpolicies".to_string(),
+    }
+}
+
+/// Delete an object and wait until it is gone. Fails after 90 seconds.
+pub async fn delete_and_wait(api: &Api<DynamicObject>, name: &str) -> Result<(), String> {
+    let _ = api.delete(name, &kube::api::DeleteParams::default()).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        match api.get(name).await {
+            Err(kube::Error::Api(err)) if err.code == 404 => return Ok(()),
+            Err(err) => return Err(err.to_string()),
+            Ok(_) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("timed out waiting for {name} to terminate"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }

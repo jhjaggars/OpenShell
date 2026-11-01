@@ -622,6 +622,12 @@ mod tests {
                 cpu_cores: 2,
                 memory: "2Gi".to_string(),
                 workspace_pvc: true,
+                supervisor_namespace: "openshell".to_string(),
+                supervisor_pod_selector: BTreeMap::from([(
+                    "app.kubernetes.io/name".to_string(),
+                    "openshell-supervisor".to_string(),
+                )]),
+                supervisor_port: 5500,
             },
             ..KubernetesComputeConfig::default()
         }
@@ -1054,6 +1060,12 @@ mod kubevirt_review_tests {
                 cpu_cores: 2,
                 memory: "2Gi".to_string(),
                 workspace_pvc: true,
+                supervisor_namespace: "openshell".to_string(),
+                supervisor_pod_selector: BTreeMap::from([(
+                    "app.kubernetes.io/name".to_string(),
+                    "openshell-supervisor".to_string(),
+                )]),
+                supervisor_port: 5500,
             },
             ..KubernetesComputeConfig::default()
         }

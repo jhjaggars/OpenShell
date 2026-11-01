@@ -172,6 +172,18 @@ main() {
     # BoundaryConfig, mode 0600, then launch the boundary. The boundary
     # deletes its config and TLS material after loading them.
     if [ -n "${OPENSHELL_BOUNDARY_CONFIG_B64:-}" ]; then
+        # L1: capture the workload identity from the payload BEFORE
+        # staging unsets it; the same values drive both the chown in
+        # staging and the launch-capability-free arguments. They come from
+        # the same ResolvedWorkloadIdentity the boundary config carries
+        # (render_guest_payload), so there is no second source of truth.
+        local launch_uid launch_gid
+        launch_uid="${OPENSHELL_WORKLOAD_UID}"
+        launch_gid="${OPENSHELL_WORKLOAD_GID}"
+        if [ -z "${launch_uid}" ] || [ -z "${launch_gid}" ]; then
+            ts "FATAL: payload is missing the workload identity"
+            return 1
+        fi
         stage_boundary_bootstrap
         # G2: assert the environment is clean before launching the child.
         # The boundary inherits PID 1's env; any B64 or token var here
@@ -182,17 +194,7 @@ main() {
         fi
         ts "environment verified clean (no B64 or token vars)"
         # Run the boundary as a child (not exec) so PID 1 can power off on
-        # exit (see the wait + poweroff below). The uid/gid were captured
-        # in stage_boundary_bootstrap's local vars; re-read them from the
-        # staged boundary config's workload_identity to avoid a second
-        # source of truth (G4).
-        local launch_uid launch_gid
-        launch_uid=$(sed -n 's/.*"uid":\([0-9]*\).*/\1/p' /.openshell/state/bootstrap/boundary.json | head -1)
-        launch_gid=$(sed -n 's/.*"gid":\([0-9]*\).*/\1/p' /.openshell/state/bootstrap/boundary.json | head -1)
-        if [ -z "${launch_uid}" ] || [ -z "${launch_gid}" ]; then
-            ts "FATAL: could not read workload identity from staged boundary config"
-            return 1
-        fi
+        # exit (see the wait + poweroff below).
         # shellcheck disable=SC2086
         /usr/local/bin/openshell-sandbox launch-capability-free \
             "${launch_uid}" "${launch_gid}" \

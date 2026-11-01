@@ -184,6 +184,14 @@ pub struct KubeVirtConfig {
     /// Attach a per-sandbox PVC at `/sandbox` so the workspace survives
     /// stop/start (mirrors the pod path's PVC-backed workspace).
     pub workspace_pvc: bool,
+    /// Namespace of the gateway-shared supervisor Service the boundary
+    /// dials (`RuntimeInitiatedTlsTcp`). Required for the boundary path.
+    pub supervisor_namespace: String,
+    /// The shared supervisor Service's pod selector (read from the live
+    /// Service, used as the egress fence's podSelector).
+    pub supervisor_pod_selector: BTreeMap<String, String>,
+    /// The shared supervisor Service's runtime port.
+    pub supervisor_port: u16,
 }
 
 impl Default for KubeVirtConfig {
@@ -194,6 +202,9 @@ impl Default for KubeVirtConfig {
             cpu_cores: 1,
             memory: "1Gi".to_string(),
             workspace_pvc: true,
+            supervisor_namespace: String::new(),
+            supervisor_pod_selector: BTreeMap::new(),
+            supervisor_port: 0,
         }
     }
 }
@@ -1224,7 +1235,7 @@ fn validate_provider_spiffe_workload_api_socket_path_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap as HashMap;
+    use BTreeMap as HashMap;
 
     #[test]
     fn gateway_supervisor_topology_requires_its_connection_and_refuses_unsupported_inputs() {
