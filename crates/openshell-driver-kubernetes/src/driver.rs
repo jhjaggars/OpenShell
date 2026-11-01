@@ -4461,40 +4461,77 @@ impl KubernetesComputeDriver {
         let secrets = Api::<Secret>::namespaced(self.client.clone(), &namespace);
         let namespace_for_secret = namespace.clone();
         let sandbox_id_for_secret = sandbox_id.to_string();
-        shared
-            .supervision()
-            .launch(&registration, move |launch_material| {
-                let secrets = secrets.clone();
-                let namespace = namespace_for_secret.clone();
-                let names = names.clone();
-                let sandbox_id = sandbox_id_for_secret.clone();
-                let owner = instance_owner;
-                async move {
-                    secrets
-                        .create(
-                            &PostParams::default(),
-                            &shared_instance_secret(
-                                &namespace,
-                                &names,
-                                &sandbox_id,
-                                launch_material,
-                                owner,
-                            ),
-                        )
-                        .await
-                        .map(|_| ())
-                        .map_err(KubernetesDriverError::from_kube)
-                }
-            })
-            .await
-            .map_err(|error| match error {
+        let mut attempts = 0u8;
+        loop {
+            attempts += 1;
+            let secrets = secrets.clone();
+            let namespace = namespace_for_secret.clone();
+            let names = names.clone();
+            let sandbox_id = sandbox_id_for_secret.clone();
+            let owner = instance_owner.clone();
+            let launch_result = shared
+                .supervision()
+                .launch(&registration, move |launch_material| {
+                    let secrets = secrets.clone();
+                    let namespace = namespace.clone();
+                    let names = names.clone();
+                    let sandbox_id = sandbox_id.clone();
+                    let owner = owner;
+                    async move {
+                        let secret = shared_instance_secret(
+                            &namespace,
+                            &names,
+                            &sandbox_id,
+                            launch_material,
+                            owner,
+                        );
+                        // A retried launch can find this generation's
+                        // (immutable) instance Secret already created by
+                        // the earlier attempt's persist; replace it so the
+                        // material always matches this attempt.
+                        if let Err(KubeError::Api(err)) =
+                            secrets.create(&PostParams::default(), &secret).await
+                        {
+                            if err.code != 409 {
+                                return Err(KubernetesDriverError::from_kube(KubeError::Api(err)));
+                            }
+                            let _ = secrets
+                                .delete(
+                                    &secret.metadata.name.clone().unwrap_or_default(),
+                                    &DeleteParams::default(),
+                                )
+                                .await;
+                            secrets
+                                .create(&PostParams::default(), &secret)
+                                .await
+                                .map(|_| ())
+                                .map_err(KubernetesDriverError::from_kube)?;
+                        }
+                        Ok(())
+                    }
+                })
+                .await;
+            let error = match launch_result {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
+            let retryable = matches!(
+                &error,
+                LaunchError::Unplaced(reason) if reason.contains(ROUTE_RECORD_RACE_MESSAGE)
+            );
+            if retryable && attempts < 12 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            return Err(match error {
                 LaunchError::Persist(error) => error,
                 LaunchError::Refused(error) => {
                     KubernetesDriverError::Precondition(error.to_string())
                 }
                 LaunchError::Unplaced(reason) => KubernetesDriverError::Precondition(reason),
                 LaunchError::Invalid(error) => KubernetesDriverError::Message(error.to_string()),
-            })
+            });
+        }
     }
 
     /// X6: delete the previous generations' shared-instance Secrets for a
@@ -4953,8 +4990,31 @@ impl KubernetesComputeDriver {
         let kube_name = object.metadata.name.clone().ok_or_else(|| {
             KubernetesDriverError::Message("VirtualMachine has no name".to_string())
         })?;
+        // The stopped generation ends its shared-supervisor instance: the
+        // supervisor stops serving this sandbox's route, and the pool's
+        // record is withdrawn now (not by the later async sweep) so an
+        // immediate start can re-register the route for the new
+        // generation. Mirrors the pod path's stop, which calls
+        // remove_shared_instance.
+        if let Some(route) = object
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(ANNOTATION_SUPERVISOR_SESSION))
+            && let Some(shared) = &self.shared_supervisor
+        {
+            shared.supervision().withdraw(route);
+        }
 
-        let patch = serde_json::json!({"spec": {"runStrategy": "Halted"}});
+        // Also clear any lingering create-in-flight annotation: a create
+        // interrupted before its Once patch leaves one, and the
+        // provisioning-timeout reclaim reaches this stop.
+        let patch = serde_json::json!({
+            "metadata": {"annotations": {
+                crate::kubevirt::KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION: null
+            }},
+            "spec": {"runStrategy": "Halted"}
+        });
         tokio::time::timeout(
             KUBE_API_TIMEOUT,
             api.patch(&kube_name, &PatchParams::default(), &Patch::Merge(&patch)),
@@ -7178,6 +7238,13 @@ fn shared_instance_registration(
 
 /// The value-taking core of `shared_instance_registration`, shared by the
 /// pod path (which extracts values from the Sandbox CR) and the `KubeVirt`
+/// The pool's durable route record is removed asynchronously after a
+/// withdrawal (the gateway reconciles every ~2s), so an immediate
+/// stop -> start can race it: the launch is refused with "the sandbox
+/// instance route is recorded for another generation". The `KubeVirt`
+/// registration retries that specific refusal for a bounded window.
+const ROUTE_RECORD_RACE_MESSAGE: &str = "route is recorded for another generation";
+
 /// path (which has them from the gateway's `Sandbox` object directly).
 #[allow(clippy::too_many_arguments)]
 fn shared_instance_registration_from_values(
