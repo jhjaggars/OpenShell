@@ -36,6 +36,17 @@ GUEST_IMAGE="${OPENSHELL_KVPOC_GUEST_IMAGE:-kvpoc/openshell-sandbox-vm:dev}"
 RUN_DEMO=0
 [ "${1:-}" = "--demo" ] && RUN_DEMO=1
 
+# Supervisor topology for this run: "dedicated" (the default — one
+# supervisor Pod per sandbox, matching the pod path's default) or "gateway"
+# (the Helm-shared supervisor). Exported for run-demo.sh, whose checks are
+# topology-aware.
+TOPOLOGY="${OPENSHELL_KVPOC_TOPOLOGY:-dedicated}"
+case "${TOPOLOGY}" in
+    dedicated|gateway) ;;
+    *) echo "OPENSHELL_KVPOC_TOPOLOGY must be 'dedicated' or 'gateway', got '${TOPOLOGY}'" >&2; exit 1 ;;
+esac
+export OPENSHELL_KVPOC_TOPOLOGY="${TOPOLOGY}"
+
 # The k3d docker bridge gateway is the host address guests use to reach the
 # gateway (k3d prints it at cluster creation; derive it from the network).
 BRIDGE_IP="$(docker network inspect k3d-kvpoc -f '{{(index .IPAM.Config 0).Gateway}}')"
@@ -70,6 +81,12 @@ if kubectl get namespace "${SUPERVISOR_NAMESPACE}" >/dev/null 2>&1; then
         --from-file=ca.crt="${PKI_DIR}/ca.crt" \
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 fi
+# The dedicated topology's supervisor Pods live in the sandbox namespace and
+# verify the gateway through this CA (client_tls_secret_name).
+kubectl create namespace "${SANDBOX_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+kubectl -n "${SANDBOX_NAMESPACE}" create secret generic "${SUPERVISOR_CA_SECRET}" \
+    --from-file=ca.crt="${PKI_DIR}/ca.crt" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 if [ ! -f "${TLS_DIR}/jwt/signing.pem" ]; then
     echo "==> Generating local gateway credentials"
     "${GATEWAY_BIN}" generate-certs --output-dir "${TLS_DIR}"
@@ -80,6 +97,33 @@ mkdir -p "${STATE_DIR}"
 # so `sandbox create --name kvpoc-demo` is reproducible. Nothing durable is
 # kept in this gateway.
 rm -f "${STATE_DIR}"/gateway.db*
+# Topology-dependent config fragments: the gateway topology selects the
+# Helm-shared supervisor; the dedicated default (matching the pod path's
+# default) runs one supervisor Pod per sandbox with the locally imported
+# supervisor image and the gateway-CA client-TLS Secret synced into the
+# sandbox namespace above.
+if [ "${TOPOLOGY}" = "gateway" ]; then
+    TOPOLOGY_CONFIG='supervisor_topology = "gateway"'
+    DEDICATED_KEYS=''
+    SHARED_SUPERVISOR_CONFIG=$(cat <<FRAG
+
+[openshell.drivers.kubernetes.shared_supervisor]
+service_name = "${SUPERVISOR_SERVICE}"
+service_namespace = "${SUPERVISOR_NAMESPACE}"
+runtime_port = ${SUPERVISOR_PORT}
+token_secret_name = "${SUPERVISOR_TOKEN_SECRET}"
+FRAG
+)
+else
+    TOPOLOGY_CONFIG=''
+    DEDICATED_KEYS=$(cat <<FRAG
+supervisor_image = "${OPENSHELL_KVPOC_SUPERVISOR_IMAGE:-kvpoc/openshell-supervisor:dev}"
+client_tls_secret_name = "${SUPERVISOR_CA_SECRET}"
+FRAG
+)
+    SHARED_SUPERVISOR_CONFIG=''
+fi
+
 CONFIG_PATH="${STATE_DIR}/gateway.toml"
 cat >"${CONFIG_PATH}" <<EOF
 # OpenShell gateway for the KubeVirt compute-driver PoC (e2e/kubevirt/).
@@ -116,19 +160,15 @@ runtime = "kubevirt"
 gateway_id = "kvpoc"
 namespace = "${SANDBOX_NAMESPACE}"
 grpc_endpoint = "${GRPC_ENDPOINT}"
-supervisor_topology = "gateway"
+${TOPOLOGY_CONFIG}
+${DEDICATED_KEYS}
 
 [openshell.drivers.kubernetes.kubevirt]
 guest_image = "${GUEST_IMAGE}"
 guest_image_pull_policy = "IfNotPresent"
 cpu_cores = 1
 memory = "1Gi"
-
-[openshell.drivers.kubernetes.shared_supervisor]
-service_name = "${SUPERVISOR_SERVICE}"
-service_namespace = "${SUPERVISOR_NAMESPACE}"
-runtime_port = ${SUPERVISOR_PORT}
-token_secret_name = "${SUPERVISOR_TOKEN_SECRET}"
+${SHARED_SUPERVISOR_CONFIG}
 EOF
 
 # Register the gateway for the CLI (mTLS: the shared supervisor requires

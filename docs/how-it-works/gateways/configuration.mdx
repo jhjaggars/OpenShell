@@ -1203,9 +1203,13 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # VirtualMachine objects directly — the KubeVirt controller replaces the
 # Agent Sandbox controller, and each sandbox boots a purpose-built guest
 # image with the `openshell-sandbox` supervisor as guest PID 1. The kubevirt
-# runtime currently supports only `workspace_mode = "shared"` and requires
-# `grpc_endpoint` to be reachable from guest VMs. See `e2e/kubevirt/README.md`
-# for the PoC workflow, guest-image build, and known gaps.
+# runtime currently supports only `workspace_mode = "shared"` and supports
+# the same supervisor topologies as the pod runtime: the default is a
+# dedicated supervisor Pod per sandbox (which requires `grpc_endpoint` to be
+# reachable from those Pods), and `supervisor_topology = "gateway"` places
+# each generation on the gateway's shared supervisor. See
+# `e2e/kubevirt/README.md` for the PoC workflow, guest-image build, and
+# known gaps.
 # runtime                      = "kubevirt"
 
 # Settings used only when runtime = "kubevirt".
@@ -1220,12 +1224,16 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # supervisor then runs process-only and the VM's egress is fenced by a
 # NetworkPolicy to the proxy pod, cluster DNS, and the gateway. proxy_pod
 # requires an IP-literal grpc_endpoint host.
-# The kubevirt runtime requires the gateway-shared supervisor
-# (supervisor_topology = "gateway"): the guest's boundary dials the
-# shared supervisor Service named by shared_supervisor, whose ClusterIP
-# and pod selector are resolved through the API at create time. A
-# NetworkPolicy fences guest egress to that Service, cluster DNS, and
-# the gateway.
+# Supervisor topologies: the default provisions one dedicated supervisor
+# Pod per sandbox (supervisor_image, and the supervisor settings above,
+# apply as on the pod runtime; the guest's boundary dials that Pod's
+# per-sandbox Service, and a NetworkPolicy fences guest egress to only
+# that Pod). supervisor_topology = "gateway" instead places each
+# generation on the gateway's shared supervisor: the guest's boundary
+# dials the shared supervisor Service named by shared_supervisor, whose
+# ClusterIP and pod selector are resolved through the API at create time,
+# and the fence admits only that Service. Either way no gateway token or
+# endpoint reaches the guest.
 # [openshell.drivers.kubernetes.kubevirt]
 # guest_image              = "kvpoc/openshell-sandbox-vm:dev"
 # guest_image_pull_policy  = "IfNotPresent"

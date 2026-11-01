@@ -4,17 +4,23 @@ This directory contains the proof of concept for running OpenShell sandboxes as
 **KubeVirt VirtualMachines** through the Kubernetes compute driver, instead of
 `agents.x-k8s.io` Sandbox CRs reconciled into pods. It is built on current
 `main`'s **isolation boundary architecture** (an in-workload
-`openshell-sandbox` boundary plus the gateway-shared supervisor; see
+`openshell-sandbox` boundary plus its supervisor; see
 `crates/openshell-sandbox-backend`) using the **Option A** boundary delivery:
 the pod path's boundary artifacts ride the cloud-init channel into the guest.
+The KubeVirt runtime supports the pod path's two supervisor topologies with
+the same defaults: **a dedicated supervisor Pod per sandbox** (the default,
+`supervisor_topology` unset) or the **gateway-shared supervisor**
+(`supervisor_topology = "gateway"`).
 
 What this branch demonstrates, on a local k3d cluster with nested KVM:
 
 1. `openshell sandbox create` reaches **Ready**: the driver creates the
    `VirtualMachine` (Halted first, so its UID is captured for the claims),
-   the egress-fence NetworkPolicy, the bootstrap Secret, the workspace PVC,
-   and the shared-supervisor instance registration; the guest boots, its
-   boundary dials the shared supervisor over the routed runtime connection,
+   the supervisor generation — a dedicated supervisor Pod with its
+   per-sandbox Service and bootstrap Secret (the default), or the
+   shared-supervisor instance registration — the egress-fence
+   NetworkPolicy, the bootstrap Secret, and the workspace PVC; the guest
+   boots, its boundary dials the supervisor over the runtime connection,
    and the supervisor session establishes.
 2. **Exec in the VM** as the zero-capability workload user; the workload
    environment carries no gateway material (no token, no endpoint).
@@ -28,7 +34,9 @@ What this branch demonstrates, on a local k3d cluster with nested KVM:
    (fence).
 5. **Stop/start**: `Halted`/`Once` run-strategy mapping with the VM UID and
    fence UID stable across generations; start re-renders the boundary
-   bootstrap for the new generation and re-registers the instance.
+   bootstrap for the new generation, re-registers the shared instance
+   (gateway topology) or provisions a fresh supervisor Pod whose new UID the
+   re-rendered bootstrap claims (dedicated topology).
 6. **Fence verification** on every start: the expected fence (UID + rendered
    spec) is persisted on the VM; a spec edit fails start with a drift
    Precondition, a label-only edit is accepted.
@@ -55,10 +63,12 @@ OCI sandbox images as VM disks (the guest image is purpose-built). See
        │                                     pod ─▶ QEMU/KVM guest
        │ routed runtime connection (TLS)            (Alpine + openshell-
        │         ┌──────────────────────┐            sandbox boundary)
-       ╚════════▶│ shared supervisor    │   ▲
-                 │ (Helm-rendered       │   │ fence NetworkPolicy:
-                 │  Deployment+Service, │   │  launcher egress → only
-                 │  openshell ns)       │   │  the supervisor + DNS
+       ╚════════▶│ supervisor           │   ▲
+                 │ (dedicated: per-     │   │ fence NetworkPolicy:
+                 │  sandbox Pod+Service │   │  launcher egress → only
+                 │  in kvpoc-sandboxes; │   │  this sandbox's supervisor
+                 │  gateway: Helm-shared │   │
+                 │  Deployment+Service) │   │
                  └──────────────────────┘   │
                                             │
               VM volumes:                   │
@@ -68,10 +78,15 @@ OCI sandbox images as VM disks (the guest image is purpose-built). See
 ```
 
 - **Driver change** (`crates/openshell-driver-kubernetes`): a
-  `runtime = "kubevirt"` mode in `[openshell.drivers.kubernetes]`,
-  requiring `supervisor_topology = "gateway"` and a `shared_supervisor`
-  config. The driver creates `VirtualMachine` objects directly (the
-  KubeVirt controller replaces the Agent Sandbox controller) and maps
+  `runtime = "kubevirt"` mode in `[openshell.drivers.kubernetes]` with the
+  pod path's two supervisor topologies: the default provisions one
+  dedicated supervisor Pod per sandbox (reusing the pod path's
+  `supervisor_pod`, `boundary_service`, `supervisor_bootstrap_secret`, and
+  control-policy renderers with `VirtualMachine` owner references), and
+  `supervisor_topology = "gateway"` plus a `shared_supervisor` config
+  places each generation on the gateway's shared supervisor. The driver
+  creates `VirtualMachine` objects directly (the KubeVirt controller
+  replaces the Agent Sandbox controller) and maps
   get/list/watch/stop/start/delete onto VM/VMI state. See `src/kubevirt.rs`,
   `src/kubevirt_boundary.rs`, and the branches in `src/driver.rs`.
 - **Boundary delivery (Option A)**: the driver renders the pod path's
@@ -80,7 +95,9 @@ OCI sandbox images as VM disks (the guest image is purpose-built). See
   cloud-init `userData` (base64 lines, no gateway material). The guest init
   stages them on a tmpfs and runs
   `openshell-sandbox launch-capability-free <uid> <gid> <config>`; the
-  boundary dials the shared supervisor's Service on the allocated route.
+  boundary dials the supervisor's Service — the per-sandbox
+  `os-supervisor-<id>` Service of a dedicated generation, or the shared
+  supervisor's Service with the sandbox's route handle.
 - **Guest image** (`build-guest-image.sh`): Alpine + static-musl
   `openshell-sandbox` + the init script, booted via direct kernel boot. The
   guest's resolver is the boundary's loopback DNS relay (`127.0.0.53`).
@@ -93,8 +110,8 @@ OCI sandbox images as VM disks (the guest image is purpose-built). See
 |---|---|
 | `build-guest-image.sh` | Builds the `kvpoc/openshell-sandbox-vm:dev` containerDisk (Alpine rootfs + static musl supervisor + guest init + kernel, repacked initramfs, KubeVirt's `container-disk` helper). |
 | `guest-init.sh` | Guest PID-1 init (baked into the image). |
-| `demo.sh` | Starts a host gateway (TLS, `supervisor_topology = "gateway"`) against the `kvpoc` cluster and registers it as the CLI's mTLS gateway; `--demo` then runs `run-demo.sh` against it. |
-| `run-demo.sh` | The full acceptance demo (10 steps, no failure tolerance): create → Ready, fence check, exec, env scrub, L4/L7 policy, bypass blocked, stop/start with stable UIDs, fence drift verification, main-process exit → Error, delete with zero leftovers. |
+| `demo.sh` | Starts a host gateway (TLS) against the `kvpoc` cluster and registers it as the CLI's mTLS gateway; `--demo` then runs `run-demo.sh` against it. Defaults to the dedicated supervisor topology; `OPENSHELL_KVPOC_TOPOLOGY=gateway` selects the shared one. |
+| `run-demo.sh` | The full acceptance demo (10 steps, no failure tolerance): create → Ready, fence check, exec, env scrub, L4/L7 policy, bypass blocked, stop/start with stable VM/fence UIDs (dedicated: a rotated and re-claimed supervisor Pod UID), fence drift verification, main-process exit → Error, delete with zero leftovers. Topology-aware via `OPENSHELL_KVPOC_TOPOLOGY`. |
 | `demo-policy.yaml` | The acceptance policy: L4 raw-TCP allow/deny and L7 HTTPS GET-allow/POST-deny. |
 | `supervisor-values.yaml` | Renders the shared supervisor (Deployment, Service, NetworkPolicy, token Secret) from the OpenShell Helm chart, pointing at the demo gateway. |
 
@@ -149,11 +166,14 @@ docker load -i /tmp/supervisor.tar
 docker tag localhost/openshell/supervisor:dev kvpoc/openshell-supervisor:dev
 k3d image import kvpoc/openshell-supervisor:dev -c kvpoc
 
-# 4. Shared supervisor: render the supervisor templates from the OpenShell
-#    Helm chart into the `openshell` namespace, pointing at the demo gateway
-#    (the values file sets grpc_endpoint to the k3d bridge IP). The demo
-#    gateway mints the supervisor token into the rendered token Secret and
-#    syncs the gateway CA into the Secret the supervisor mounts.
+# 4. Shared supervisor (only needed for OPENSHELL_KVPOC_TOPOLOGY=gateway):
+#    render the supervisor templates from the OpenShell Helm chart into the
+#    `openshell` namespace, pointing at the demo gateway (the values file
+#    sets grpc_endpoint to the k3d bridge IP). The demo gateway mints the
+#    supervisor token into the rendered token Secret and syncs the gateway
+#    CA into the Secret the supervisor mounts. The dedicated topology needs
+#    no cluster-side supervisor: the driver creates one Pod per sandbox
+#    from the locally imported kvpoc/openshell-supervisor:dev image.
 helm template kvpoc deploy/helm/openshell -n openshell \
     -f e2e/kubevirt/supervisor-values.yaml \
     -s templates/supervisor.yaml -s templates/supervisor-service.yaml \
@@ -162,8 +182,10 @@ helm template kvpoc deploy/helm/openshell -n openshell \
 kubectl rollout status deployment/kvpoc-openshell-supervisor -n openshell --timeout=120s
 
 # 5. Run the demo (builds the gateway + CLI, starts the gateway, runs the
-#    full acceptance, tears the sandbox down).
+#    full acceptance, tears the sandbox down). The default topology is
+#    dedicated; run both for the full acceptance:
 e2e/kubevirt/demo.sh --demo
+OPENSHELL_KVPOC_TOPOLOGY=gateway e2e/kubevirt/demo.sh --demo
 ```
 
 The demo gateway's PKI lives in `.cache/gateway-kubevirt/tls/pki/`; deleting
@@ -278,6 +300,12 @@ material); delete it to fully reset.
 - **Image identity**: the VM driver claims the registry digest; this PoC
   claims the configured `guest_image` tag, which is weaker (a tag does not
   identify an image). The production path is a digest-pinned guest image.
+- The dedicated topology creates the namespace-wide supervisor egress
+  policy (`openshell-sandbox-supervisors`, the supervisor half of the pod
+  path's workload fence) once per namespace; it is shared infrastructure
+  and is deliberately not deleted with any one sandbox. The per-sandbox
+  virt-launcher fence plays the workload role, so the namespace-wide
+  workload policy is not created for KubeVirt sandboxes.
 - Single (shared) workspace mode; managed/operator modes are rejected.
 - No Helm chart / RBAC changes for the gateway itself: the PoC gateway runs
   on the host with the cluster-admin kubeconfig. A real deployment needs
@@ -301,7 +329,11 @@ The KubeVirt boundary claims model follows the VM driver's approach:
 - **Claimed:** `kubevirt.vm_uid` (the VirtualMachine's real UID — the
   create builds the VM `Halted` first, captures its UID, and only then
   renders the boundary claims), `kubevirt.generation`, and
-  `kubevirt.image_identity`.
+  `kubevirt.image_identity`. The dedicated topology additionally claims
+  `kubevirt.supervisor_pod_uid` — the dedicated supervisor Pod's UID,
+  mirroring the pod path's `kubernetes.supervisor_pod_uid` and re-bound on
+  every start (each generation gets a fresh Pod). No control-policy UID is
+  claimed in either topology.
 - **Evidence:** the virt-launcher egress NetworkPolicy's UID and
   resourceVersion, projected against the generation via
   `ProvisioningEvidence::from_enforcement_evidence`. The expected fence

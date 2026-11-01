@@ -23,7 +23,12 @@
 #   10. delete -> zero leftover managed objects
 #
 # Requires the `openshell` CLI built at $CARGO_TARGET_DIR/release/openshell
-# and the shared supervisor deployed (e2e/kubevirt/supervisor-values.yaml).
+# and, for OPENSHELL_KVPOC_TOPOLOGY=gateway, the shared supervisor deployed
+# (e2e/kubevirt/supervisor-values.yaml). The default topology is dedicated:
+# one supervisor Pod per sandbox, matching the pod path's default; the
+# dedicated steps additionally verify the supervisor Pod's UID is the
+# boundary claim, that the fence selects only that Pod, that stop/start
+# rotates it, and that delete removes it.
 
 set -euo pipefail
 
@@ -32,6 +37,11 @@ CARGO_TARGET="${CARGO_TARGET_DIR:-${ROOT}/target}"
 OPENSHELL_CLI="${CARGO_TARGET}/release/openshell"
 SANDBOX_NAMESPACE="${OPENSHELL_KVPOC_NAMESPACE:-kvpoc-sandboxes}"
 SUPERVISOR_NAMESPACE="${OPENSHELL_KVPOC_SUPERVISOR_NAMESPACE:-openshell}"
+TOPOLOGY="${OPENSHELL_KVPOC_TOPOLOGY:-dedicated}"
+case "${TOPOLOGY}" in
+    dedicated|gateway) ;;
+    *) fail "OPENSHELL_KVPOC_TOPOLOGY must be 'dedicated' or 'gateway', got '${TOPOLOGY}'" ;;
+esac
 NAME="kvpoc-demo"
 VM_SELECTOR="openshell.ai/sandbox-name=${NAME}"
 FENCE_PREFIX="openshell-kubevirt-fence-"
@@ -89,12 +99,21 @@ fence_name() {
 # swallowed. The workload's own exit codes (e.g. a denied connect) still
 # propagate.
 # Assert the supervisor logged an OCSF NET:OPEN DENIED line for the
-# destination, so a network failure cannot pass as a policy deny.
+# destination, so a network failure cannot pass as a policy deny. The log
+# source is topology-dependent: the shared supervisor Deployment, or this
+# sandbox's dedicated supervisor Pod.
+supervisor_logs() {
+    if [ "${TOPOLOGY}" = "gateway" ]; then
+        kubectl logs -n "${SUPERVISOR_NAMESPACE}" deployment/kvpoc-openshell-supervisor \
+            --since=5m 2>/dev/null
+    else
+        kubectl logs -n "${SANDBOX_NAMESPACE}" "pod/${SUPERVISOR_POD}" --since=5m 2>/dev/null
+    fi
+}
+
 supervisor_denied() {
     local destination="$1"
-    kubectl logs -n "${SUPERVISOR_NAMESPACE}" deployment/kvpoc-openshell-supervisor \
-        --since=2m 2>/dev/null \
-        | grep -a "OCSF NET:OPEN.*DENIED.*${destination}"
+    supervisor_logs | grep -a "OCSF NET:OPEN.*DENIED.*${destination}"
 }
 
 exec_in_sandbox() {
@@ -114,7 +133,7 @@ if kubectl get vm -n "${SANDBOX_NAMESPACE}" -l "${VM_SELECTOR}"     --no-headers
     echo "clearing an orphaned VM from a previous run"
     kubectl delete vm -n "${SANDBOX_NAMESPACE}" -l "${VM_SELECTOR}" --wait=true         >/dev/null 2>&1 || true
 fi
-kubectl delete secret,pvc,netpol -n "${SANDBOX_NAMESPACE}" -l "${VM_SELECTOR}"     --ignore-not-found >/dev/null 2>&1 || true
+kubectl delete pod,svc,secret,pvc,netpol -n "${SANDBOX_NAMESPACE}" -l "${VM_SELECTOR}" --ignore-not-found >/dev/null 2>&1 || true
 sleep 5
 "${OPENSHELL_CLI}" sandbox create --detach --name "${NAME}" \
     --policy "${ROOT}/e2e/kubevirt/demo-policy.yaml" \
@@ -126,6 +145,33 @@ kubectl get vm,vmi,netpol,secret,pvc -n "${SANDBOX_NAMESPACE}" -l "${VM_SELECTOR
 SBX_ID="$(vm_jsonpath '{.items[0].metadata.labels.openshell\.ai/sandbox-id}')"
 VM_UID="$(vm_jsonpath '{.items[0].metadata.uid}')"
 [ -n "${VM_UID}" ] || fail "VM has no UID"
+# The dedicated supervisor Pod's name derives from the sandbox id
+# (SandboxRuntimeNames::new lowercases it).
+SBX_LC="$(printf '%s' "${SBX_ID}" | tr '[:upper:]' '[:lower:]')"
+SUPERVISOR_POD="os-supervisor-${SBX_LC}"
+BOOTSTRAP_SECRET="default--${NAME}-bootstrap"
+
+if [ "${TOPOLOGY}" = "dedicated" ]; then
+    echo "dedicated supervisor generation:"
+    kubectl get pod,svc,secret -n "${SANDBOX_NAMESPACE}" \
+        -l "openshell.ai/sandbox-id=${SBX_ID},openshell.ai/component=supervisor" \
+        || fail "dedicated supervisor objects missing after create"
+    SUPERVISOR_POD_UID="$(kubectl get pod -n "${SANDBOX_NAMESPACE}" "${SUPERVISOR_POD}" \
+        -o jsonpath='{.metadata.uid}' 2>/dev/null)" \
+        || fail "dedicated supervisor Pod ${SUPERVISOR_POD} not found"
+    [ -n "${SUPERVISOR_POD_UID}" ] || fail "supervisor Pod has no UID"
+    # The boundary config delivered to the guest claims the supervisor Pod's
+    # UID (kubevirt.supervisor_pod_uid); the rendered claim must be the live
+    # Pod's UID.
+    CLAIMED_UID="$(kubectl get secret -n "${SANDBOX_NAMESPACE}" "${BOOTSTRAP_SECRET}" \
+        -o jsonpath='{.data.userData}' | base64 -d \
+        | grep "^OPENSHELL_BOUNDARY_CONFIG_B64=" | cut -d= -f2- | base64 -d \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["resource_claims"]["kubevirt.supervisor_pod_uid"])')" \
+        || fail "could not extract kubevirt.supervisor_pod_uid from the guest bootstrap"
+    [ "${CLAIMED_UID}" = "${SUPERVISOR_POD_UID}" ] \
+        || fail "boundary claim kubevirt.supervisor_pod_uid (${CLAIMED_UID}) does not match the supervisor Pod UID (${SUPERVISOR_POD_UID})"
+    echo "supervisor Pod UID matches the kubevirt.supervisor_pod_uid claim (${SUPERVISOR_POD_UID})"
+fi
 
 step "2/10 fence NetworkPolicy and its podSelector"
 FENCE="$(fence_name)"
@@ -140,6 +186,17 @@ LAUNCHER_PODS="$(kubectl get pods -n "${SANDBOX_NAMESPACE}" \
 [ "${LAUNCHER_PODS}" = "1" ] \
     || fail "expected exactly one launcher pod matching the fence selector, got ${LAUNCHER_PODS}"
 echo "exactly one virt-launcher pod matches the fence podSelector"
+if [ "${TOPOLOGY}" = "dedicated" ]; then
+    # The fence's egress target is the pair's supervisor-role selector:
+    # exactly this sandbox's supervisor Pod (same namespace, no
+    # namespaceSelector).
+    FENCE_PODS="$(kubectl get pods -n "${SANDBOX_NAMESPACE}" \
+        -l "openshell.ai/boundary-pair=${SBX_LC},openshell.ai/boundary-role=supervisor" \
+        --no-headers 2>/dev/null | wc -l)"
+    [ "${FENCE_PODS}" = "1" ] \
+        || fail "expected exactly one supervisor pod in the fence egress selector, got ${FENCE_PODS}"
+    echo "fence egress selects exactly this sandbox's supervisor Pod"
+fi
 
 step "3/10 exec inside the VM"
 exec_in_sandbox sh -c 'uname -a; id; cat /proc/1/comm' | tee ${WORKDIR}/exec.log
@@ -219,6 +276,15 @@ echo "fence check: launcher pod -> supervisor ${SUPERVISOR_IP}:5500 reachable (s
 step "7/10 stop -> start -> Ready with VM and fence UIDs unchanged"
 "${OPENSHELL_CLI}" sandbox stop "${NAME}"
 require_phase Stopped
+if [ "${TOPOLOGY}" = "dedicated" ]; then
+    # Stop deletes the supervisor Pod, exactly as the pod path's stop
+    # deletes both Pods.
+    sleep 5
+    if kubectl get pod -n "${SANDBOX_NAMESPACE}" "${SUPERVISOR_POD}" >/dev/null 2>&1; then
+        fail "supervisor Pod still present after stop"
+    fi
+    echo "supervisor Pod deleted by stop"
+fi
 "${OPENSHELL_CLI}" sandbox start "${NAME}"
 wait_for_phase Ready
 VM_UID_AFTER="$(vm_jsonpath '{.items[0].metadata.uid}')"
@@ -227,6 +293,25 @@ FENCE_UID_AFTER="$(kubectl get netpol -n "${SANDBOX_NAMESPACE}" "${FENCE}" \
 [ "${VM_UID_AFTER}" = "${VM_UID}" ] || fail "VM UID changed across stop/start"
 [ "${FENCE_UID_AFTER}" = "${FENCE_UID}" ] || fail "fence UID changed across stop/start"
 echo "VM uid unchanged (${VM_UID}); fence uid unchanged (${FENCE_UID})"
+if [ "${TOPOLOGY}" = "dedicated" ]; then
+    # A dedicated start provisions a fresh supervisor generation: a new Pod
+    # with a new UID, claimed by the re-rendered boundary bootstrap.
+    NEW_SUPERVISOR_POD_UID="$(kubectl get pod -n "${SANDBOX_NAMESPACE}" "${SUPERVISOR_POD}" \
+        -o jsonpath='{.metadata.uid}' 2>/dev/null)" \
+        || fail "no supervisor Pod after start"
+    [ -n "${NEW_SUPERVISOR_POD_UID}" ] || fail "restarted supervisor Pod has no UID"
+    [ "${NEW_SUPERVISOR_POD_UID}" != "${SUPERVISOR_POD_UID}" ] \
+        || fail "supervisor Pod UID did not rotate across stop/start"
+    CLAIMED_UID="$(kubectl get secret -n "${SANDBOX_NAMESPACE}" "${BOOTSTRAP_SECRET}" \
+        -o jsonpath='{.data.userData}' | base64 -d \
+        | grep "^OPENSHELL_BOUNDARY_CONFIG_B64=" | cut -d= -f2- | base64 -d \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["resource_claims"]["kubevirt.supervisor_pod_uid"])')" \
+        || fail "could not extract kubevirt.supervisor_pod_uid after start"
+    [ "${CLAIMED_UID}" = "${NEW_SUPERVISOR_POD_UID}" ] \
+        || fail "re-rendered claim (${CLAIMED_UID}) does not match the new supervisor Pod UID (${NEW_SUPERVISOR_POD_UID})"
+    echo "supervisor Pod UID rotated and re-claimed (${NEW_SUPERVISOR_POD_UID})"
+    SUPERVISOR_POD_UID="${NEW_SUPERVISOR_POD_UID}"
+fi
 INSTANCE_SECRETS="$(kubectl get secret -n "${SANDBOX_NAMESPACE}" \
     -l "openshell.ai/sandbox-id=${SBX_ID},openshell.ai/component=supervisor-bootstrap" \
     --no-headers 2>/dev/null | wc -l)"
@@ -268,21 +353,32 @@ echo "main process exit observed through the boundary session (Error, exit code 
 
 step "10/10 delete -> zero leftover managed objects"
 "${OPENSHELL_CLI}" sandbox delete "${NAME}"
+# The leftover set includes pods and services: the dedicated topology's
+# supervisor Pod and per-sandbox Service carry the sandbox-id label (the
+# shared topology has none, so the count stays complete either way).
 DEADLINE=$(( $(date +%s) + 180 ))
 while [ "$(date +%s)" -lt "${DEADLINE}" ]; do
-    LEFT="$(kubectl get vm,vmi,secret,pvc,netpol -n "${SANDBOX_NAMESPACE}" \
+    LEFT="$(kubectl get vm,vmi,pod,svc,secret,pvc,netpol -n "${SANDBOX_NAMESPACE}" \
         -l "openshell.ai/sandbox-id=${SBX_ID}" --no-headers 2>/dev/null | wc -l)"
     [ "${LEFT}" = "0" ] && break
     sleep 5
 done
-LEFT="$(kubectl get vm,vmi,secret,pvc,netpol -n "${SANDBOX_NAMESPACE}" \
+LEFT="$(kubectl get vm,vmi,pod,svc,secret,pvc,netpol -n "${SANDBOX_NAMESPACE}" \
     -l "openshell.ai/sandbox-id=${SBX_ID}" --no-headers 2>/dev/null | wc -l)"
 [ "${LEFT}" = "0" ] || fail "${LEFT} managed objects left after delete"
-kubectl logs -n "${SUPERVISOR_NAMESPACE}" deployment/kvpoc-openshell-supervisor \
-    --since=5m 2>/dev/null | grep "removing withdrawn sandbox instance" | tail -1 \
-    || echo "(note: supervisor withdrawal log line not captured — check manually)"
-echo "zero leftover vm/vmi/secret/pvc/netpol for sandbox ${SBX_ID}"
+if [ "${TOPOLOGY}" = "dedicated" ]; then
+    if kubectl get pod -n "${SANDBOX_NAMESPACE}" "${SUPERVISOR_POD}" >/dev/null 2>&1; then
+        fail "supervisor Pod still present after delete"
+    fi
+    echo "supervisor Pod gone after delete"
+else
+    kubectl logs -n "${SUPERVISOR_NAMESPACE}" deployment/kvpoc-openshell-supervisor \
+        --since=5m 2>/dev/null | grep "removing withdrawn sandbox instance" | tail -1 \
+        || echo "(note: supervisor withdrawal log line not captured — check manually)"
+fi
+echo "zero leftover vm/vmi/pod/svc/secret/pvc/netpol for sandbox ${SBX_ID}"
 
 echo
-echo "demo complete: Ready, exec, L4/L7 policy, bypass blocked, stop/start,"
-echo "fence verification, dead-runtime Error, and clean teardown all verified"
+echo "demo complete (${TOPOLOGY} supervisor topology): Ready, exec, L4/L7"
+echo "policy, bypass blocked, stop/start, fence verification, dead-runtime"
+echo "Error, and clean teardown all verified"
