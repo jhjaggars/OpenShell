@@ -600,7 +600,8 @@ impl KubernetesComputeConfig {
         self.validate_proxy_uid()?;
         self.validate_upstream_proxy_config()?;
         self.validate_allowed_pod_annotations()?;
-        self.validate_allowed_pod_labels()
+        self.validate_allowed_pod_labels()?;
+        self.validate_kubevirt_config()
     }
 
     /// The shared supervisor serves only sandbox instances it can isolate: it
@@ -687,6 +688,13 @@ impl KubernetesComputeConfig {
     }
 
     /// Validate the `KubeVirt` runtime mode configuration (`PoC` constraints).
+    ///
+    /// `grpc_endpoint` is deliberately neither required nor restricted here:
+    /// the pod path uses it to point per-sandbox supervisor pods at the
+    /// gateway, while a `KubeVirt` guest never learns the gateway endpoint at
+    /// all — the boundary resolves the shared supervisor's Service through
+    /// the API and dials it on the routed runtime connection, so an
+    /// `https://` endpoint (the TLS demo's shape) is as valid as none.
     pub fn validate_kubevirt_config(&self) -> Result<(), String> {
         if self.runtime != KubernetesRuntimeMode::KubeVirt {
             return Ok(());
@@ -715,21 +723,6 @@ impl KubernetesComputeConfig {
                  configured mode is {}",
                 self.workspace_mode
             ));
-        }
-        if self.grpc_endpoint.trim().is_empty() {
-            return Err(
-                "kubevirt runtime requires grpc_endpoint: the guest supervisor must be \
-                 able to reach the gateway"
-                    .to_string(),
-            );
-        }
-        if self.grpc_endpoint.trim_start().starts_with("https://") {
-            return Err(
-                "kubevirt runtime does not yet support https:// grpc_endpoints: the guest \
-                 bootstrap delivers no client TLS material. Use an http:// endpoint local \
-                 to the cluster network"
-                    .to_string(),
-            );
         }
         Ok(())
     }

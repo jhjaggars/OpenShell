@@ -1218,6 +1218,9 @@ impl KubernetesComputeDriver {
         config
             .validate_supervisor_topology()
             .map_err(KubernetesDriverError::Precondition)?;
+        config
+            .validate_kubevirt_config()
+            .map_err(KubernetesDriverError::Precondition)?;
         // Read the bundle once at startup so an unreadable path or a
         // certificate-free file fails the gateway here, rather than as a
         // repeated sandbox-create failure. The authoritative read still
@@ -10506,6 +10509,61 @@ mod tests {
         assert!(
             matches!(&error, KubeError::Service(source) if source.is::<tower::timeout::error::Elapsed>()),
             "expected request timeout, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kubevirt_config_rules_run_at_construction() {
+        // Z1 guard: the kubevirt runtime rules must run through the real
+        // construction entry points, so an invalid runtime=kubevirt config
+        // cannot build a driver. Validation happens before any cluster
+        // connection, so no kubeconfig is needed to assert the refusal.
+        let config = KubernetesComputeConfig {
+            runtime: crate::KubernetesRuntimeMode::KubeVirt,
+            namespace: "kvpoc-sandboxes".to_string(),
+            gateway_id: "kvpoc".to_string(),
+            kubevirt: crate::KubeVirtConfig {
+                guest_image: "kvpoc/openshell-sandbox-vm:dev".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // runtime=kubevirt without the gateway shared supervisor is refused
+        // by the plain constructor before it touches the cluster.
+        let error = KubernetesComputeDriver::new(config.clone(), shutdown_rx.clone(), None)
+            .await
+            .expect_err("kubevirt without shared supervisor is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("kubevirt runtime requires the gateway shared supervisor"),
+            "message should name the requirement: {error}"
+        );
+
+        // With the gateway topology and shared supervision wired, an empty
+        // guest image is refused by the same path (the wiring cannot
+        // silently disappear again).
+        let mut config = config;
+        config.supervisor_topology = Some(crate::SupervisorTopology::Gateway);
+        config.shared_supervisor = Some(crate::SharedSupervisorConfig {
+            service_name: "openshell-supervisor".to_string(),
+            service_namespace: "openshell".to_string(),
+            runtime_port: 5500,
+            token_secret_name: "openshell-supervisor-token".to_string(),
+        });
+        config.kubevirt.guest_image = String::new();
+        let error = KubernetesComputeDriver::with_shared_supervision(
+            config,
+            shutdown_rx,
+            SharedSupervision::new(),
+        )
+        .await
+        .expect_err("empty guest_image is refused");
+        assert!(
+            error.to_string().contains("guest_image"),
+            "message should name the key: {error}"
         );
     }
 

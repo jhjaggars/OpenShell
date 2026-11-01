@@ -1154,14 +1154,43 @@ mod kubevirt_review_tests {
     }
 
     #[test]
-    fn https_endpoint_is_rejected_with_clear_message() {
+    fn grpc_endpoint_is_not_validated_in_kubevirt_mode() {
+        // The guest never learns the gateway endpoint: the boundary resolves
+        // the shared supervisor's Service through the API and dials it on the
+        // routed runtime connection. grpc_endpoint serves the pod path's
+        // per-sandbox supervisor pods only, so kubevirt mode neither requires
+        // nor restricts it — including the https:// shape the TLS demo uses.
         let mut cfg = review_config();
         cfg.grpc_endpoint = "https://openshell-gateway.ns.svc:8080".to_string();
-        let err = cfg.validate_kubevirt_config().expect_err("https rejected");
-        assert!(err.contains("https://"), "message should name TLS: {err}");
-        // A plain http endpoint with any host shape passes endpoint checks.
-        cfg.grpc_endpoint = "http://openshell-gateway.ns.svc:8080".to_string();
         assert!(cfg.validate_kubevirt_config().is_ok());
+        cfg.grpc_endpoint = String::new();
+        assert!(cfg.validate_kubevirt_config().is_ok());
+    }
+
+    #[test]
+    fn validate_configuration_surfaces_kubevirt_rules() {
+        // The startup validation entry point must include the kubevirt rules,
+        // so an invalid runtime=kubevirt config cannot pass construction.
+        let mut cfg = review_config();
+        cfg.shared_supervisor = None;
+        let err = cfg
+            .validate_configuration()
+            .expect_err("missing shared supervisor is refused");
+        assert!(
+            err.contains("kubevirt runtime requires the gateway shared supervisor"),
+            "message should name the requirement: {err}"
+        );
+
+        let mut cfg = review_config();
+        cfg.supervisor_topology = Some(crate::SupervisorTopology::Gateway);
+        cfg.kubevirt.guest_image = String::new();
+        let err = cfg
+            .validate_configuration()
+            .expect_err("empty guest_image is refused");
+        assert!(
+            err.contains("guest_image"),
+            "message should name the key: {err}"
+        );
     }
 }
 
