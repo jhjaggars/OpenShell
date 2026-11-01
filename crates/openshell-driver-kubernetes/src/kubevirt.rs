@@ -47,12 +47,13 @@ use openshell_core::driver_utils::{
 use openshell_core::proto::compute::v1::{
     DriverCondition, DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus,
 };
-use openshell_core::sandbox_env;
 
 use crate::KubernetesDriverError;
 use crate::config::{KubernetesComputeConfig, KubernetesRuntimeMode, WorkspaceMode};
 use crate::driver::KUBE_API_TIMEOUT;
 use crate::driver::{sandbox_annotations, sandbox_labels};
+#[cfg(test)]
+use openshell_core::sandbox_env;
 
 pub const KUBEVIRT_GROUP: &str = "kubevirt.io";
 pub const KUBEVIRT_VERSION: &str = "v1";
@@ -158,7 +159,8 @@ pub struct KubeVirtSandboxParams<'a> {
 /// `cloudInitNoCloud` volume. `user-data` is a shell-sourceable `KEY=VALUE`
 /// file; the guest init writes the token to a 0600 file and unsets it before
 /// exec'ing the supervisor.
-pub fn render_bootstrap_secret(params: &KubeVirtSandboxParams<'_>) -> Secret {
+#[cfg(test)]
+fn render_bootstrap_secret(params: &KubeVirtSandboxParams<'_>) -> Secret {
     let sandbox = params.sandbox;
     let spec = sandbox.spec.as_ref();
     let mut lines = Vec::new();
@@ -554,6 +556,7 @@ fn annotation_or_label(obj: &DynamicObject, key: &str) -> Option<String> {
 }
 
 /// Single-quote a value for the shell-sourceable user-data file.
+#[cfg(test)]
 fn shell_quote(value: &str) -> String {
     if value
         .chars()

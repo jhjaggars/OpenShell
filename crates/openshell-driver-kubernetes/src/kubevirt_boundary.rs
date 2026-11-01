@@ -961,15 +961,23 @@ pub fn render_kubevirt_bootstrap(
         image_identity: guest_image.to_string(),
         network_policy_uid: fence_uid.to_string(),
         network_policy_resource_version: fence_resource_version.to_string(),
+        // W2: the authority is the supervisor Service's DNS name. The
+        // SupervisorEndpoint carries it; for the PoC this is the
+        // namespace-local service name.
         supervisor_authority: format!(
-            "{}.{}:{}",
-            supervisor.namespace, supervisor.namespace, supervisor.port
+            "openshell-supervisor.{}:{}",
+            supervisor.namespace, supervisor.port
         ),
         supervisor_addresses: vec![supervisor_address],
         route: route.to_string(),
+        // W3: the supervisor's TLS client config (how it authenticates the
+        // boundary). The trust anchor is the session CA (from
+        // generate_sandbox_tls_material, embedded in the certificate chain);
+        // the server_name is the sandbox DNS name it assigned to the
+        // session certificate.
         supervisor_tls: SandboxTlsClientConfig {
-            server_name: format!("supervisor.{}.svc", supervisor.namespace),
-            trust_anchor_pem: String::new(),
+            server_name: format!("sandbox.{}.openshell.internal", launch_inputs.session_id),
+            trust_anchor_pem: launch_inputs.tls.certificate_chain_pem.clone(),
         },
         workload_identity: workload_identity.clone(),
         child_env: HashMap::new(),

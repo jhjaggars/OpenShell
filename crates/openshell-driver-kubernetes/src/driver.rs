@@ -3996,25 +3996,28 @@ impl KubernetesComputeDriver {
         // TLS + guest payload) instead of the legacy env-var userData.
         // The fence NetworkPolicy is created before the VM so the
         // boundary evidence can carry its UID.
-        let launch_authentication: Option<openshell_core::jwt::SandboxLaunchAuthentication> =
-            sandbox
-                .spec
-                .as_ref()
-                .filter(|spec| !spec.launch_authentication.is_empty())
-                .map(|spec| {
-                    crate::kubevirt::decode_launch_authentication(
-                        spec.launch_authentication.as_slice(),
-                    )
-                    .and_then(|opt| {
-                        opt.ok_or_else(|| {
-                            KubernetesDriverError::Precondition(
-                                "launch authentication was non-empty but decoded to None"
-                                    .to_string(),
-                            )
-                        })
+        // W7: missing launch authentication is a Precondition error — the
+        // boundary path requires it, and silently falling back to the
+        // legacy env-var payload would put gateway material in the guest.
+        let launch_authentication: openshell_core::jwt::SandboxLaunchAuthentication = {
+            let spec = sandbox.spec.as_ref().ok_or_else(|| {
+                KubernetesDriverError::Precondition("KubeVirt sandbox spec is required".to_string())
+            })?;
+            if spec.launch_authentication.is_empty() {
+                return Err(KubernetesDriverError::Precondition(
+                    "KubeVirt runtime requires launch authentication; the gateway did not                      provide it"
+                        .to_string(),
+                ));
+            }
+            crate::kubevirt::decode_launch_authentication(spec.launch_authentication.as_slice())
+                .and_then(|opt| {
+                    opt.ok_or_else(|| {
+                        KubernetesDriverError::Precondition(
+                            "launch authentication was non-empty but decoded to None".to_string(),
+                        )
                     })
-                })
-                .transpose()?;
+                })?
+        };
 
         let vm_api = crate::kubevirt::virtual_machine_api(&self.client, &namespace);
         // The VM is the owning resource: if it already exists this sandbox
@@ -4046,7 +4049,8 @@ impl KubernetesComputeDriver {
         // instead of the legacy env-var payload. The fence NetworkPolicy
         // is created first so its UID feeds the evidence.
         let mut created_fence: Option<(String, String, serde_json::Value)> = None;
-        let user_data: String = if let Some(ref auth) = launch_authentication {
+        let _ = &created_fence;
+        let user_data: String = {
             let supervisor = crate::kubevirt_boundary::SupervisorEndpoint {
                 namespace: self.config.kubevirt.supervisor_namespace.clone(),
                 pod_selector: self.config.kubevirt.supervisor_pod_selector.clone(),
@@ -4100,7 +4104,7 @@ impl KubernetesComputeDriver {
             // known after creation. The stability property the claims
             // need (same identity across stop/start) is preserved.
             let bootstrap = crate::kubevirt_boundary::render_kubevirt_bootstrap(
-                auth,
+                &launch_authentication,
                 &sandbox.id,
                 &sandbox.name,
                 &sandbox.id, // vm_uid (PoC: the sandbox ID)
@@ -4115,15 +4119,6 @@ impl KubernetesComputeDriver {
             )
             .map_err(KubernetesDriverError::Precondition)?;
             bootstrap.guest_payload
-        } else {
-            // Legacy path: the env-var userData for the R3 dead-guest
-            // path and the capability probe.
-            crate::kubevirt::render_bootstrap_secret(&params)
-                .string_data
-                .as_ref()
-                .and_then(|data| data.get("userData"))
-                .cloned()
-                .unwrap_or_default()
         };
         let core_secret_resource = ApiResource {
             group: String::new(),
@@ -4421,14 +4416,117 @@ impl KubernetesComputeDriver {
         // token, which would only fail later inside the guest.
         match crate::kubevirt::decode_launch_authentication(encoded_authentication) {
             Ok(Some(authentication)) => {
-                let fresh_token = authentication.supervisor.sandbox_token.expose_secret();
-                crate::kubevirt::refresh_bootstrap_secret_token(
-                    &self.client,
-                    &namespace,
-                    &kube_name,
-                    fresh_token,
-                )
-                .await?;
+                // Boundary path: re-read the fence and re-render the guest
+                // bootstrap for this generation. When the bootstrap Secret
+                // carries a boundary payload (the boundary path was used at
+                // create), the re-render replaces the token-line rewrite.
+                // The legacy path (token-line rewrite) is kept for
+                // bootstraps created before the boundary wiring.
+                let secret_api: Api<Secret> = Api::namespaced(self.client.clone(), &namespace);
+                let secret_name = crate::kubevirt::bootstrap_secret_name(&kube_name);
+                let secret = tokio::time::timeout(KUBE_API_TIMEOUT, secret_api.get(&secret_name))
+                    .await
+                    .map_err(|_| {
+                        KubernetesDriverError::Message(format!(
+                            "timed out reading bootstrap Secret {secret_name}"
+                        ))
+                    })?
+                    .map_err(KubernetesDriverError::from_kube)?;
+                let current_user_data = secret
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("userData"))
+                    .and_then(|value| String::from_utf8(value.0.clone()).ok())
+                    .unwrap_or_default();
+
+                if current_user_data.contains("OPENSHELL_BOUNDARY_CONFIG_B64") {
+                    // Boundary path: re-read the fence (verifies it exists),
+                    // re-render the bootstrap with the new generation.
+                    let supervisor = crate::kubevirt_boundary::SupervisorEndpoint {
+                        namespace: self.config.kubevirt.supervisor_namespace.clone(),
+                        pod_selector: self.config.kubevirt.supervisor_pod_selector.clone(),
+                        port: self.config.kubevirt.supervisor_port,
+                    };
+                    let fence = crate::kubevirt_boundary::observe_fence(
+                        &self.client,
+                        &namespace,
+                        &object
+                            .metadata
+                            .labels
+                            .as_ref()
+                            .and_then(|l| l.get("openshell.ai/sandbox-id").cloned())
+                            .unwrap_or_default(),
+                    )
+                    .await
+                    .map_err(KubernetesDriverError::Message)?
+                    .ok_or_else(|| {
+                        KubernetesDriverError::Precondition(
+                            "the egress fence was deleted; the boundary bootstrap cannot be re-rendered"
+                                .to_string(),
+                        )
+                    })?;
+
+                    let bootstrap = crate::kubevirt_boundary::render_kubevirt_bootstrap(
+                        &authentication,
+                        &object
+                            .metadata
+                            .labels
+                            .as_ref()
+                            .and_then(|l| l.get("openshell.ai/sandbox-id").cloned())
+                            .unwrap_or_default(),
+                        &kube_name,
+                        &object
+                            .metadata
+                            .labels
+                            .as_ref()
+                            .and_then(|l| l.get("openshell.ai/sandbox-id").cloned())
+                            .unwrap_or_default(),
+                        &self.config.kubevirt.guest_image,
+                        &fence.uid,
+                        &fence.resource_version,
+                        fence.spec,
+                        &supervisor,
+                        &object
+                            .metadata
+                            .labels
+                            .as_ref()
+                            .and_then(|l| l.get("openshell.ai/sandbox-id").cloned())
+                            .unwrap_or_default(),
+                        10001,
+                        10001,
+                    )
+                    .map_err(KubernetesDriverError::Precondition)?;
+
+                    let patch = serde_json::json!({
+                        "stringData": {"userData": bootstrap.guest_payload}
+                    });
+                    tokio::time::timeout(
+                        KUBE_API_TIMEOUT,
+                        secret_api.patch(
+                            &secret_name,
+                            &PatchParams::default(),
+                            &Patch::Merge(&patch),
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        KubernetesDriverError::Message(format!(
+                            "timed out patching bootstrap Secret {secret_name}"
+                        ))
+                    })?
+                    .map_err(KubernetesDriverError::from_kube)?;
+                } else {
+                    // Legacy path: rewrite the token line in the env-var
+                    // payload.
+                    let fresh_token = authentication.supervisor.sandbox_token.expose_secret();
+                    crate::kubevirt::refresh_bootstrap_secret_token(
+                        &self.client,
+                        &namespace,
+                        &kube_name,
+                        fresh_token,
+                    )
+                    .await?;
+                }
             }
             Ok(None) => {}
             Err(error) => return Err(error),
