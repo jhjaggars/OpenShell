@@ -1220,13 +1220,18 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # supervisor then runs process-only and the VM's egress is fenced by a
 # NetworkPolicy to the proxy pod, cluster DNS, and the gateway. proxy_pod
 # requires an IP-literal grpc_endpoint host.
+# The kubevirt runtime requires the gateway-shared supervisor
+# (supervisor_topology = "gateway"): the guest's boundary dials the
+# shared supervisor Service named by shared_supervisor, whose ClusterIP
+# and pod selector are resolved through the API at create time. A
+# NetworkPolicy fences guest egress to that Service, cluster DNS, and
+# the gateway.
 # [openshell.drivers.kubernetes.kubevirt]
 # guest_image              = "kvpoc/openshell-sandbox-vm:dev"
 # guest_image_pull_policy  = "IfNotPresent"
 # cpu_cores                = 1
 # memory                   = "1Gi"
 # workspace_pvc            = true
-# proxy_pod                = true
 
 [openshell.drivers.kubernetes.managed_ssh_ingress]
 enabled = true

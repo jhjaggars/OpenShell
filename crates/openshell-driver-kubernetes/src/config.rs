@@ -184,14 +184,6 @@ pub struct KubeVirtConfig {
     /// Attach a per-sandbox PVC at `/sandbox` so the workspace survives
     /// stop/start (mirrors the pod path's PVC-backed workspace).
     pub workspace_pvc: bool,
-    /// Namespace of the gateway-shared supervisor Service the boundary
-    /// dials (`RuntimeInitiatedTlsTcp`). Required for the boundary path.
-    pub supervisor_namespace: String,
-    /// The shared supervisor Service's pod selector (read from the live
-    /// Service, used as the egress fence's podSelector).
-    pub supervisor_pod_selector: BTreeMap<String, String>,
-    /// The shared supervisor Service's runtime port.
-    pub supervisor_port: u16,
 }
 
 impl Default for KubeVirtConfig {
@@ -202,9 +194,6 @@ impl Default for KubeVirtConfig {
             cpu_cores: 1,
             memory: "1Gi".to_string(),
             workspace_pvc: true,
-            supervisor_namespace: String::new(),
-            supervisor_pod_selector: BTreeMap::new(),
-            supervisor_port: 0,
         }
     }
 }
@@ -701,6 +690,11 @@ impl KubernetesComputeConfig {
     pub fn validate_kubevirt_config(&self) -> Result<(), String> {
         if self.runtime != KubernetesRuntimeMode::KubeVirt {
             return Ok(());
+        }
+        if self.shared_supervisor.is_none() {
+            return Err("kubevirt runtime requires the gateway shared supervisor \
+                 (supervisor_topology = \"gateway\"); configure shared_supervisor"
+                .to_string());
         }
         if self.kubevirt.guest_image.trim().is_empty() {
             return Err(

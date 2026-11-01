@@ -4051,10 +4051,26 @@ impl KubernetesComputeDriver {
         let mut created_fence: Option<(String, String, serde_json::Value)> = None;
         let _ = &created_fence;
         let user_data: String = {
+            // W1: resolve the shared supervisor Service through the API —
+            // ClusterIP, selector, and port — the same resolution the pod
+            // path performs via GenerationLaunchTarget::Shared.
+            let shared_supervisor = self.config.shared_supervisor.as_ref().ok_or_else(|| {
+                KubernetesDriverError::Precondition(
+                    "KubeVirt runtime requires a configured shared supervisor".to_string(),
+                )
+            })?;
+            let resolved_supervisor = crate::kubevirt_boundary::resolve_shared_supervisor(
+                &self.client,
+                shared_supervisor,
+            )
+            .await
+            .map_err(KubernetesDriverError::Precondition)?;
             let supervisor = crate::kubevirt_boundary::SupervisorEndpoint {
-                namespace: self.config.kubevirt.supervisor_namespace.clone(),
-                pod_selector: self.config.kubevirt.supervisor_pod_selector.clone(),
-                port: self.config.kubevirt.supervisor_port,
+                namespace: resolved_supervisor.namespace.clone(),
+                service_name: resolved_supervisor.service_name.clone(),
+                pod_selector: resolved_supervisor.pod_selector.clone(),
+                port: resolved_supervisor.port,
+                address: resolved_supervisor.address,
             };
             // Create the fence NetworkPolicy (before the VM).
             let fence_json = crate::kubevirt_boundary::render_fence(
@@ -4442,10 +4458,25 @@ impl KubernetesComputeDriver {
                 if current_user_data.contains("OPENSHELL_BOUNDARY_CONFIG_B64") {
                     // Boundary path: re-read the fence (verifies it exists),
                     // re-render the bootstrap with the new generation.
+                    let shared_supervisor =
+                        self.config.shared_supervisor.as_ref().ok_or_else(|| {
+                            KubernetesDriverError::Precondition(
+                                "KubeVirt runtime requires a configured shared supervisor"
+                                    .to_string(),
+                            )
+                        })?;
+                    let resolved_supervisor = crate::kubevirt_boundary::resolve_shared_supervisor(
+                        &self.client,
+                        shared_supervisor,
+                    )
+                    .await
+                    .map_err(KubernetesDriverError::Precondition)?;
                     let supervisor = crate::kubevirt_boundary::SupervisorEndpoint {
-                        namespace: self.config.kubevirt.supervisor_namespace.clone(),
-                        pod_selector: self.config.kubevirt.supervisor_pod_selector.clone(),
-                        port: self.config.kubevirt.supervisor_port,
+                        namespace: resolved_supervisor.namespace.clone(),
+                        service_name: resolved_supervisor.service_name.clone(),
+                        pod_selector: resolved_supervisor.pod_selector.clone(),
+                        port: resolved_supervisor.port,
+                        address: resolved_supervisor.address,
                     };
                     let fence = crate::kubevirt_boundary::observe_fence(
                         &self.client,

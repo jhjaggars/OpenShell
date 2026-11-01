@@ -443,11 +443,15 @@ use kube::core::DynamicObject;
 pub struct SupervisorEndpoint {
     /// Namespace of the shared supervisor Service.
     pub namespace: String,
+    /// Name of the shared supervisor Service (from `SharedSupervisorConfig`).
+    pub service_name: String,
     /// The Service's `spec.selector` (pod labels), used verbatim as the
     /// egress podSelector. Read from the live Service, never hard-coded.
     pub pod_selector: BTreeMap<String, String>,
     /// The Service's runtime port.
     pub port: u16,
+    /// The Service's `ClusterIP` (resolved through the API at render time).
+    pub address: SocketAddr,
 }
 
 /// The fence's observed state: UID, resourceVersion, and the full spec
@@ -659,9 +663,10 @@ pub async fn verify_fence(
 mod fence_tests {
     use super::*;
 
-    fn supervisor() -> SupervisorEndpoint {
+    pub(super) fn supervisor() -> SupervisorEndpoint {
         SupervisorEndpoint {
             namespace: "openshell".to_string(),
+            service_name: "openshell-supervisor".to_string(),
             pod_selector: BTreeMap::from([
                 (
                     "app.kubernetes.io/name".to_string(),
@@ -673,6 +678,7 @@ mod fence_tests {
                 ),
             ]),
             port: 5500,
+            address: "10.43.0.10:5500".parse().unwrap(),
         }
     }
 
@@ -887,6 +893,101 @@ mod payload_tests {
             );
         }
     }
+
+    fn test_launch_authentication() -> SandboxLaunchAuthentication {
+        use openshell_core::jwt::{
+            CredentialEpoch, SecretJwt, SessionRotation, SessionVerificationKey,
+            SupervisorAuthBundle,
+        };
+        SandboxLaunchAuthentication {
+            supervisor: SupervisorAuthBundle {
+                session_id: openshell_core::SandboxSessionId::new(),
+                runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                    "generation-1",
+                )
+                .unwrap(),
+                session_rotation: SessionRotation::new(1).unwrap(),
+                auth_epoch: CredentialEpoch::new(1).unwrap(),
+                gateway_token: SecretJwt::parse("gateway.token.value").unwrap(),
+                gateway_expires_at: i64::MAX,
+                sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
+                sandbox_expires_at: i64::MAX,
+                ssh_host_private_key: None,
+                ocsf_otlp_headers: None,
+            },
+            gateway_id: "gateway-test".to_string(),
+            verification_keys: vec![SessionVerificationKey {
+                key_id: "test-key".to_string(),
+                public_key_pem: b"public-key".to_vec(),
+            }],
+        }
+    }
+
+    /// W3: the rendered descriptor's TLS must be the session material's
+    /// `server_name` and `trust_anchor_pem` verbatim — the same fields the
+    /// pod path passes to `SandboxTlsClientConfig`. The trust anchor is
+    /// the session CA (a distinct certificate from the leaf the guest
+    /// presents), and it must be non-empty PEM.
+    #[test]
+    fn descriptor_tls_uses_session_material_verbatim() {
+        let auth = test_launch_authentication();
+        let session_id = auth.supervisor.session_id;
+        let supervisor = fence_tests::supervisor();
+        let bootstrap = render_kubevirt_bootstrap(
+            &auth,
+            "sbx-1",
+            "sandbox-1",
+            "vm-uid-1",
+            "kvpoc/openshell-sandbox-vm:dev",
+            "np-uid-1",
+            "1945",
+            serde_json::json!({}),
+            &supervisor,
+            "route-1",
+            10001,
+            10001,
+        )
+        .expect("render");
+
+        let tls = &bootstrap.runtime_descriptor.tls;
+        // server_name is exactly what generate_sandbox_tls_material assigns
+        // for this session (sandbox.<session_id>.openshell.internal).
+        assert_eq!(
+            tls.server_name,
+            format!("sandbox.{session_id}.openshell.internal"),
+            "server_name must be the session material's, verbatim"
+        );
+        // trust_anchor_pem is the session CA — non-empty certificate PEM.
+        assert!(
+            !tls.trust_anchor_pem.trim().is_empty(),
+            "trust anchor must not be empty"
+        );
+        assert!(
+            tls.trust_anchor_pem.contains("BEGIN CERTIFICATE"),
+            "trust anchor must be certificate PEM: {}",
+            tls.trust_anchor_pem
+        );
+
+        // The trust anchor is the CA, distinct from the leaf certificate
+        // the guest presents (the payload's tls.crt): anchoring on the
+        // chain would break the supervisor's verification.
+        let payload = &bootstrap.guest_payload;
+        let cert_line = payload
+            .lines()
+            .find(|line| line.starts_with(PAYLOAD_BOUNDARY_CERTIFICATE))
+            .expect("payload carries the boundary certificate");
+        let cert_b64 = cert_line.split_once('=').unwrap().1;
+        let cert_pem = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(cert_b64)
+                .expect("certificate decodes"),
+        )
+        .expect("certificate is UTF-8");
+        assert_ne!(
+            tls.trust_anchor_pem, cert_pem,
+            "trust anchor must be the session CA, not the leaf certificate chain"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -906,6 +1007,10 @@ pub struct KubeVirtBootstrap {
     /// The fence UID/resourceVersion the evidence was rendered against.
     /// On start, the driver re-reads the fence and compares.
     pub fence: ExpectedFence,
+    /// The runtime descriptor for the shared supervisor's instance
+    /// registration (W4: `shared_instance_secret`). Its `tls` is the
+    /// session material's `server_name`/`trust_anchor_pem` verbatim.
+    pub runtime_descriptor: SandboxRuntimeDescriptor,
 }
 
 /// Render one generation's `KubeVirt` boundary bootstrap. Used by both
@@ -941,11 +1046,6 @@ pub fn render_kubevirt_bootstrap(
     )
     .map_err(|error| format!("workload identity: {error}"))?;
 
-    // Resolve the supervisor's Service address to a concrete SocketAddr for
-    // the boundary listener. The guest dials this directly (no DNS in the
-    // fence).
-    let supervisor_address = resolve_supervisor_address(supervisor)?;
-
     let spec = KubeVirtBoundarySpec {
         boundary_id: sandbox_id.to_string(),
         generation: launch_authentication
@@ -965,10 +1065,10 @@ pub fn render_kubevirt_bootstrap(
         // SupervisorEndpoint carries it; for the PoC this is the
         // namespace-local service name.
         supervisor_authority: format!(
-            "openshell-supervisor.{}:{}",
-            supervisor.namespace, supervisor.port
+            "{}.{}:{}",
+            supervisor.service_name, supervisor.namespace, supervisor.port
         ),
-        supervisor_addresses: vec![supervisor_address],
+        supervisor_addresses: vec![supervisor.address],
         route: route.to_string(),
         // W3: the supervisor's TLS client config (how it authenticates the
         // boundary). The trust anchor is the session CA (from
@@ -976,8 +1076,8 @@ pub fn render_kubevirt_bootstrap(
         // the server_name is the sandbox DNS name it assigned to the
         // session certificate.
         supervisor_tls: SandboxTlsClientConfig {
-            server_name: format!("sandbox.{}.openshell.internal", launch_inputs.session_id),
-            trust_anchor_pem: launch_inputs.tls.certificate_chain_pem.clone(),
+            server_name: launch_inputs.tls.server_name.clone(),
+            trust_anchor_pem: launch_inputs.tls.trust_anchor_pem.clone(),
         },
         workload_identity: workload_identity.clone(),
         child_env: HashMap::new(),
@@ -1002,22 +1102,8 @@ pub fn render_kubevirt_bootstrap(
     Ok(KubeVirtBootstrap {
         guest_payload,
         fence,
+        runtime_descriptor: provisioned.runtime_descriptor,
     })
-}
-
-/// Resolve the supervisor's Service to a concrete address. In the `PoC` the
-/// service name is the namespace-local service; in a full deployment this
-/// would use the Service's `ClusterIP`.
-fn resolve_supervisor_address(supervisor: &SupervisorEndpoint) -> Result<SocketAddr, String> {
-    // For the PoC: the supervisor Service's ClusterIP is resolved by the
-    // driver at render time. Here we accept any address the caller
-    // provides via the pod_selector (which in practice carries the
-    // ClusterIP as a well-known label or is resolved separately).
-    // For now, use a DNS-resolvable name and let the guest resolve it
-    // (the fence allows egress to the supervisor's pods).
-    format!("0.0.0.0:{}", supervisor.port)
-        .parse()
-        .map_err(|error| format!("invalid supervisor port {}: {error}", supervisor.port))
 }
 
 /// `ApiResource` for `NetworkPolicy` (shared with the fence functions).
@@ -1046,4 +1132,61 @@ pub async fn delete_and_wait(api: &Api<DynamicObject>, name: &str) -> Result<(),
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
+}
+
+/// Resolve the shared supervisor from the configured Service through the API.
+///
+/// Returns the Service's DNS name (authority), its `ClusterIP` (address),
+/// and its pod selector (for the egress fence). This is the same resolution
+/// the pod path performs via `GenerationLaunchTarget::Shared`.
+pub async fn resolve_shared_supervisor(
+    client: &Client,
+    config: &crate::config::SharedSupervisorConfig,
+) -> Result<SupervisorEndpoint, String> {
+    let service_api: Api<k8s_openapi::api::core::v1::Service> =
+        Api::namespaced(client.clone(), &config.service_namespace);
+    let service = service_api
+        .get(&config.service_name)
+        .await
+        .map_err(|error| {
+            format!(
+                "failed to resolve the shared supervisor Service {}/{}: {error}",
+                config.service_namespace, config.service_name
+            )
+        })?;
+
+    let spec = service.spec.as_ref().ok_or_else(|| {
+        format!(
+            "the shared supervisor Service {}/{} has no spec",
+            config.service_namespace, config.service_name
+        )
+    })?;
+    let cluster_ip = spec.cluster_ip.as_deref().ok_or_else(|| {
+        format!(
+            "the shared supervisor Service {}/{} is headless (no ClusterIP)",
+            config.service_namespace, config.service_name
+        )
+    })?;
+    let address: SocketAddr = format!("{cluster_ip}:{}", config.runtime_port)
+        .parse()
+        .map_err(|error| {
+            format!(
+                "invalid shared supervisor address {cluster_ip}:{}: {error}",
+                config.runtime_port
+            )
+        })?;
+    let selector = spec.selector.clone().ok_or_else(|| {
+        format!(
+            "the shared supervisor Service {}/{} has no selector",
+            config.service_namespace, config.service_name
+        )
+    })?;
+
+    Ok(SupervisorEndpoint {
+        namespace: config.service_namespace.clone(),
+        service_name: config.service_name.clone(),
+        pod_selector: selector,
+        port: config.runtime_port,
+        address,
+    })
 }

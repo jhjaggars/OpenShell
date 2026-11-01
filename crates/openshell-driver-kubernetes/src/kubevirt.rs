@@ -625,13 +625,13 @@ mod tests {
                 cpu_cores: 2,
                 memory: "2Gi".to_string(),
                 workspace_pvc: true,
-                supervisor_namespace: "openshell".to_string(),
-                supervisor_pod_selector: BTreeMap::from([(
-                    "app.kubernetes.io/name".to_string(),
-                    "openshell-supervisor".to_string(),
-                )]),
-                supervisor_port: 5500,
             },
+            shared_supervisor: Some(crate::SharedSupervisorConfig {
+                service_name: "openshell-supervisor".to_string(),
+                service_namespace: "openshell".to_string(),
+                runtime_port: 5500,
+                token_secret_name: "openshell-supervisor-token".to_string(),
+            }),
             ..KubernetesComputeConfig::default()
         }
     }
@@ -1063,13 +1063,13 @@ mod kubevirt_review_tests {
                 cpu_cores: 2,
                 memory: "2Gi".to_string(),
                 workspace_pvc: true,
-                supervisor_namespace: "openshell".to_string(),
-                supervisor_pod_selector: BTreeMap::from([(
-                    "app.kubernetes.io/name".to_string(),
-                    "openshell-supervisor".to_string(),
-                )]),
-                supervisor_port: 5500,
             },
+            shared_supervisor: Some(crate::SharedSupervisorConfig {
+                service_name: "openshell-supervisor".to_string(),
+                service_namespace: "openshell".to_string(),
+                runtime_port: 5500,
+                token_secret_name: "openshell-supervisor-token".to_string(),
+            }),
             ..KubernetesComputeConfig::default()
         }
     }
