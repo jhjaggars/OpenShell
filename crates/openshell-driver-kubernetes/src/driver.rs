@@ -4882,7 +4882,7 @@ impl KubernetesComputeDriver {
             };
             let retryable = matches!(
                 &error,
-                LaunchError::Unplaced(reason) if reason.contains(ROUTE_RECORD_RACE_MESSAGE)
+                LaunchError::Unplaced(reason) if route_teardown_race(reason)
             );
             if retryable && attempts < 12 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -7697,6 +7697,20 @@ fn shared_instance_registration(
 /// suite; if the wording changes, that test fails and this constant needs
 /// updating.
 const ROUTE_RECORD_RACE_MESSAGE: &str = "route is recorded for another generation";
+
+/// The same teardown race one phase later: the route's record still names
+/// the previous generation while the withdrawal that stop issued is being
+/// reconciled away (the supervisor has usually already removed the
+/// instance). Pinned by `openshell-server`'s supervisor-pool suite the same
+/// way.
+const ROUTE_OWNER_RACE_MESSAGE: &str = "route is owned by another generation";
+
+/// Whether a shared-instance launch refusal is the withdraw-teardown race:
+/// the record of the route this sandbox owns is mid-reconciliation after a
+/// stop, and a bounded retry re-launches once the pool has cleared it.
+fn route_teardown_race(reason: &str) -> bool {
+    reason.contains(ROUTE_RECORD_RACE_MESSAGE) || reason.contains(ROUTE_OWNER_RACE_MESSAGE)
+}
 
 /// The value-taking core of `shared_instance_registration`, shared by the
 /// pod path (which extracts values from the Sandbox CR) and the `KubeVirt`
@@ -10959,6 +10973,24 @@ mod tests {
             matches!(&error, KubeError::Service(source) if source.is::<tower::timeout::error::Elapsed>()),
             "expected request timeout, got {error:?}"
         );
+    }
+
+    #[test]
+    fn route_teardown_race_matches_both_withdrawal_phases() {
+        // The recording phase: the route's record still names the previous
+        // generation while the withdrawal is being recorded.
+        assert!(route_teardown_race(
+            "the sandbox instance route is recorded for another generation"
+        ));
+        // The admission phase: the record is being reconciled away after
+        // the supervisor already removed the instance.
+        assert!(route_teardown_race(
+            "the sandbox instance route is owned by another generation"
+        ));
+        // Anything else is a real refusal (another sandbox's route, pool
+        // capacity) and must fail closed without retries.
+        assert!(!route_teardown_race("no live member has room for the instance"));
+        assert!(!route_teardown_race("the sandbox instance is being recorded by another gateway task"));
     }
 
     #[tokio::test]
