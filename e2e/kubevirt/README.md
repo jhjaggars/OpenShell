@@ -129,7 +129,19 @@ kubectl wait --for=condition=Available deployment/virt-api -n kubevirt --timeout
 e2e/kubevirt/build-guest-image.sh
 k3d image import kvpoc/openshell-sandbox-vm:dev -c kvpoc
 
-# 4. Run the demo (builds the gateway + CLI, starts the gateway, exercises
+# 4. Shared supervisor: render the supervisor templates from the OpenShell
+#    Helm chart into the `openshell` namespace, pointing at the demo gateway
+#    (the values file sets grpc_endpoint to the k3d bridge IP). The demo
+#    gateway mints the supervisor token into the rendered token Secret and
+#    syncs the gateway CA into the Secret the supervisor mounts.
+helm template kvpoc deploy/helm/openshell -n openshell \
+    -f e2e/kubevirt/supervisor-values.yaml \
+    -s templates/supervisor.yaml -s templates/supervisor-service.yaml \
+    -s templates/supervisor-networkpolicy.yaml -s templates/supervisor-token-secret.yaml \
+    | kubectl apply -f -
+kubectl rollout status deployment/kvpoc-openshell-supervisor -n openshell --timeout=120s
+
+# 5. Run the demo (builds the gateway + CLI, starts the gateway, exercises
 #    create/Ready/exec/stop/start/delete, tears the sandbox down).
 e2e/kubevirt/demo.sh --demo
 ```
@@ -244,6 +256,11 @@ The KubeVirt boundary claims model follows the VM driver's approach:
 Who verifies the fence:
 
 - the driver attests it by re-reading the NetworkPolicy each generation
+- because the expected fence spec is re-rendered from the *current*
+  supervisor Service selector and port, a Helm upgrade that changes the
+  supervisor's labels or port makes every existing KubeVirt sandbox fail
+  start with a spec-drift Precondition error — fail-closed by design, so
+  stop and restart sandboxes after such an upgrade
   (`verify_fence` / `check_fence`);
 - the boundary checks the evidence's generation binding
   (`contract.rs:254`);

@@ -39,12 +39,37 @@ RUN_DEMO=0
 # The k3d docker bridge gateway is the host address guests use to reach the
 # gateway (k3d prints it at cluster creation; derive it from the network).
 BRIDGE_IP="$(docker network inspect k3d-kvpoc -f '{{(index .IPAM.Config 0).Gateway}}')"
-GRPC_ENDPOINT="http://${BRIDGE_IP}:${PORT}"
+GRPC_ENDPOINT="https://${BRIDGE_IP}:${PORT}"
 
 echo "==> Building openshell-gateway and openshell CLI"
 cargo build --release -p openshell-gateway -p openshell-cli
 
 TLS_DIR="${STATE_DIR}/tls"
+# Shared supervisor: rendered from the OpenShell Helm chart (see
+# e2e/kubevirt/README.md) into the release namespace. The gateway mints
+# the supervisor assignment token into the token Secret and resolves the
+# Service (ClusterIP, selector, port) at create time.
+SUPERVISOR_SERVICE="${OPENSHELL_KVPOC_SUPERVISOR_SERVICE:-kvpoc-openshell-supervisor}"
+SUPERVISOR_NAMESPACE="${OPENSHELL_KVPOC_SUPERVISOR_NAMESPACE:-openshell}"
+SUPERVISOR_PORT="${OPENSHELL_KVPOC_SUPERVISOR_PORT:-5500}"
+SUPERVISOR_TOKEN_SECRET="${OPENSHELL_KVPOC_SUPERVISOR_TOKEN_SECRET:-kvpoc-openshell-supervisor-token}"
+SUPERVISOR_CA_SECRET="${OPENSHELL_KVPOC_SUPERVISOR_CA_SECRET:-kvpoc-server-tls}"
+PKI_DIR="${STATE_DIR}/tls/pki"
+if [ ! -f "${PKI_DIR}/server/tls.crt" ]; then
+    mkdir -p "${PKI_DIR}"
+    "${GATEWAY_BIN}" generate-certs --output-dir "${PKI_DIR}" \
+        --server-san 127.0.0.1 --server-san "${BRIDGE_IP}" \
+        --server-san localhost --server-san "${GATEWAY_NAME}" \
+        >/dev/null
+fi
+# Keep the supervisor's gateway-CA Secret in sync with the PKI the gateway
+# serves (the supervisor mounts it to verify the assignment-stream
+# connection). See e2e/kubevirt/README.md for the supervisor deployment.
+if kubectl get namespace "${SUPERVISOR_NAMESPACE}" >/dev/null 2>&1; then
+    kubectl -n "${SUPERVISOR_NAMESPACE}" create secret generic "${SUPERVISOR_CA_SECRET}" \
+        --from-file=ca.crt="${PKI_DIR}/ca.crt" \
+        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+fi
 if [ ! -f "${TLS_DIR}/jwt/signing.pem" ]; then
     echo "==> Generating local gateway credentials"
     "${GATEWAY_BIN}" generate-certs --output-dir "${TLS_DIR}"
@@ -64,14 +89,20 @@ version = 2
 [openshell.gateway]
 # Driver selection moved to the OPENSHELL_DRIVERS environment variable on
 # current main (a single `compute_driver` file key also exists).
-disable_tls = true
-# 0.0.0.0: guests reach the gateway through the k3d docker bridge
-# (http://172.18.0.1:PORT); the CLI uses 127.0.0.1.
+# TLS is required: the shared supervisor's assignment token travels only
+# over TLS, and supervisor_topology = "gateway" refuses to start without it.
+# 0.0.0.0: the shared supervisor Pod and the CLI reach the gateway through
+# the k3d docker bridge (https://172.18.0.1:PORT) and 127.0.0.1.
 bind_address = "0.0.0.0:${PORT}"
 health_bind_address = "127.0.0.1:$((PORT + 1))"
 
 [openshell.gateway.auth]
 allow_unauthenticated_users = true
+
+[openshell.gateway.tls]
+cert_path = "${PKI_DIR}/server/tls.crt"
+key_path = "${PKI_DIR}/server/tls.key"
+client_ca_path = "${PKI_DIR}/ca.crt"
 
 [openshell.gateway.gateway_jwt]
 signing_key_path = "${TLS_DIR}/jwt/signing.pem"
@@ -85,35 +116,50 @@ runtime = "kubevirt"
 gateway_id = "kvpoc"
 namespace = "${SANDBOX_NAMESPACE}"
 grpc_endpoint = "${GRPC_ENDPOINT}"
+supervisor_topology = "gateway"
 
 [openshell.drivers.kubernetes.kubevirt]
 guest_image = "${GUEST_IMAGE}"
 guest_image_pull_policy = "IfNotPresent"
 cpu_cores = 1
 memory = "1Gi"
+
+[openshell.drivers.kubernetes.shared_supervisor]
+service_name = "${SUPERVISOR_SERVICE}"
+service_namespace = "${SUPERVISOR_NAMESPACE}"
+runtime_port = ${SUPERVISOR_PORT}
+token_secret_name = "${SUPERVISOR_TOKEN_SECRET}"
 EOF
 
-# Register the gateway for the CLI (plaintext, like gateway-vm.sh). The
-# previous active gateway selection is restored when the demo exits.
+# Register the gateway for the CLI (mTLS: the shared supervisor requires
+# gateway TLS, so the demo generates a PKI bundle into the state directory
+# and lays the client side into the CLI's gateway directory). The previous
+# active gateway selection is restored when the demo exits.
 CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
 ACTIVE_GATEWAY_PATH="${CONFIG_HOME}/openshell/active_gateway"
 PREVIOUS_ACTIVE_GATEWAY="$(cat "${ACTIVE_GATEWAY_PATH}" 2>/dev/null || true)"
 restore_active_gateway() {
     if [ -n "${PREVIOUS_ACTIVE_GATEWAY}" ]; then
-        printf '%s' "${PREVIOUS_ACTIVE_GATEWAY}" > "${ACTIVE_GATEWAY_PATH}"
+        printf '%s' "${PREVIOUS_ACTIVE_GATEWAY}" >"${ACTIVE_GATEWAY_PATH}"
     else
         rm -f "${ACTIVE_GATEWAY_PATH}"
     fi
 }
 GATEWAY_DIR="${CONFIG_HOME}/openshell/gateways/${GATEWAY_NAME}"
+rm -rf "${GATEWAY_DIR}"
 mkdir -p "${GATEWAY_DIR}"
+mkdir -p "${GATEWAY_DIR}/mtls"
+cp "${PKI_DIR}/ca.crt" "${GATEWAY_DIR}/mtls/ca.crt"
+cp "${PKI_DIR}/client/tls.crt" "${GATEWAY_DIR}/mtls/tls.crt"
+cp "${PKI_DIR}/client/tls.key" "${GATEWAY_DIR}/mtls/tls.key"
+chmod 0600 "${GATEWAY_DIR}/mtls/tls.key"
 cat >"${GATEWAY_DIR}/metadata.json" <<EOF
 {
   "name": "${GATEWAY_NAME}",
-  "gateway_endpoint": "http://127.0.0.1:${PORT}",
+  "gateway_endpoint": "https://127.0.0.1:${PORT}",
   "is_remote": false,
   "gateway_port": ${PORT},
-  "auth_mode": "plaintext"
+  "auth_mode": "mtls"
 }
 EOF
 printf '%s' "${GATEWAY_NAME}" >"${CONFIG_HOME}/openshell/active_gateway"

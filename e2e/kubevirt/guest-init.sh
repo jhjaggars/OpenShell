@@ -73,10 +73,15 @@ configure_network() {
     else
         ts "WARNING: DHCP failed; supervisor will not reach the gateway"
     fi
-    # udhcpc's default script maintains /etc/resolv.conf when present.
-    if [ ! -s /etc/resolv.conf ]; then
-        printf 'nameserver 10.43.0.10\n' > /etc/resolv.conf 2>/dev/null || true
-    fi
+    # The workload's resolver is the boundary's loopback DNS relay
+    # (127.0.0.53), which forwards queries through the mediated control
+    # stream — the workload cannot reach the cluster DNS directly (the
+    # seccomp broker denies it, mirroring the libkrun VM driver's init).
+    # DHCP (or its default script) may have written the cluster DNS into
+    # /etc/resolv.conf; overwrite it.
+    printf 'nameserver 127.0.0.53\noptions timeout:2 attempts:2\n' \
+        > /etc/resolv.conf 2>/dev/null || \
+        ts "WARNING: could not point /etc/resolv.conf at the loopback DNS relay"
 }
 
 read_bootstrap_config() {
