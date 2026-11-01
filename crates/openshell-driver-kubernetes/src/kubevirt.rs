@@ -31,13 +31,11 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use k8s_openapi::api::core::v1::{
-    PersistentVolumeClaim, PersistentVolumeClaimSpec, Secret, VolumeResourceRequirements,
+    PersistentVolumeClaim, PersistentVolumeClaimSpec, VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{
-    Api, ApiResource, DeleteParams, ListParams, ObjectList, Patch, PatchParams, Preconditions,
-};
+use kube::api::{Api, ApiResource, DeleteParams, ListParams, ObjectList, Preconditions};
 use kube::core::DynamicObject;
 use kube::{Client, Error as KubeError};
 use openshell_core::driver_utils::{
@@ -50,10 +48,7 @@ use openshell_core::proto::compute::v1::{
 
 use crate::KubernetesDriverError;
 use crate::config::{KubernetesComputeConfig, KubernetesRuntimeMode, WorkspaceMode};
-use crate::driver::KUBE_API_TIMEOUT;
 use crate::driver::{sandbox_annotations, sandbox_labels};
-#[cfg(test)]
-use openshell_core::sandbox_env;
 
 pub const KUBEVIRT_GROUP: &str = "kubevirt.io";
 pub const KUBEVIRT_VERSION: &str = "v1";
@@ -153,80 +148,6 @@ pub struct KubeVirtSandboxParams<'a> {
     pub namespace: &'a str,
     /// `KubeVirt` resource name (`{workspace}--{name}` in shared mode).
     pub kube_name: &'a str,
-}
-
-/// Render the bootstrap Secret consumed by the guest init through the
-/// `cloudInitNoCloud` volume. `user-data` is a shell-sourceable `KEY=VALUE`
-/// file; the guest init writes the token to a 0600 file and unsets it before
-/// exec'ing the supervisor.
-#[cfg(test)]
-fn render_bootstrap_secret(params: &KubeVirtSandboxParams<'_>) -> Secret {
-    let sandbox = params.sandbox;
-    let spec = sandbox.spec.as_ref();
-    let mut lines = Vec::new();
-
-    let mut push = |key: &str, value: &str| {
-        lines.push(format!("{key}={}", shell_quote(value)));
-    };
-
-    push(sandbox_env::ENDPOINT, &params.config.grpc_endpoint);
-    push(sandbox_env::SANDBOX_ID, &sandbox.id);
-    push(sandbox_env::SANDBOX, &sandbox.name);
-    // The supervisor runs its own SSH server on this in-guest unix socket;
-    // providing the path is what enables the readiness-bearing supervisor
-    // session (same value as the libkrun VM driver uses).
-    push(
-        sandbox_env::SSH_SOCKET_PATH,
-        openshell_core::container_paths::SSH_SOCKET_PATH,
-    );
-    push(
-        sandbox_env::SANDBOX_TOKEN_FILE,
-        openshell_core::container_paths::VM_GUEST_SANDBOX_TOKEN_PATH,
-    );
-    // Pre-minted gateway JWT — same delivery model as the libkrun VM driver.
-    if let Some(token) = spec.and_then(|spec| {
-        let token = spec.sandbox_token.as_str();
-        (!token.is_empty()).then_some(token)
-    }) {
-        push(sandbox_env::SANDBOX_TOKEN, token);
-    }
-    let main_process =
-        sandbox_env::MainProcessConfig::encode_driver_spec_base64url(spec).unwrap_or_default();
-    push(sandbox_env::MAIN_PROCESS_SPEC, &main_process);
-    push(
-        sandbox_env::LOG_LEVEL,
-        &openshell_core::driver_utils::sandbox_log_level(sandbox, "info"),
-    );
-    push(
-        sandbox_env::TELEMETRY_ENABLED,
-        openshell_core::telemetry::enabled_env_value(),
-    );
-    // Runtime capabilities are driver-owned; this PoC provides no policy DNS
-    // or transparent TCP substrate inside the guest.
-    push(sandbox_env::NETWORK_RUNTIME_CAPABILITIES, "");
-    let user_env = spec
-        .map(|spec| spec.environment.clone())
-        .unwrap_or_default();
-    if !user_env.is_empty()
-        && let Ok(json) = serde_json::to_string(&user_env)
-    {
-        push(sandbox_env::USER_ENVIRONMENT, &json);
-    }
-
-    let user_data = lines.join("\n") + "\n";
-
-    Secret {
-        metadata: ObjectMeta {
-            name: Some(bootstrap_secret_name(params.kube_name)),
-            namespace: Some(params.namespace.to_string()),
-            labels: Some(sandbox_labels(sandbox, Some(&params.config.gateway_id))),
-            annotations: Some(sandbox_annotations(sandbox)),
-            ..Default::default()
-        },
-        string_data: Some(BTreeMap::from([("userData".to_string(), user_data)])),
-        type_: Some("Opaque".to_string()),
-        ..Default::default()
-    }
 }
 
 /// Render the workspace PVC. The guest init formats it on first boot (sentinel
@@ -378,6 +299,11 @@ pub fn render_virtual_machine(params: &KubeVirtSandboxParams<'_>) -> DynamicObje
 /// `OpenShell` ownership markers.
 const KUBEVIRT_VM_LABEL: &str = "kubevirt.io/domain";
 const KUBEVIRT_VM_LABEL_VALUE: &str = "openshell";
+
+/// The workload identity the `KubeVirt` guest's boundary runs as. The guest
+/// image provisions this uid/gid (the `sandbox` user in the Alpine guest).
+pub const KUBEVIRT_WORKLOAD_UID: u32 = 10001;
+pub const KUBEVIRT_WORKLOAD_GID: u32 = 10001;
 
 pub fn bootstrap_secret_name(kube_name: &str) -> String {
     format!("{kube_name}-bootstrap")
@@ -646,39 +572,6 @@ mod tests {
             namespace: "kvpoc-sandboxes",
             kube_name: "default--demo",
         }
-    }
-
-    #[test]
-    fn bootstrap_secret_carries_supervisor_environment() {
-        let mut sbx = sandbox();
-        sbx.spec = Some(openshell_core::proto::compute::v1::DriverSandboxSpec {
-            sandbox_token: "jwt-value".to_string(),
-            ..Default::default()
-        });
-        let cfg = config();
-        let secret = render_bootstrap_secret(&params(&sbx, &cfg));
-
-        let data = secret
-            .string_data
-            .expect("string data")
-            .remove("userData")
-            .expect("userData key uses KubeVirt cloudInitNoCloud convention");
-        assert!(data.contains("OPENSHELL_ENDPOINT=http"));
-        assert!(data.contains("OPENSHELL_SANDBOX_ID=sbx-id"));
-        assert!(data.contains("OPENSHELL_SANDBOX=demo"));
-        assert!(data.contains("OPENSHELL_SANDBOX_TOKEN=jwt-value"));
-        assert!(data.contains("OPENSHELL_SANDBOX_TOKEN_FILE=/opt/openshell/auth/sandbox.jwt"));
-        // The main-process spec envelope must survive shell quoting.
-        assert!(data.contains("OPENSHELL_MAIN_PROCESS_SPEC=base64url:"));
-        let labels = secret.metadata.labels.expect("labels");
-        assert_eq!(
-            labels.get(LABEL_SANDBOX_ID).map(String::as_str),
-            Some("sbx-id")
-        );
-        assert_eq!(
-            secret.metadata.name.as_deref(),
-            Some("default--demo-bootstrap")
-        );
     }
 
     #[test]
@@ -961,79 +854,6 @@ pub async fn rollback_companions(client: &Client, namespace: &str, created: &[Cr
     }
 }
 
-/// Replace the `OPENSHELL_SANDBOX_TOKEN=...` line in a rendered `userData`
-/// bootstrap payload with a freshly minted token. Extracted for unit tests.
-///
-/// A restarted guest re-reads the bootstrap Secret from scratch, so the
-/// token frozen at create time would expire under the gateway's JWT TTL and
-/// leave the restarted sandbox provisioning forever. `start` refreshes it.
-#[must_use]
-pub fn replace_user_data_token(user_data: &str, token: &str) -> String {
-    let mut replaced = false;
-    let mut lines = Vec::new();
-    for line in user_data.lines() {
-        if line.starts_with("OPENSHELL_SANDBOX_TOKEN=") {
-            if !replaced {
-                lines.push(format!("OPENSHELL_SANDBOX_TOKEN={token}"));
-                replaced = true;
-            }
-            // A duplicated token line (never rendered today) collapses to the
-            // fresh value rather than leaking the stale one.
-        } else {
-            lines.push(line.to_string());
-        }
-    }
-    if !replaced {
-        // The create-time render always carries the token line; tolerate a
-        // hand-edited payload by appending it.
-        lines.push(format!("OPENSHELL_SANDBOX_TOKEN={token}"));
-    }
-    lines.join("\n") + "\n"
-}
-
-/// Refresh the bootstrap Secret's sandbox token from the gateway's launch
-/// authentication. Reads the stored `data.userData` (the apiserver persists
-/// `stringData` there), swaps the token line, and patches the Secret.
-pub async fn refresh_bootstrap_secret_token(
-    client: &Client,
-    namespace: &str,
-    kube_name: &str,
-    token: &str,
-) -> Result<(), KubernetesDriverError> {
-    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
-    let secret_name = bootstrap_secret_name(kube_name);
-    let secret = tokio::time::timeout(KUBE_API_TIMEOUT, api.get(&secret_name))
-        .await
-        .map_err(|_| {
-            KubernetesDriverError::Message(format!(
-                "timed out reading bootstrap Secret {secret_name}"
-            ))
-        })?
-        .map_err(KubernetesDriverError::from_kube)?;
-    // k8s-openapi's `ByteString` already holds the decoded content bytes;
-    // `Secret.data` values arrive base64-decoded.
-    let user_data = secret
-        .data
-        .as_ref()
-        .and_then(|data| data.get("userData"))
-        .and_then(|value| String::from_utf8(value.0.clone()).ok())
-        .unwrap_or_default();
-    let refreshed = replace_user_data_token(&user_data, token);
-    let patch = serde_json::json!({
-        "stringData": {"userData": refreshed}
-    });
-    tokio::time::timeout(
-        KUBE_API_TIMEOUT,
-        api.patch(&secret_name, &PatchParams::default(), &Patch::Merge(&patch)),
-    )
-    .await
-    .map_err(|_| {
-        KubernetesDriverError::Message(format!("timed out patching bootstrap Secret {secret_name}"))
-    })?
-    .map_err(KubernetesDriverError::from_kube)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod kubevirt_review_tests {
     use super::*;
@@ -1241,33 +1061,6 @@ mod kubevirt_review_tests {
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "VMFailed");
         assert!(ready.message.contains("Failed"));
-    }
-
-    #[test]
-    fn replace_user_data_token_swaps_stale_token() {
-        let user_data = "OPENSHELL_SANDBOX_ID=sbx-id\nOPENSHELL_SANDBOX_TOKEN=stale-jwt\nOPENSHELL_ENDPOINT=http://gw\n";
-        let refreshed = replace_user_data_token(user_data, "fresh-jwt");
-        assert!(refreshed.contains("OPENSHELL_SANDBOX_TOKEN=fresh-jwt"));
-        assert!(!refreshed.contains("stale-jwt"));
-        assert!(refreshed.contains("OPENSHELL_SANDBOX_ID=sbx-id"));
-        assert!(refreshed.contains("OPENSHELL_ENDPOINT=http://gw"));
-        assert!(refreshed.ends_with('\n'));
-    }
-
-    #[test]
-    fn replace_user_data_token_appends_when_missing() {
-        let user_data = "OPENSHELL_SANDBOX_ID=sbx-id\n";
-        let refreshed = replace_user_data_token(user_data, "fresh-jwt");
-        assert!(refreshed.contains("OPENSHELL_SANDBOX_TOKEN=fresh-jwt"));
-        assert!(refreshed.contains("OPENSHELL_SANDBOX_ID=sbx-id"));
-    }
-
-    #[test]
-    fn replace_user_data_token_collapses_duplicates() {
-        let user_data = "OPENSHELL_SANDBOX_TOKEN=a\nOPENSHELL_SANDBOX_TOKEN=b\n";
-        let refreshed = replace_user_data_token(user_data, "fresh");
-        assert_eq!(refreshed.matches("OPENSHELL_SANDBOX_TOKEN=").count(), 1);
-        assert!(refreshed.contains("OPENSHELL_SANDBOX_TOKEN=fresh"));
     }
 
     #[test]

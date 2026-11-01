@@ -443,8 +443,10 @@ use kube::core::DynamicObject;
 pub struct SupervisorEndpoint {
     /// Namespace of the shared supervisor Service.
     pub namespace: String,
-    /// Name of the shared supervisor Service (from `SharedSupervisorConfig`).
-    pub service_name: String,
+    /// The supervisor Service's DNS authority, carried verbatim from the
+    /// pod path's `shared_supervisor_target` resolution
+    /// (`{service}.{namespace}.svc:{port}`).
+    pub authority: String,
     /// The Service's `spec.selector` (pod labels), used verbatim as the
     /// egress podSelector. Read from the live Service, never hard-coded.
     pub pod_selector: BTreeMap<String, String>,
@@ -469,6 +471,42 @@ pub struct ExpectedFence {
     pub uid: String,
     pub resource_version: String,
     pub spec: serde_json::Value,
+}
+
+/// VM annotation persisting the fence expectation (UID and rendered spec)
+/// the create-time evidence was rendered against.
+///
+/// The start path verifies the fence on every new generation with it:
+/// deletion, UID change, and spec drift are Precondition errors; a
+/// resourceVersion-only change is accepted and re-captured.
+pub const FENCE_EXPECTATION_ANNOTATION: &str = "openshell.ai/kubevirt-fence-expectation";
+
+impl ExpectedFence {
+    /// Encode the expectation (UID + spec, not the volatile RV) as a VM
+    /// annotation value.
+    pub fn to_annotation(&self) -> Result<String, String> {
+        serde_json::to_string(&serde_json::json!({
+            "uid": self.uid,
+            "spec": self.spec,
+        }))
+        .map_err(|error| format!("encode fence expectation: {error}"))
+    }
+
+    /// Decode a VM annotation value back into an expectation. The
+    /// resourceVersion is not persisted (it changes on every label-only
+    /// edit); the caller supplies the freshly rendered spec separately.
+    pub fn from_annotation(value: &str) -> Result<Self, String> {
+        let decoded: serde_json::Value = serde_json::from_str(value)
+            .map_err(|error| format!("decode fence expectation: {error}"))?;
+        Ok(Self {
+            uid: decoded["uid"]
+                .as_str()
+                .ok_or("fence expectation has no uid")?
+                .to_string(),
+            resource_version: String::new(),
+            spec: decoded["spec"].clone(),
+        })
+    }
 }
 
 impl ExpectedFence {
@@ -666,7 +704,7 @@ mod fence_tests {
     pub(super) fn supervisor() -> SupervisorEndpoint {
         SupervisorEndpoint {
             namespace: "openshell".to_string(),
-            service_name: "openshell-supervisor".to_string(),
+            authority: "openshell-supervisor.openshell.svc:5500".to_string(),
             pod_selector: BTreeMap::from([
                 (
                     "app.kubernetes.io/name".to_string(),
@@ -1064,10 +1102,7 @@ pub fn render_kubevirt_bootstrap(
         // W2: the authority is the supervisor Service's DNS name. The
         // SupervisorEndpoint carries it; for the PoC this is the
         // namespace-local service name.
-        supervisor_authority: format!(
-            "{}.{}:{}",
-            supervisor.service_name, supervisor.namespace, supervisor.port
-        ),
+        supervisor_authority: supervisor.authority.clone(),
         supervisor_addresses: vec![supervisor.address],
         route: route.to_string(),
         // W3: the supervisor's TLS client config (how it authenticates the
@@ -1115,78 +1150,4 @@ pub fn fence_api_resource() -> kube::api::ApiResource {
         kind: "NetworkPolicy".to_string(),
         plural: "networkpolicies".to_string(),
     }
-}
-
-/// Delete an object and wait until it is gone. Fails after 90 seconds.
-pub async fn delete_and_wait(api: &Api<DynamicObject>, name: &str) -> Result<(), String> {
-    let _ = api.delete(name, &kube::api::DeleteParams::default()).await;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
-    loop {
-        match api.get(name).await {
-            Err(kube::Error::Api(err)) if err.code == 404 => return Ok(()),
-            Err(err) => return Err(err.to_string()),
-            Ok(_) => {}
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("timed out waiting for {name} to terminate"));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-}
-
-/// Resolve the shared supervisor from the configured Service through the API.
-///
-/// Returns the Service's DNS name (authority), its `ClusterIP` (address),
-/// and its pod selector (for the egress fence). This is the same resolution
-/// the pod path performs via `GenerationLaunchTarget::Shared`.
-pub async fn resolve_shared_supervisor(
-    client: &Client,
-    config: &crate::config::SharedSupervisorConfig,
-) -> Result<SupervisorEndpoint, String> {
-    let service_api: Api<k8s_openapi::api::core::v1::Service> =
-        Api::namespaced(client.clone(), &config.service_namespace);
-    let service = service_api
-        .get(&config.service_name)
-        .await
-        .map_err(|error| {
-            format!(
-                "failed to resolve the shared supervisor Service {}/{}: {error}",
-                config.service_namespace, config.service_name
-            )
-        })?;
-
-    let spec = service.spec.as_ref().ok_or_else(|| {
-        format!(
-            "the shared supervisor Service {}/{} has no spec",
-            config.service_namespace, config.service_name
-        )
-    })?;
-    let cluster_ip = spec.cluster_ip.as_deref().ok_or_else(|| {
-        format!(
-            "the shared supervisor Service {}/{} is headless (no ClusterIP)",
-            config.service_namespace, config.service_name
-        )
-    })?;
-    let address: SocketAddr = format!("{cluster_ip}:{}", config.runtime_port)
-        .parse()
-        .map_err(|error| {
-            format!(
-                "invalid shared supervisor address {cluster_ip}:{}: {error}",
-                config.runtime_port
-            )
-        })?;
-    let selector = spec.selector.clone().ok_or_else(|| {
-        format!(
-            "the shared supervisor Service {}/{} has no selector",
-            config.service_namespace, config.service_name
-        )
-    })?;
-
-    Ok(SupervisorEndpoint {
-        namespace: config.service_namespace.clone(),
-        service_name: config.service_name.clone(),
-        pod_selector: selector,
-        port: config.runtime_port,
-        address,
-    })
 }

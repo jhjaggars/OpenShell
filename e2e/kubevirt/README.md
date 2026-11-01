@@ -92,6 +92,7 @@ this repo built (`cargo build --release -p openshell-server -p openshell-cli`;
 the guest image build compiles the supervisor itself as static musl).
 
 E2e prerequisites (discovered the hard way):
+
 - `OPENSHELL_BIN=$CARGO_TARGET_DIR/debug/openshell` — the sandbox_lifecycle
   tests spawn the CLI via this env var (default is `target/debug/openshell`
   relative to the repo, which misses when `CARGO_TARGET_DIR` is redirected)
@@ -241,6 +242,7 @@ The KubeVirt boundary claims model follows the VM driver's approach:
   when the boundary config is rendered.
 
 Who verifies the fence:
+
 - the driver attests it by re-reading the NetworkPolicy each generation
   (`verify_fence` / `check_fence`);
 - the boundary checks the evidence's generation binding

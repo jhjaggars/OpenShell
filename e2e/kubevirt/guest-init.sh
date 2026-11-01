@@ -114,20 +114,6 @@ read_bootstrap_config() {
     umount /config
 }
 
-materialize_token() {
-    mkdir -p /opt/openshell/auth /run/openshell
-    if [ -n "${OPENSHELL_SANDBOX_TOKEN:-}" ]; then
-        old_umask=$(umask)
-        umask 077
-        printf '%s' "$OPENSHELL_SANDBOX_TOKEN" > /opt/openshell/auth/sandbox.jwt
-        umask "$old_umask"
-        unset OPENSHELL_SANDBOX_TOKEN
-        ts "sandbox token materialized"
-    else
-        ts "WARNING: no pre-minted sandbox token in bootstrap config"
-    fi
-}
-
 mount_workspace() {
     mkdir -p /sandbox
     # The workspace PVC arrives as a virtio-fs share (filesystem PVCs are not
@@ -164,7 +150,6 @@ main() {
         return 1
     fi
     read_bootstrap_config
-    materialize_token
     mount_workspace
     ts "starting openshell-sandbox"
     # Stage the boundary bootstrap artifacts from the cloud-init payload
@@ -201,12 +186,11 @@ main() {
             /.openshell/state/bootstrap/boundary.json &
         SANDBOX_PID=$!
     else
-        # Legacy path (pre-boundary payload): run with whatever args the
-        # payload provides. Kept so the R3 dead-guest path and the
-        # capability probe still work during the transition.
-        # shellcheck disable=SC2086
-        /usr/local/bin/openshell-sandbox ${OPENSHELL_SUPERVISOR_ARGS:-} &
-        SANDBOX_PID=$!
+        # No boundary payload: the gateway cannot have created this VM
+        # (create requires launch authentication and renders the boundary
+        # payload), so this is an invalid or tampered bootstrap.
+        ts "FATAL: no boundary payload in bootstrap config (OPENSHELL_BOUNDARY_CONFIG_B64 unset)"
+        return 1
     fi
     # `wait` returns the child's exit status, and this script runs under
     # `set -e`: an unguarded failing wait would exit PID 1 (kernel panic)
