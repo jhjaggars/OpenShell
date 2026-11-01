@@ -4039,40 +4039,99 @@ impl KubernetesComputeDriver {
         // rollback only ever deletes objects this create made.
         let mut created: Vec<crate::kubevirt::CreatedCompanion> = Vec::new();
 
-        // Bootstrap Secret first: the VM references it and the KubeVirt
-        // controller waits for referenced volumes to exist. An orphan from an
-        // out-of-band VM deletion is deleted and waited for, so the recreate
-        // cannot collide with a terminating object.
-        //
-        // When the boundary path is active, the Secret's userData carries
-        // the boundary bootstrap (base64 artifacts + workload identity)
-        // instead of the legacy env-var payload. The fence NetworkPolicy
-        // is created first so its UID feeds the evidence.
-        let mut created_fence: Option<(String, String, serde_json::Value)> = None;
-        let _ = &created_fence;
-        let user_data: String = {
-            // W1: resolve the shared supervisor Service through the API —
-            // ClusterIP, selector, and port — the same resolution the pod
-            // path performs via GenerationLaunchTarget::Shared.
-            let shared_supervisor = self.config.shared_supervisor.as_ref().ok_or_else(|| {
-                KubernetesDriverError::Precondition(
-                    "KubeVirt runtime requires a configured shared supervisor".to_string(),
-                )
-            })?;
-            let resolved_supervisor = crate::kubevirt_boundary::resolve_shared_supervisor(
-                &self.client,
-                shared_supervisor,
+        // W1: resolve the shared supervisor Service through the API —
+        // ClusterIP, selector, and port — the same resolution the pod
+        // path performs via GenerationLaunchTarget::Shared.
+        let shared_supervisor = self.config.shared_supervisor.as_ref().ok_or_else(|| {
+            KubernetesDriverError::Precondition(
+                "KubeVirt runtime requires a configured shared supervisor".to_string(),
             )
-            .await
-            .map_err(KubernetesDriverError::Precondition)?;
-            let supervisor = crate::kubevirt_boundary::SupervisorEndpoint {
-                namespace: resolved_supervisor.namespace.clone(),
-                service_name: resolved_supervisor.service_name.clone(),
-                pod_selector: resolved_supervisor.pod_selector.clone(),
-                port: resolved_supervisor.port,
-                address: resolved_supervisor.address,
-            };
-            // Create the fence NetworkPolicy (before the VM).
+        })?;
+        let resolved_supervisor =
+            crate::kubevirt_boundary::resolve_shared_supervisor(&self.client, shared_supervisor)
+                .await
+                .map_err(KubernetesDriverError::Precondition)?;
+        let supervisor = crate::kubevirt_boundary::SupervisorEndpoint {
+            namespace: resolved_supervisor.namespace.clone(),
+            service_name: resolved_supervisor.service_name.clone(),
+            pod_selector: resolved_supervisor.pod_selector.clone(),
+            port: resolved_supervisor.port,
+            address: resolved_supervisor.address,
+        };
+
+        // W4: allocate the route handle for the shared-supervisor instance
+        // registration, exactly as the pod path does in
+        // new_generation_placement. The route is persisted on the VM so
+        // start re-registers the same instance.
+        let route = openshell_sandbox_backend::runtime_routed::new_route_handle();
+
+        // W6: create the VirtualMachine first with runStrategy Halted so
+        // its UID is known before the boundary claims are rendered — the
+        // cloudInitNoCloud volume references the bootstrap Secret by name
+        // only, and KubeVirt resolves it when the VMI starts (after the
+        // runStrategy patch to Once below), not when the VM object is
+        // created. This lets vm_uid be the VM's real UID, as the claims
+        // model decided.
+        let mut vm = crate::kubevirt::render_virtual_machine(&params);
+        vm.data["spec"]["runStrategy"] = serde_json::json!("Halted");
+        vm.metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(ANNOTATION_SUPERVISOR_SESSION.to_string(), route.clone());
+        let vm_uid: String = {
+            let created_vm =
+                tokio::time::timeout(KUBE_API_TIMEOUT, vm_api.create(&PostParams::default(), &vm))
+                    .await
+                    .map_err(|_| {
+                        KubernetesDriverError::Message(format!(
+                            "timed out after {}s creating VirtualMachine (Halted)",
+                            KUBE_API_TIMEOUT.as_secs()
+                        ))
+                    })?;
+            match created_vm {
+                Ok(result) => {
+                    info!(
+                        sandbox_id = %sandbox.id,
+                        sandbox_name = %sandbox.name,
+                        "KubeVirt VirtualMachine created (Halted)"
+                    );
+                    result.metadata.uid.unwrap_or_else(|| kube_name.clone())
+                }
+                Err(KubeError::Api(err)) if err.code == 409 => {
+                    return Err(KubernetesDriverError::AlreadyExists);
+                }
+                Err(err) => return Err(KubernetesDriverError::from_kube(err)),
+            }
+        };
+
+        // Roll back everything this create made: the companions (fence,
+        // bootstrap Secret, PVC, shared-instance Secret), the instance
+        // registration, and the Halted VM itself.
+        let rollback_all = |created: Vec<crate::kubevirt::CreatedCompanion>, route: String| {
+            let client = self.client.clone();
+            let vm_api = vm_api.clone();
+            let namespace = namespace.clone();
+            let kube_name = kube_name.clone();
+            let shared = self.shared_supervisor.clone();
+            async move {
+                crate::kubevirt::rollback_companions(&client, &namespace, &created).await;
+                if let Some(shared) = &shared {
+                    shared.supervision().withdraw(&route);
+                }
+                crate::kubevirt::delete_and_wait(
+                    &vm_api,
+                    &kube_name,
+                    "VirtualMachine",
+                    COMPANION_DELETE_TIMEOUT,
+                )
+                .await
+                .ok();
+            }
+        };
+
+        // Create the fence NetworkPolicy. W8: it is a companion with its
+        // UID, so every failure path below rolls it back.
+        let bootstrap = {
             let fence_json = crate::kubevirt_boundary::render_fence(
                 &namespace,
                 &sandbox.id,
@@ -4110,32 +4169,41 @@ impl KubernetesComputeDriver {
                 .resource_version
                 .unwrap_or_default();
             let fence_spec = fence_json["spec"].clone();
-            created_fence = Some((fence_uid.clone(), fence_rv.clone(), fence_spec.clone()));
+            created.push(crate::kubevirt::CreatedCompanion {
+                resource: crate::kubevirt_boundary::fence_api_resource(),
+                name: fence_name,
+                uid: fence_uid.clone(),
+            });
 
-            // Render the boundary bootstrap.
-            // PoC note: the vm_uid claim uses the sandbox ID (a UUID,
-            // stable across stop/start) rather than the VirtualMachine's
-            // UID, because the Secret must exist before the VM (the
-            // cloudInit volume references it) and the VM UID is only
-            // known after creation. The stability property the claims
-            // need (same identity across stop/start) is preserved.
-            let bootstrap = crate::kubevirt_boundary::render_kubevirt_bootstrap(
+            // The bootstrap Secret's userData carries the boundary
+            // bootstrap (base64 artifacts + workload identity), rendered
+            // against the fence evidence and the VM's real UID.
+            match crate::kubevirt_boundary::render_kubevirt_bootstrap(
                 &launch_authentication,
                 &sandbox.id,
                 &sandbox.name,
-                &sandbox.id, // vm_uid (PoC: the sandbox ID)
+                &vm_uid,
                 &self.config.kubevirt.guest_image,
                 &fence_uid,
                 &fence_rv,
                 fence_spec,
                 &supervisor,
-                &sandbox.id, // route (PoC: the sandbox ID as the route handle)
-                10001,       // workload uid
-                10001,       // workload gid
-            )
-            .map_err(KubernetesDriverError::Precondition)?;
-            bootstrap.guest_payload
+                &route,
+                10001,
+                10001,
+            ) {
+                Ok(bootstrap) => bootstrap,
+                Err(error) => {
+                    rollback_all(created, route.clone()).await;
+                    return Err(KubernetesDriverError::Precondition(error));
+                }
+            }
         };
+
+        // Bootstrap Secret: the VM's cloudInitNoCloud volume references it
+        // by name. An orphan from an out-of-band VM deletion is deleted
+        // and waited for, so the recreate cannot collide with a
+        // terminating object.
         let core_secret_resource = ApiResource {
             group: String::new(),
             version: "v1".to_string(),
@@ -4162,7 +4230,10 @@ impl KubernetesComputeDriver {
                 labels: Some(sandbox_labels(sandbox, Some(&self.config.gateway_id))),
                 ..Default::default()
             },
-            string_data: Some(BTreeMap::from([("userData".to_string(), user_data)])),
+            string_data: Some(BTreeMap::from([(
+                "userData".to_string(),
+                bootstrap.guest_payload,
+            )])),
             type_: Some("Opaque".to_string()),
             ..Default::default()
         };
@@ -4178,10 +4249,15 @@ impl KubernetesComputeDriver {
                 uid: result.metadata.uid.unwrap_or_default(),
             }),
             Ok(Err(KubeError::Api(err))) if err.code == 409 => {
+                rollback_all(created, route.clone()).await;
                 return Err(KubernetesDriverError::AlreadyExists);
             }
-            Ok(Err(err)) => return Err(KubernetesDriverError::from_kube(err)),
+            Ok(Err(err)) => {
+                rollback_all(created, route.clone()).await;
+                return Err(KubernetesDriverError::from_kube(err));
+            }
             Err(_elapsed) => {
+                rollback_all(created, route.clone()).await;
                 return Err(KubernetesDriverError::Message(format!(
                     "timed out after {}s creating bootstrap Secret",
                     KUBE_API_TIMEOUT.as_secs()
@@ -4225,17 +4301,17 @@ impl KubernetesComputeDriver {
                     uid: result.metadata.uid.unwrap_or_default(),
                 }),
                 Ok(Err(KubeError::Api(err))) if err.code == 409 => {
-                    // A concurrent create owns the claim; roll back only what
-                    // this create made (the Secret above).
-                    crate::kubevirt::rollback_companions(&self.client, &namespace, &created).await;
+                    // A concurrent create owns the claim; roll back only
+                    // what this create made.
+                    rollback_all(created, route.clone()).await;
                     return Err(KubernetesDriverError::AlreadyExists);
                 }
                 Ok(Err(err)) => {
-                    crate::kubevirt::rollback_companions(&self.client, &namespace, &created).await;
+                    rollback_all(created, route.clone()).await;
                     return Err(KubernetesDriverError::from_kube(err));
                 }
                 Err(_elapsed) => {
-                    crate::kubevirt::rollback_companions(&self.client, &namespace, &created).await;
+                    rollback_all(created, route.clone()).await;
                     return Err(KubernetesDriverError::Message(format!(
                         "timed out after {}s creating workspace PVC",
                         KUBE_API_TIMEOUT.as_secs()
@@ -4244,64 +4320,98 @@ impl KubernetesComputeDriver {
             }
         }
 
-        let vm = crate::kubevirt::render_virtual_machine(&params);
-        let created_vm = match tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            vm_api.create(&PostParams::default(), &vm),
-        )
-        .await
+        // W4: register the shared-supervisor instance. The supervisor
+        // reads the instance Secret and serves this sandbox's boundary on
+        // the allocated route; without this registration the boundary's
+        // dial is refused.
         {
-            Ok(Ok(result)) => {
-                info!(
-                    sandbox_id = %sandbox.id,
-                    sandbox_name = %sandbox.name,
-                    "KubeVirt VirtualMachine created successfully"
-                );
-                Ok(result)
-            }
-            Ok(Err(KubeError::Api(err))) if err.code == 409 => {
-                Err(KubernetesDriverError::AlreadyExists)
-            }
-            Ok(Err(err)) => {
-                warn!(
-                    sandbox_id = %sandbox.id,
-                    error = %err,
-                    "Failed to create KubeVirt VirtualMachine"
-                );
-                Err(KubernetesDriverError::from_kube(err))
-            }
-            Err(_elapsed) => Err(KubernetesDriverError::Message(format!(
-                "timed out after {}s creating VirtualMachine",
-                KUBE_API_TIMEOUT.as_secs()
-            ))),
-        };
-
-        match created_vm {
-            Ok(vm) => Ok(vm.metadata.uid.unwrap_or_else(|| kube_name.clone())),
-            Err(error) => {
-                // The VM is the owning resource: when it could not be
-                // created, roll back the companions this create made so a
-                // retried create does not collide with orphaned state.
-                crate::kubevirt::rollback_companions(&self.client, &namespace, &created).await;
-                // Also roll back the fence (it's not a "companion" in the
-                // rollback list because its name is derived from the
-                // sandbox ID, not the kube resource name).
-                if created_fence.is_some() {
-                    let fence_api: Api<DynamicObject> = Api::namespaced_with(
-                        self.client.clone(),
-                        &namespace,
-                        &crate::kubevirt_boundary::fence_api_resource(),
-                    );
-                    let _ = fence_api
-                        .delete(
-                            &crate::kubevirt_boundary::fence_name(&sandbox.id),
-                            &DeleteParams::default(),
-                        )
-                        .await;
-                }
-                Err(error)
+            let shared = self.shared_supervisor.as_ref().ok_or_else(|| {
+                KubernetesDriverError::Precondition(
+                    "KubeVirt runtime requires a configured shared supervisor".to_string(),
+                )
+            })?;
+            let main_process_spec =
+                openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(
+                    sandbox.spec.as_ref(),
+                )
+                .map_err(|error| {
+                    KubernetesDriverError::InvalidArgument(format!(
+                        "encode main process spec: {error}"
+                    ))
+                })?;
+            let proxy_ca = generate_proxy_ca_material().map_err(KubernetesDriverError::Message)?;
+            let registration = shared_instance_registration_from_values(
+                &route,
+                &sandbox.id,
+                &sandbox.name,
+                main_process_spec,
+                &self.config.kubevirt.guest_image,
+                bootstrap.runtime_descriptor,
+                launch_authentication.supervisor.clone(),
+                proxy_ca,
+            );
+            let generation = registration.runtime_descriptor.generation.clone();
+            let names = SandboxRuntimeNames::for_generation(&sandbox.id, &generation);
+            let instance_owner = crate::sandbox_runtime::sandbox_owner_reference(
+                &kube_name,
+                &vm_uid,
+                "kubevirt.io/v1",
+                true,
+            );
+            let secrets = Api::<Secret>::namespaced(self.client.clone(), &namespace);
+            let namespace_for_secret = namespace.clone();
+            let sandbox_id_for_secret = sandbox.id.clone();
+            let launch_result = shared
+                .supervision()
+                .launch(&registration, move |launch_material| {
+                    let secrets = secrets.clone();
+                    let namespace = namespace_for_secret.clone();
+                    let names = names.clone();
+                    let sandbox_id = sandbox_id_for_secret.clone();
+                    let owner = instance_owner;
+                    async move {
+                        secrets
+                            .create(
+                                &PostParams::default(),
+                                &shared_instance_secret(
+                                    &namespace,
+                                    &names,
+                                    &sandbox_id,
+                                    launch_material,
+                                    owner,
+                                ),
+                            )
+                            .await
+                            .map(|_| ())
+                            .map_err(KubernetesDriverError::from_kube)
+                    }
+                })
+                .await;
+            if let Err(error) = launch_result {
+                rollback_all(created, route.clone()).await;
+                return Err(match error {
+                    LaunchError::Persist(error) => error,
+                    LaunchError::Refused(error) => {
+                        KubernetesDriverError::Precondition(error.to_string())
+                    }
+                    LaunchError::Unplaced(reason) => KubernetesDriverError::Precondition(reason),
+                    LaunchError::Invalid(error) => {
+                        KubernetesDriverError::Message(error.to_string())
+                    }
+                });
             }
         }
+
+        // Start the VM: patch runStrategy from Halted to Once.
+        patch_dynamic_object_with_resource_version_retry(&vm_api, &kube_name, |version| {
+            serde_json::json!({
+                "metadata": {"resourceVersion": version},
+                "spec": {"runStrategy": "Once"}
+            })
+        })
+        .await?;
+
+        Ok(vm_uid)
     }
 
     /// `KubeVirt` runtime mode lookup by sandbox-id label.
@@ -4497,32 +4607,33 @@ impl KubernetesComputeDriver {
                         )
                     })?;
 
+                    // The claims use the VM's real UID (W6) and the route
+                    // persisted on the VM at create (W4).
+                    let vm_uid = object.metadata.uid.clone().unwrap_or_default();
+                    let route = object
+                        .metadata
+                        .annotations
+                        .as_ref()
+                        .and_then(|annotations| annotations.get(ANNOTATION_SUPERVISOR_SESSION))
+                        .cloned()
+                        .unwrap_or_default();
+                    let sandbox_id = object
+                        .metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|l| l.get("openshell.ai/sandbox-id").cloned())
+                        .unwrap_or_default();
                     let bootstrap = crate::kubevirt_boundary::render_kubevirt_bootstrap(
                         &authentication,
-                        &object
-                            .metadata
-                            .labels
-                            .as_ref()
-                            .and_then(|l| l.get("openshell.ai/sandbox-id").cloned())
-                            .unwrap_or_default(),
+                        &sandbox_id,
                         &kube_name,
-                        &object
-                            .metadata
-                            .labels
-                            .as_ref()
-                            .and_then(|l| l.get("openshell.ai/sandbox-id").cloned())
-                            .unwrap_or_default(),
+                        &vm_uid,
                         &self.config.kubevirt.guest_image,
                         &fence.uid,
                         &fence.resource_version,
                         fence.spec,
                         &supervisor,
-                        &object
-                            .metadata
-                            .labels
-                            .as_ref()
-                            .and_then(|l| l.get("openshell.ai/sandbox-id").cloned())
-                            .unwrap_or_default(),
+                        &route,
                         10001,
                         10001,
                     )
@@ -4546,6 +4657,95 @@ impl KubernetesComputeDriver {
                         ))
                     })?
                     .map_err(KubernetesDriverError::from_kube)?;
+
+                    // W4: re-register the shared instance for the new
+                    // generation. The supervisor serves the new session on
+                    // the same route; the launch is idempotent for an
+                    // identical assignment and replaces it for a new one.
+                    if let Some(shared) = &self.shared_supervisor {
+                        let main_process_spec = object
+                            .metadata
+                            .annotations
+                            .as_ref()
+                            .and_then(|annotations| {
+                                annotations.get(ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC)
+                            })
+                            .cloned()
+                            .ok_or_else(|| {
+                                KubernetesDriverError::Precondition(
+                                    "VirtualMachine is missing its persisted main process \
+                                     spec; the shared instance cannot be re-registered"
+                                        .to_string(),
+                                )
+                            })?;
+                        let proxy_ca =
+                            generate_proxy_ca_material().map_err(KubernetesDriverError::Message)?;
+                        let registration = shared_instance_registration_from_values(
+                            &route,
+                            &sandbox_id,
+                            &object
+                                .metadata
+                                .annotations
+                                .as_ref()
+                                .and_then(|annotations| annotations.get(LABEL_SANDBOX_NAME))
+                                .cloned()
+                                .unwrap_or_default(),
+                            main_process_spec,
+                            &self.config.kubevirt.guest_image,
+                            bootstrap.runtime_descriptor,
+                            authentication.supervisor.clone(),
+                            proxy_ca,
+                        );
+                        let generation = registration.runtime_descriptor.generation.clone();
+                        let names = SandboxRuntimeNames::for_generation(&sandbox_id, &generation);
+                        let instance_owner = crate::sandbox_runtime::sandbox_owner_reference(
+                            &kube_name,
+                            &vm_uid,
+                            "kubevirt.io/v1",
+                            true,
+                        );
+                        let secrets = Api::<Secret>::namespaced(self.client.clone(), &namespace);
+                        let namespace_for_secret = namespace.clone();
+                        let sandbox_id_for_secret = sandbox_id.clone();
+                        shared
+                            .supervision()
+                            .launch(&registration, move |launch_material| {
+                                let secrets = secrets.clone();
+                                let namespace = namespace_for_secret.clone();
+                                let names = names.clone();
+                                let sandbox_id = sandbox_id_for_secret.clone();
+                                let owner = instance_owner;
+                                async move {
+                                    secrets
+                                        .create(
+                                            &PostParams::default(),
+                                            &shared_instance_secret(
+                                                &namespace,
+                                                &names,
+                                                &sandbox_id,
+                                                launch_material,
+                                                owner,
+                                            ),
+                                        )
+                                        .await
+                                        .map(|_| ())
+                                        .map_err(KubernetesDriverError::from_kube)
+                                }
+                            })
+                            .await
+                            .map_err(|error| match error {
+                                LaunchError::Persist(error) => error,
+                                LaunchError::Refused(error) => {
+                                    KubernetesDriverError::Precondition(error.to_string())
+                                }
+                                LaunchError::Unplaced(reason) => {
+                                    KubernetesDriverError::Precondition(reason)
+                                }
+                                LaunchError::Invalid(error) => {
+                                    KubernetesDriverError::Message(error.to_string())
+                                }
+                            })?;
+                    }
                 } else {
                     // Legacy path: rewrite the token line in the env-var
                     // payload.
@@ -4794,6 +4994,25 @@ impl KubernetesComputeDriver {
             .name
             .clone()
             .ok_or("VirtualMachine has no name")?;
+        // W4: withdraw the shared-supervisor instance before the VM goes,
+        // so the supervisor stops serving this sandbox's boundary route.
+        // The route was persisted on the VM at create
+        // (ANNOTATION_SUPERVISOR_SESSION).
+        if let Some(route) = object
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(ANNOTATION_SUPERVISOR_SESSION))
+        {
+            if let Some(shared) = &self.shared_supervisor {
+                shared.supervision().withdraw(route);
+            } else {
+                warn!(
+                    route,
+                    "shared supervisor is not configured; its sandbox instance cannot be withdrawn"
+                );
+            }
+        }
         let preconditions = Preconditions {
             uid: object.metadata.uid,
             resource_version: None,
@@ -4842,6 +5061,20 @@ impl KubernetesComputeDriver {
                 )
                 .await;
         }
+        // W8: delete the egress fence in the normal path too — its name
+        // derives from the sandbox ID, so the name-based companion cleanup
+        // above misses it.
+        let fence_api: Api<DynamicObject> = Api::namespaced_with(
+            self.client.clone(),
+            &namespace,
+            &crate::kubevirt_boundary::fence_api_resource(),
+        );
+        let _ = fence_api
+            .delete(
+                &crate::kubevirt_boundary::fence_name(sandbox_id),
+                &DeleteParams::default(),
+            )
+            .await;
         Ok(true)
     }
 
@@ -4850,17 +5083,23 @@ impl KubernetesComputeDriver {
     /// already gone and its name — hence the companions' derived names — is
     /// unknown.
     async fn delete_kubevirt_companions_by_selector(&self, namespace: &str, selector: &str) {
-        for (resource, plural) in [("", "secrets"), ("", "persistentvolumeclaims")] {
+        // W8: the fence NetworkPolicy carries the sandbox labels (F4), so
+        // the selector-based cleanup includes it alongside the Secret and
+        // PVC companions.
+        for (group, plural, kind) in [
+            ("", "secrets", "Secret"),
+            ("", "persistentvolumeclaims", "PersistentVolumeClaim"),
+            ("networking.k8s.io", "networkpolicies", "NetworkPolicy"),
+        ] {
             let api_resource = ApiResource {
-                group: resource.to_string(),
+                group: group.to_string(),
                 version: "v1".to_string(),
-                api_version: "v1".to_string(),
-                kind: if plural == "secrets" {
-                    "Secret"
+                api_version: if group.is_empty() {
+                    "v1".to_string()
                 } else {
-                    "PersistentVolumeClaim"
-                }
-                .to_string(),
+                    format!("{group}/v1")
+                },
+                kind: kind.to_string(),
                 plural: plural.to_string(),
             };
             let api = Api::<DynamicObject>::namespaced_with(
@@ -6848,22 +7087,16 @@ fn shared_instance_registration(
     launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
     proxy_ca: crate::sandbox_runtime::ProxyCaMaterial,
 ) -> Result<SandboxInstanceRegistration, KubernetesDriverError> {
-    Ok(SandboxInstanceRegistration {
-        route: route.to_string(),
-        sandbox_id: sandbox_id.to_string(),
-        sandbox_name: annotation_or_label(object, LABEL_SANDBOX_NAME).ok_or_else(|| {
+    Ok(shared_instance_registration_from_values(
+        route,
+        sandbox_id,
+        &annotation_or_label(object, LABEL_SANDBOX_NAME).ok_or_else(|| {
             KubernetesDriverError::Precondition(
                 "Sandbox resource is missing its OpenShell sandbox name".to_string(),
             )
         })?,
-        runtime_descriptor,
-        auth: launch_authentication.supervisor.clone(),
-        main_process_spec: required_sandbox_annotation(
-            object,
-            ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC,
-        )?,
-        workdir: Some(WORKSPACE_MOUNT_PATH.to_string()),
-        container_image: object
+        required_sandbox_annotation(object, ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC)?,
+        object
             .data
             .pointer("/spec/podTemplate/spec/containers")
             .and_then(serde_json::Value::as_array)
@@ -6874,14 +7107,42 @@ fn shared_instance_registration(
             })
             .and_then(|container| container.get("image"))
             .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+            .unwrap_or_default(),
+        runtime_descriptor,
+        launch_authentication.supervisor.clone(),
+        proxy_ca,
+    ))
+}
+
+/// The value-taking core of `shared_instance_registration`, shared by the
+/// pod path (which extracts values from the Sandbox CR) and the `KubeVirt`
+/// path (which has them from the gateway's `Sandbox` object directly).
+#[allow(clippy::too_many_arguments)]
+fn shared_instance_registration_from_values(
+    route: &str,
+    sandbox_id: &str,
+    sandbox_name: &str,
+    main_process_spec: String,
+    container_image: &str,
+    runtime_descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor,
+    auth: openshell_core::jwt::SupervisorAuthBundle,
+    proxy_ca: crate::sandbox_runtime::ProxyCaMaterial,
+) -> SandboxInstanceRegistration {
+    SandboxInstanceRegistration {
+        route: route.to_string(),
+        sandbox_id: sandbox_id.to_string(),
+        sandbox_name: sandbox_name.to_string(),
+        runtime_descriptor,
+        auth,
+        main_process_spec,
+        workdir: Some(WORKSPACE_MOUNT_PATH.to_string()),
+        container_image: container_image.to_string(),
         proxy_ca: openshell_supervisor_control::ProxyCaMaterial {
             certificate_pem: proxy_ca.certificate_pem,
             private_key_pem: openshell_supervisor_control::SecretPem::new(proxy_ca.private_key_pem),
         },
         trace_context: RegistrationTraceContext::current(),
-    })
+    }
 }
 
 /// What bootstrap completion waits for before the runtime is declared ready.
