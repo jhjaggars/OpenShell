@@ -3207,6 +3207,7 @@ impl KubernetesComputeDriver {
             KubernetesDriverError::Message("created Sandbox CR has no UID".to_string())
         })?;
         let dependent_owner = sandbox_runtime_sandbox_owner_reference(
+            "Sandbox",
             cr_name,
             cr_uid,
             &sandbox_api.resource.api_version,
@@ -3673,6 +3674,7 @@ impl KubernetesComputeDriver {
                 sandbox_id,
                 supervisor,
                 sandbox_runtime_sandbox_owner_reference(
+                    "Sandbox",
                     cr_name,
                     cr_uid,
                     &sandbox_api.resource.api_version,
@@ -4450,6 +4452,7 @@ impl KubernetesComputeDriver {
         let generation = registration.runtime_descriptor.generation.clone();
         let names = SandboxRuntimeNames::for_generation(sandbox_id, &generation);
         let instance_owner = crate::sandbox_runtime::sandbox_owner_reference(
+            "VirtualMachine",
             vm_name,
             vm_uid,
             "kubevirt.io/v1",
@@ -5618,6 +5621,7 @@ impl KubernetesComputeDriver {
         // generation that follows one creates both.
         if placement == SupervisorPlacement::Dedicated {
             let owner = sandbox_runtime_sandbox_owner_reference(
+                "Sandbox",
                 cr_name,
                 cr_uid,
                 &sandbox_api.resource.api_version,
@@ -5696,6 +5700,7 @@ impl KubernetesComputeDriver {
                         sandbox_id,
                         &sandbox_name,
                         sandbox_runtime_sandbox_owner_reference(
+                            "Sandbox",
                             cr_name,
                             cr_uid,
                             &sandbox_api.resource.api_version,
@@ -10928,6 +10933,7 @@ mod tests {
         let mut sandbox_owned = expected.clone();
         sandbox_owned.metadata.owner_references =
             Some(vec![sandbox_runtime_sandbox_owner_reference(
+                "Sandbox",
                 "sandbox",
                 "sandbox-uid",
                 "agents.x-k8s.io/v1beta1",

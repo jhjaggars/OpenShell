@@ -874,6 +874,7 @@ pub fn image_pull_secret_copy(
 
 #[must_use]
 pub fn sandbox_owner_reference(
+    kind: &str,
     name: &str,
     uid: &str,
     api_version: &str,
@@ -881,7 +882,7 @@ pub fn sandbox_owner_reference(
 ) -> OwnerReference {
     OwnerReference {
         api_version: api_version.to_string(),
-        kind: "Sandbox".to_string(),
+        kind: kind.to_string(),
         name: name.to_string(),
         uid: uid.to_string(),
         controller: controller.then_some(true),
@@ -993,7 +994,7 @@ mod tests {
     use super::*;
 
     fn owner() -> OwnerReference {
-        sandbox_owner_reference("demo", "uid-1", "agents.x-k8s.io/v1beta1", false)
+        sandbox_owner_reference("Sandbox", "demo", "uid-1", "agents.x-k8s.io/v1beta1", false)
     }
 
     #[test]
