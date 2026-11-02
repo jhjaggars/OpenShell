@@ -345,6 +345,18 @@ pub const KUBEVIRT_CREATE_DEADLINE_MS: i64 = 10 * 60 * 1000;
 /// The create's in-flight annotation value: the Unix-millisecond timestamp
 /// of the Halted-window start (older revisions wrote a bare "true", which
 /// parses to no deadline).
+/// The guest image the VM actually boots: the containerDisk reference in
+/// the VM spec's direct kernel boot (M6: the claim tracks what runs, not
+/// the configured string — after a config change, start must not claim an
+/// image the VM is not booting).
+pub fn kubevirt_boot_image(vm: &DynamicObject) -> String {
+    vm.data
+        .pointer("/spec/template/spec/domain/firmware/kernelBoot/container/image")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn kubevirt_create_in_flight_since(obj: &DynamicObject) -> Option<i64> {
     obj.metadata
         .annotations
@@ -514,41 +526,50 @@ fn vm_status_from_object(
     // connect, so the sandbox surfaces as Error rather than provisioning
     // forever. It wins over the not-ready fallback but not over an
     // already-terminal VM failure.
-    let supervisor_failed = supervisor_failure.filter(|_| !ready && terminal.is_none());
+    let supervisor_failed = supervisor_failure.filter(|_| terminal.is_none() && !halted);
 
     let mut conditions = Vec::new();
     conditions.push(DriverCondition {
         r#type: "Ready".to_string(),
-        status: if ready { "True" } else { "False" }.to_string(),
-        reason: if ready {
-            "VMReady".to_string()
-        } else if terminal.is_some() {
+        status: if ready && terminal.is_none() && supervisor_failed.is_none() {
+            "True"
+        } else {
+            "False"
+        }
+        .to_string(),
+        reason: if terminal.is_some() {
             REASON_VM_FAILED.to_string()
-        } else if create_timed_out {
-            REASON_CREATE_TIMED_OUT.to_string()
         } else if supervisor_failed.is_some() {
             REASON_SUPERVISOR_FAILED.to_string()
+        } else if ready {
+            "VMReady".to_string()
+        } else if create_timed_out {
+            REASON_CREATE_TIMED_OUT.to_string()
         } else {
             REASON_VM_NOT_READY.to_string()
         },
-        message: if ready {
-            "VirtualMachineInstance is running".to_string()
-        } else if let Some(terminal) = terminal {
-            format!("VirtualMachine failed: {terminal}")
-        } else if create_timed_out {
-            "the create's Halted window outlived the deadline (the gateway \
-             likely died mid-create); stop or delete the sandbox"
-                .to_string()
-        } else if let Some(failure) = supervisor_failed {
-            format!("dedicated supervisor Pod failed: {failure}")
-        } else if let Some(phase) = vmi_phase {
-            // Surface the VMI's phase alongside the printable status so
-            // launcher-side problems (e.g. an image pull stuck on Pending)
-            // are visible instead of hiding behind "Starting".
-            format!("VirtualMachine status: {printable} (VMI {phase})")
-        } else {
-            format!("VirtualMachine status: {printable}")
-        },
+        message: terminal
+            .map(|terminal| format!("VirtualMachine failed: {terminal}"))
+            .or_else(|| {
+                supervisor_failed
+                    .map(|failure| format!("dedicated supervisor Pod failed: {failure}"))
+            })
+            .or_else(|| ready.then(|| "VirtualMachineInstance is running".to_string()))
+            .or_else(|| {
+                create_timed_out.then(|| {
+                    "the create's Halted window outlived the deadline (the gateway \
+                     likely died mid-create); stop or delete the sandbox"
+                        .to_string()
+                })
+            })
+            .unwrap_or_else(|| {
+                // Surface the VMI's phase alongside the printable status
+                // so launcher-side problems are visible (L4).
+                vmi_phase.map_or_else(
+                    || format!("VirtualMachine status: {printable}"),
+                    |phase| format!("VirtualMachine status: {printable} (VMI {phase})"),
+                )
+            }),
         transition_time: None,
     });
     // The watch reconciler re-fenced a drifted or deleted fence and stamped
@@ -560,7 +581,12 @@ fn vm_status_from_object(
             status: "True".to_string(),
             reason: "ReFencedAfterDrift".to_string(),
             message: format!(
-                "the egress fence drifted or was deleted and was re-created by the driver at                  {restored_at}"
+                "the egress fence drifted or was deleted and was re-created by the driver \
+                 (restored at {} Unix seconds)",
+                restored_at
+                    .parse::<i64>()
+                    .map(|millis| millis / 1000)
+                    .map_or_else(|_| restored_at.to_string(), |seconds| seconds.to_string())
             ),
             transition_time: None,
         });
@@ -1280,6 +1306,24 @@ mod kubevirt_review_tests {
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, REASON_SUPERVISOR_FAILED);
         assert!(ready.message.contains("supervisor Pod is gone"));
+        // The real M2 case: the VM still reports ready when its supervisor
+        // Pod is deleted under it — the failure must still surface as a
+        // terminal Error, not hide behind VMReady.
+        let cfg = review_config();
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+        vm.data["spec"]["runStrategy"] = serde_json::json!("Once");
+        vm.data["status"] = serde_json::json!({"ready": true, "printableStatus": "Running"});
+        let (_, sbx) = sandbox_from_vm_object_with_runtime(
+            "kvpoc-sandboxes",
+            vm,
+            Some("Running"),
+            Some("supervisor Pod is gone"),
+            None,
+        )
+        .expect("converts");
+        let ready = sbx.status.unwrap().conditions[0].clone();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, REASON_SUPERVISOR_FAILED);
         // Without the failure the same VM stays transient.
         let cfg = review_config();
         let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
@@ -1290,6 +1334,41 @@ mod kubevirt_review_tests {
                 .expect("converts");
         let ready = sbx.status.unwrap().conditions[0].clone();
         assert_eq!(ready.reason, REASON_VM_NOT_READY);
+    }
+
+    #[test]
+    fn create_window_watch_event_stays_bootstrapping() {
+        // The watch re-emits snapshots during the create's Halted window,
+        // before the dedicated supervisor Pod exists; even if a failure
+        // were reported for that window, the snapshot must stay
+        // Bootstrapping (Provisioning), never SupervisorFailed (Error).
+        let cfg = review_config();
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+        vm.data["spec"]["runStrategy"] = serde_json::json!("Halted");
+        vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Stopped"});
+        vm.metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION.to_string(),
+                openshell_core::time::now_ms().to_string(),
+            );
+        let (_, sbx) = sandbox_from_vm_object_with_runtime(
+            "kvpoc-sandboxes",
+            vm,
+            None,
+            Some("supervisor Pod is gone"),
+            None,
+        )
+        .expect("converts");
+        let conditions = sbx.status.unwrap().conditions;
+        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+        assert_eq!(ready.reason, REASON_VM_NOT_READY);
+        assert!(
+            conditions
+                .iter()
+                .any(|condition| condition.r#type == "Bootstrapping" && condition.status == "True")
+        );
     }
 
     #[test]
