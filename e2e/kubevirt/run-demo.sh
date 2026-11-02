@@ -210,6 +210,12 @@ grep -q "uid=10001(sandbox)" ${WORKDIR}/exec.log \
     || fail "workload does not run as the provisioned sandbox user"
 grep -q "^init$" ${WORKDIR}/exec.log || fail "PID 1 is not the guest init"
 
+# H2: the workspace PVC must be writable by the workload uid (the idmapped
+# virtiofs mount); a marker file proves it and is re-read after stop/start.
+exec_in_sandbox sh -c 'echo workspace-ok > /sandbox/.kvpoc-demo-marker' \
+    || fail "the workload uid cannot write to the workspace PVC"
+echo "workspace writable by the workload uid (idmapped virtiofs)"
+
 step "4/10 no gateway material in the workload environment"
 if exec_in_sandbox sh -c \
     'env | grep -iE "BOUNDARY|PRIVATE|TOKEN|OPENSHELL_ENDPOINT"' \
@@ -260,8 +266,15 @@ LAUNCHER="$(kubectl get pods -n "${SANDBOX_NAMESPACE}" \
     -l kubevirt.io=virt-launcher,openshell.ai/sandbox-id="${SBX_ID}" \
     -o jsonpath='{.items[0].metadata.name}')"
 [ -n "${LAUNCHER}" ] || fail "no virt-launcher pod found"
-SUPERVISOR_IP="$(kubectl get svc -n "${SUPERVISOR_NAMESPACE}" \
-    kvpoc-openshell-supervisor -o jsonpath='{.spec.clusterIP}' 2>/dev/null)"
+# The fence's selective control target is topology-aware: this sandbox's
+# dedicated supervisor Service, or the shared supervisor's Service.
+if [ "${TOPOLOGY}" = "gateway" ]; then
+    SUPERVISOR_IP="$(kubectl get svc -n "${SUPERVISOR_NAMESPACE}" \
+        kvpoc-openshell-supervisor -o jsonpath='{.spec.clusterIP}' 2>/dev/null)"
+else
+    SUPERVISOR_IP="$(kubectl get svc -n "${SANDBOX_NAMESPACE}" \
+        "${SUPERVISOR_POD}" -o jsonpath='{.spec.clusterIP}' 2>/dev/null)"
+fi
 [ -n "${SUPERVISOR_IP}" ] || fail "shared supervisor Service has no ClusterIP"
 kubectl exec -n "${SANDBOX_NAMESPACE}" "${LAUNCHER}" -c compute -- \
     timeout 8 openssl s_client -connect 1.1.1.1:443 \
@@ -315,6 +328,14 @@ FENCE_UID_AFTER="$(kubectl get netpol -n "${SANDBOX_NAMESPACE}" "${FENCE}" \
 [ "${VM_UID_AFTER}" = "${VM_UID}" ] || fail "VM UID changed across stop/start"
 [ "${FENCE_UID_AFTER}" = "${FENCE_UID}" ] || fail "fence UID changed across stop/start"
 echo "VM uid unchanged (${VM_UID}); fence uid unchanged (${FENCE_UID})"
+# H2: the workspace marker survived the stop/start cycle.
+MARKER="$(exec_in_sandbox sh -c 'cat /sandbox/.kvpoc-demo-marker' 2>/dev/null)" \
+    || fail "the workspace marker could not be read after restart"
+[ "${MARKER}" = "workspace-ok" ] \
+    || fail "the workspace marker did not survive stop/start (got '${MARKER}')"
+exec_in_sandbox sh -c 'touch /sandbox/.kvpoc-demo-marker' \
+    || fail "the workspace is not writable after restart"
+echo "workspace data survived stop/start and stays writable"
 if [ "${TOPOLOGY}" = "dedicated" ]; then
     # A dedicated start provisions a fresh supervisor generation: a new Pod
     # with a new UID, claimed by the re-rendered boundary bootstrap.

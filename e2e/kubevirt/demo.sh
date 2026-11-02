@@ -50,7 +50,15 @@ export OPENSHELL_KVPOC_TOPOLOGY="${TOPOLOGY}"
 # The k3d docker bridge gateway is the host address guests use to reach the
 # gateway (k3d prints it at cluster creation; derive it from the network).
 CLUSTER="${OPENSHELL_KVPOC_CLUSTER:-kvpoc}"
-BRIDGE_IP="$(docker network inspect "k3d-${CLUSTER}" -f '{{(index .IPAM.Config 0).Gateway}}')"
+# The bridge gateway is the host address guests use to reach the gateway.
+# Docker and podman report it with different JSON shapes; try both.
+BRIDGE_IP="$(docker network inspect "k3d-${CLUSTER}" \
+    -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
+if [ -z "${BRIDGE_IP}" ]; then
+    BRIDGE_IP="$(podman network inspect "k3d-${CLUSTER}" \
+        -f '{{(index .subnets 0).gateway}}' 2>/dev/null || true)"
+fi
+[ -n "${BRIDGE_IP}" ] || { echo "could not resolve the k3d-${CLUSTER} bridge gateway IP" >&2; exit 1; }
 GRPC_ENDPOINT="https://${BRIDGE_IP}:${PORT}"
 
 echo "==> Building openshell-gateway and openshell CLI"

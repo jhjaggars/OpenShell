@@ -130,11 +130,31 @@ mount_workspace() {
         ts "WARNING: workspace virtio-fs share not available"
         return 0
     fi
-    if [ ! -f /sandbox/.openshell-seeded ] && [ -d /sandbox-seed ]; then
-        cp -a /sandbox-seed/. /sandbox/ 2>/dev/null || true
-        touch /sandbox/.openshell-seeded
+    # The share arrives owned by the launcher fsGroup (virtiofsd runs as
+    # that uid, unprivileged, and cannot switch credentials to the guest
+    # workload uid): idmap the mount so the workload uid/gid and the
+    # on-disk fsGroup translate into each other, then seed as the
+    # workload user (root is unmapped through the idmap).
+    share_gid="$(stat -c %g /sandbox 2>/dev/null || echo 0)"
+    if [ -x /usr/local/bin/idmap-mount ] \
+        && [ "${share_gid}" != "0" ] && [ "${share_gid}" != "10001" ] \
+        && /usr/local/bin/idmap-mount /sandbox "${share_gid}" 10001; then
+        ts "workspace idmapped (on-disk id ${share_gid} <-> guest 10001)"
+        if [ ! -f /sandbox/.openshell-seeded ] && [ -d /sandbox-seed ]; then
+            su -s /bin/sh sandbox -c \
+                'cp -a /sandbox-seed/. /sandbox/ && touch /sandbox/.openshell-seeded' \
+                2>/dev/null || true
+        fi
+        # Adopt files left by pre-idmap generations (created as other ids).
+        su -s /bin/sh sandbox -c 'chown -R 10001:10001 /sandbox' 2>/dev/null || true
+    else
+        ts "WARNING: workspace idmap unavailable; writes as the workload uid will fail"
+        if [ ! -f /sandbox/.openshell-seeded ] && [ -d /sandbox-seed ]; then
+            cp -a /sandbox-seed/. /sandbox/ 2>/dev/null || true
+            touch /sandbox/.openshell-seeded 2>/dev/null || true
+        fi
+        chown -R 10001:10001 /sandbox 2>/dev/null || true
     fi
-    chown -R 10001:10001 /sandbox 2>/dev/null || true
     ts "workspace PVC mounted (virtio-fs)"
 }
 

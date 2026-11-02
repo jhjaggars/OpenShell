@@ -33,12 +33,6 @@ command -v qemu-img >/dev/null || { echo "qemu-img is required" >&2; exit 1; }
 # KEEP_WORKDIR is set for debugging.
 cleanup() {
     if [ -z "${KEEP_WORKDIR:-}" ] && [ -n "${WORKDIR:-}" ] && [ -d "${WORKDIR}" ]; then
-        # The root-run build container leaves root-owned, relabeled files
-        # behind; remove them with the same privilege (falling back to the
-        # best-effort host delete for pre-container leftovers).
-        docker run --rm -v "${WORKDIR}:/work:Z" alpine:3.22 \
-            sh -c 'rm -rf /work/* /work/.[!.]* 2>/dev/null || true' \
-            >/dev/null 2>&1 || true
         rm -rf "${WORKDIR}" 2>/dev/null || true
     fi
 }
@@ -71,18 +65,26 @@ docker cp "${SUPERVISOR}" kvpoc-guest-rootfs:/usr/local/bin/openshell-sandbox
 docker export kvpoc-guest-rootfs -o "${WORKDIR}/rootfs.tar"
 docker rm kvpoc-guest-rootfs >/dev/null
 
+cp "${REPO_ROOT}/e2e/kubevirt/idmap-mount.c" "${WORKDIR}/idmap-mount.c"
+
 # 2. Unpack the exported rootfs, usr-merge it, render the ext4 disk, and
 #    repack the initramfs — all as root inside a container. An unprivileged
 #    `tar -xpf` cannot chown, so the rootfs (and with it the ext4 image
 #    built by `mkfs.ext4 -d`) would be owned by the build uid instead of
 #    root; the container keeps every filesystem step ownership-correct
 #    without requiring root on the host.
-docker run --rm -v "${WORKDIR}:/work:Z" alpine:3.22 sh -c '
+docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+    -v "${WORKDIR}:/work:Z" alpine:3.22 sh -c '
     set -eu
-    apk add --no-cache e2fsprogs >/dev/null
+    apk add --no-cache e2fsprogs gcc musl-dev linux-headers >/dev/null
 
     mkdir -p /work/rootfs
     tar -xpf /work/rootfs.tar -C /work/rootfs
+
+    # The idmapped-mount helper (static musl): remounts the virtiofs
+    # workspace share with an idmap so the workload uid can write through
+    # the unprivileged virtiofsd.
+    cc -static -O2 -o /work/rootfs/usr/local/bin/idmap-mount /work/idmap-mount.c
     chmod 0755 /work/rootfs/usr/local/bin/openshell-sandbox /work/rootfs/opt/openshell/init
 
     # Usr-merge /bin and /sbin into /usr: the supervisor default Landlock
@@ -110,6 +112,10 @@ docker run --rm -v "${WORKDIR}:/work:Z" alpine:3.22 sh -c '
     zcat /work/rootfs/boot/initramfs-virt | cpio -idm --quiet
     mkdir -p sysroot
     find . | cpio -o -H newc --quiet | gzip -9 > /work/initramfs-virt
+
+    # Hand the workdir back to the invoking user: the docker build context
+    # and the cleanup trap run unprivileged on the host.
+    chown -R "${HOST_UID}:${HOST_GID}" /work
 '
 
 # 3. Compress to qcow2 and stage the kernel artifacts.
