@@ -16,3 +16,4 @@ need `KUBECONFIG` for the kvpoc cluster and `OPENSHELL_CLI` pointing at the
 | `t10-workspace-symlink.sh` | Root `chown -R` over the workload-controlled workspace (and workspace writability) |
 | `t11-fence-checks.sh` | `run-demo.sh` step 6 "selective" check is vacuous; additive NetworkPolicy reopens egress |
 | `t12-reconcile.sh` | Running-state fence reconciler (M1) and whether the namespace default-deny floor is restored |
+| `t13-restart-identity.sh` | Repeated stop/start persists a parseable runtime identity; claimed image vs the VM spec image |
