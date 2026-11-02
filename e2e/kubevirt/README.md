@@ -168,14 +168,20 @@ k3d image import kvpoc/openshell-supervisor:dev -c kvpoc
 
 # 4. Shared supervisor (only needed for OPENSHELL_KVPOC_TOPOLOGY=gateway):
 #    render the supervisor templates from the OpenShell Helm chart into the
-#    `openshell` namespace, pointing at the demo gateway (the values file
-#    sets grpc_endpoint to the k3d bridge IP). The demo gateway mints the
-#    supervisor token into the rendered token Secret and syncs the gateway
-#    CA into the Secret the supervisor mounts. The dedicated topology needs
-#    no cluster-side supervisor: the driver creates one Pod per sandbox
-#    from the locally imported kvpoc/openshell-supervisor:dev image.
+#    `openshell` namespace, pointing at the demo gateway. The values file's
+#    grpc_endpoint placeholder must be substituted with the k3d bridge IP
+#    (the host address pods use to reach the host-run gateway). The demo
+#    gateway mints the supervisor token into the rendered token Secret and
+#    syncs the gateway CA into the Secret the supervisor mounts. The
+#    dedicated topology needs no cluster-side supervisor: the driver
+#    creates one Pod per sandbox from the locally imported
+#    kvpoc/openshell-supervisor:dev image.
+kubectl create namespace openshell
+BRIDGE_IP="$(docker network inspect k3d-kvpoc -f '{{(index .IPAM.Config 0).Gateway}}')"
+sed "s/172.18.0.1/${BRIDGE_IP}/" e2e/kubevirt/supervisor-values.yaml \
+    > /tmp/kvpoc-supervisor-values.yaml
 helm template kvpoc deploy/helm/openshell -n openshell \
-    -f e2e/kubevirt/supervisor-values.yaml \
+    -f /tmp/kvpoc-supervisor-values.yaml \
     -s templates/supervisor.yaml -s templates/supervisor-service.yaml \
     -s templates/supervisor-networkpolicy.yaml -s templates/supervisor-token-secret.yaml \
     | kubectl apply -f -
@@ -247,6 +253,10 @@ demo complete: Ready, exec, L4/L7 policy, bypass blocked, stop/start,
 fence verification, dead-runtime Error, and clean teardown all verified
 ```
 
+Stop semantics: stop waits for the VM's ready flag to clear; the VMI and
+virt-launcher pod can take another ~30 seconds to terminate, during which
+the fence (owner-referenced to the VM) still applies.
+
 Start semantics: the plan is decided from the run strategy, the VM status,
 and the paired VMI's phase. A halted VM boots with a single `Once` patch
 (`PatchOnce`). A live or booting VMI makes start idempotent
@@ -315,8 +325,11 @@ material); delete it to fully reset.
   in `guest-init.sh` because the k3d flannel-vxlan pod network is 1450.
 - No GPU, no live-migration/VMI-replacement semantics.
 - A create interrupted between the Halted VM creation and its `Once` patch
-  leaves the VM with the in-flight annotation until the gateway's
-  provisioning-deadline reclaim stops it (the stop clears the annotation).
+  leaves the VM with the in-flight annotation; after ten minutes the driver
+  maps it to a terminal create timeout (public `Error`), so it is visible
+  and stoppable even when the gateway was restarted from a clean database
+  and its own provisioning-deadline reclaim has no record to act on (the
+  stop clears the annotation).
 - Upstream context: kubernetes-sigs/agent-sandbox#1157 proposes a
   `runtimeBackend: VirtualMachine` Sandbox CR extension (unmerged POC fork).
   If that lands, the driver could switch from direct VM creation back to the
@@ -348,7 +361,21 @@ The KubeVirt boundary claims model follows the VM driver's approach:
 Who verifies the fence:
 
 - the driver attests it by re-reading the NetworkPolicy each generation
-  (`verify_fence` / `check_fence`);
+  (`verify_fence` / `check_fence`), and the watch re-verifies every running
+  sandbox on a 30-second interval, re-creating a drifted, replaced, or
+  deleted fence from the persisted expectation and surfacing a
+  `FenceRestored` condition;
+- a namespace-wide default-deny NetworkPolicy
+  (`openshell-kubevirt-launcher-isolation`) selects every virt-launcher pod
+  in the sandbox namespace, so isolation never depends on a per-sandbox
+  object's lifecycle — the per-sandbox fence and control policy only add
+  allowances on top of that floor;
+- inherent limitation: Kubernetes NetworkPolicy is additive, so an
+  out-of-band policy that selects the launcher pod and allows more egress
+  reopens egress, and a start still passes (the verification checks this
+  driver's fence, not every policy in the namespace). The default-deny
+  floor and the reconciler narrow the window to deliberate action; policy
+  governance over the namespace is the production answer;
 - because the expected fence spec is re-rendered from the *current*
   supervisor Service selector and port, a Helm upgrade that changes the
   supervisor's labels or port makes every existing KubeVirt sandbox fail

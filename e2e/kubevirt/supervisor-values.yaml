@@ -4,6 +4,8 @@ gatewayConfig:
   openshell.drivers.kubernetes:
     supervisor_topology: gateway
     namespace: kvpoc-sandboxes
+    # Placeholder host: substitute the k3d docker bridge IP before applying
+    # (the README's step 4 shows the sed); this file is not applied verbatim.
     grpc_endpoint: https://172.18.0.1:18085
     supervisor_image: kvpoc/openshell-supervisor:dev
     supervisor_image_pull_policy: never

@@ -17,8 +17,9 @@
 #              PVCs are not exposed as block disks by KubeVirt), mounted at
 #              /sandbox and seeded from the image on first boot
 #
-# After setup it execs the static openshell-sandbox supervisor, which becomes
-# PID 1 and owns the gateway relay, exec, policy, and logs from there on.
+# After setup it runs the static openshell-sandbox boundary as a child
+# process; PID 1 stays the init so it can power off the guest when the
+# boundary exits.
 
 set -eu
 

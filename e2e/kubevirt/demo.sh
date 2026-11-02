@@ -49,7 +49,8 @@ export OPENSHELL_KVPOC_TOPOLOGY="${TOPOLOGY}"
 
 # The k3d docker bridge gateway is the host address guests use to reach the
 # gateway (k3d prints it at cluster creation; derive it from the network).
-BRIDGE_IP="$(docker network inspect k3d-kvpoc -f '{{(index .IPAM.Config 0).Gateway}}')"
+CLUSTER="${OPENSHELL_KVPOC_CLUSTER:-kvpoc}"
+BRIDGE_IP="$(docker network inspect "k3d-${CLUSTER}" -f '{{(index .IPAM.Config 0).Gateway}}')"
 GRPC_ENDPOINT="https://${BRIDGE_IP}:${PORT}"
 
 echo "==> Building openshell-gateway and openshell CLI"
@@ -173,18 +174,11 @@ EOF
 
 # Register the gateway for the CLI (mTLS: the shared supervisor requires
 # gateway TLS, so the demo generates a PKI bundle into the state directory
-# and lays the client side into the CLI's gateway directory). The previous
-# active gateway selection is restored when the demo exits.
-CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
-ACTIVE_GATEWAY_PATH="${CONFIG_HOME}/openshell/active_gateway"
-PREVIOUS_ACTIVE_GATEWAY="$(cat "${ACTIVE_GATEWAY_PATH}" 2>/dev/null || true)"
-restore_active_gateway() {
-    if [ -n "${PREVIOUS_ACTIVE_GATEWAY}" ]; then
-        printf '%s' "${PREVIOUS_ACTIVE_GATEWAY}" >"${ACTIVE_GATEWAY_PATH}"
-    else
-        rm -f "${ACTIVE_GATEWAY_PATH}"
-    fi
-}
+# and lays the client side into the CLI's gateway directory). The demo runs
+# the CLI against an isolated XDG_CONFIG_HOME under the demo state
+# directory, so the user's own ~/.config/openshell is never touched.
+CONFIG_HOME="${STATE_DIR}/cli-config"
+export XDG_CONFIG_HOME="${CONFIG_HOME}"
 GATEWAY_DIR="${CONFIG_HOME}/openshell/gateways/${GATEWAY_NAME}"
 rm -rf "${GATEWAY_DIR}"
 mkdir -p "${GATEWAY_DIR}"
@@ -211,7 +205,6 @@ cleanup() {
     if [ "${RUN_DEMO}" = "1" ] && [ -n "${GATEWAY_PID:-}" ]; then
         kill "${GATEWAY_PID}" 2>/dev/null || true
     fi
-    restore_active_gateway
 }
 trap cleanup EXIT
 
@@ -239,6 +232,27 @@ for _ in $(seq 1 60); do
 done
 
 if [ "${RUN_DEMO}" = "1" ]; then
+    # The gateway topology's supervisor Deployment must attach to the
+    # gateway's assignment stream before the first create: the token the
+    # gateway mints is only served once the replica is attached, and a
+    # create racing that attach leaves the boundary's dial refused.
+    if [ "${TOPOLOGY}" = "gateway" ]; then
+        echo "==> waiting for the shared supervisor replica to attach"
+        ATTACHED=1
+        for _ in $(seq 1 60); do
+            if kubectl logs -n "${SUPERVISOR_NAMESPACE}" deployment/"${SUPERVISOR_SERVICE}" \
+                --since=5m 2>/dev/null | grep -q "gateway accepted the supervisor host"; then
+                ATTACHED=0
+                break
+            fi
+            sleep 2
+        done
+        if [ "${ATTACHED}" != "0" ]; then
+            echo "the shared supervisor replica did not attach to the gateway" >&2
+            kill "${GATEWAY_PID}" 2>/dev/null || true
+            exit 1
+        fi
+    fi
     "${ROOT}/e2e/kubevirt/run-demo.sh" || {
         kill "${GATEWAY_PID}" 2>/dev/null || true
         exit 1

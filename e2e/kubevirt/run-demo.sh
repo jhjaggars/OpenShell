@@ -133,6 +133,12 @@ if kubectl get vm -n "${SANDBOX_NAMESPACE}" -l "${VM_SELECTOR}"     --no-headers
     echo "clearing an orphaned VM from a previous run"
     kubectl delete vm -n "${SANDBOX_NAMESPACE}" -l "${VM_SELECTOR}" --wait=true         >/dev/null 2>&1 || true
 fi
+if kubectl get pod,svc,secret,pvc,netpol -n "${SANDBOX_NAMESPACE}" -l "${VM_SELECTOR}" \
+    --no-headers 2>/dev/null | grep -q .; then
+    echo "clearing orphaned labelled companions from a previous run:"
+    kubectl get pod,svc,secret,pvc,netpol -n "${SANDBOX_NAMESPACE}" -l "${VM_SELECTOR}" \
+        --no-headers 2>/dev/null | awk '{print "  " $1}' | sort -u
+fi
 kubectl delete pod,svc,secret,pvc,netpol -n "${SANDBOX_NAMESPACE}" -l "${VM_SELECTOR}" --ignore-not-found >/dev/null 2>&1 || true
 sleep 5
 "${OPENSHELL_CLI}" sandbox create --detach --name "${NAME}" \
@@ -264,10 +270,15 @@ grep -q "Connection refused" ${WORKDIR}/fence-bypass.log \
     || { cat ${WORKDIR}/fence-bypass.log >&2; \
          fail "raw TCP from the launcher pod to 1.1.1.1:443 was not refused by the fence"; }
 echo "fence check: launcher pod -> 1.1.1.1:443 refused (Connection refused)"
-if kubectl exec -n "${SANDBOX_NAMESPACE}" "${LAUNCHER}" -c compute -- \
+# The selective control: the supervisor Service must remain reachable. The
+# connect itself is expected to fail the TLS handshake (the supervisor
+# awaits its boundary, not an s_client), so success is judged ONLY by the
+# absence of "Connection refused" — the previous `&&` formulation could
+# never fail because a refused connect fails the exec and short-circuits.
+kubectl exec -n "${SANDBOX_NAMESPACE}" "${LAUNCHER}" -c compute -- \
     timeout 8 openssl s_client -connect "${SUPERVISOR_IP}:5500" \
-    > ${WORKDIR}/fence-control.log 2>&1 \
-    && grep -q "Connection refused" ${WORKDIR}/fence-control.log; then
+    > ${WORKDIR}/fence-control.log 2>&1 || true
+if grep -q "Connection refused" ${WORKDIR}/fence-control.log; then
     cat ${WORKDIR}/fence-control.log >&2
     fail "launcher pod -> supervisor Service connect was refused (fence too narrow?)"
 fi

@@ -28,8 +28,15 @@ SUPERVISOR="${CARGO_TARGET}/x86_64-unknown-linux-musl/release/openshell-sandbox"
 
 KUBEVIRT_VERSION="${KUBEVIRT_VERSION:-v1.9.1}"
 
-command -v mkfs.ext4 >/dev/null || { echo "mkfs.ext4 (e2fsprogs) is required" >&2; exit 1; }
 command -v qemu-img >/dev/null || { echo "qemu-img is required" >&2; exit 1; }
+# The build stages ~360 MB under WORKDIR; always remove it on exit unless
+# KEEP_WORKDIR is set for debugging.
+cleanup() {
+    if [ -z "${KEEP_WORKDIR:-}" ] && [ -n "${WORKDIR:-}" ]; then
+        rm -rf "${WORKDIR}"
+    fi
+}
+trap cleanup EXIT
 # Always invoke cargo build: it is incremental, and a bare [ -x ] check
 # silently ships a stale binary whenever a shared CARGO_TARGET_DIR already
 # holds one from another checkout (which is exactly how the old-branch
@@ -58,42 +65,50 @@ docker cp "${SUPERVISOR}" kvpoc-guest-rootfs:/usr/local/bin/openshell-sandbox
 docker export kvpoc-guest-rootfs -o "${WORKDIR}/rootfs.tar"
 docker rm kvpoc-guest-rootfs >/dev/null
 
-# 2. Unpack the exported rootfs.
-mkdir -p "${ROOTFS}"
-tar -xpf "${WORKDIR}/rootfs.tar" -C "${ROOTFS}"
-chmod 0755 "${ROOTFS}/usr/local/bin/openshell-sandbox" "${ROOTFS}/opt/openshell/init"
+# 2. Unpack the exported rootfs, usr-merge it, render the ext4 disk, and
+#    repack the initramfs — all as root inside a container. An unprivileged
+#    `tar -xpf` cannot chown, so the rootfs (and with it the ext4 image
+#    built by `mkfs.ext4 -d`) would be owned by the build uid instead of
+#    root; the container keeps every filesystem step ownership-correct
+#    without requiring root on the host.
+docker run --rm -v "${WORKDIR}:/work" alpine:3.22 sh -c '
+    set -eu
+    apk add --no-cache e2fsprogs >/dev/null
 
-# Usr-merge /bin and /sbin into /usr: the supervisor's default Landlock
-# policy allows exec under /usr (glibc images are usr-merged; Alpine is not,
-# so busybox in /bin would be denied with EACCES).
-merge_into() {
-    local src="$1" dest="$2"
-    mkdir -p "${dest}"
-    cp -a "${src}/." "${dest}/"
-    rm -rf "${src}"
-    ln -s "usr/$(basename "${dest}")" "${src}"
-}
-merge_into "${ROOTFS}/bin" "${ROOTFS}/usr/bin"
-merge_into "${ROOTFS}/sbin" "${ROOTFS}/usr/sbin"
+    mkdir -p /work/rootfs
+    tar -xpf /work/rootfs.tar -C /work/rootfs
+    chmod 0755 /work/rootfs/usr/local/bin/openshell-sandbox /work/rootfs/opt/openshell/init
 
-# 3. Render the ext4 rootfs disk.
-#    ~700 MiB: Alpine base + kernel + supervisor with headroom for runtime.
-mkfs.ext4 -F -q -d "${ROOTFS}" "${WORKDIR}/disk.raw" 700m
+    # Usr-merge /bin and /sbin into /usr: the supervisor default Landlock
+    # policy allows exec under /usr (glibc images are usr-merged; Alpine is
+    # not, so busybox in /bin would be denied with EACCES).
+    merge_into() {
+        local src="$1" dest="$2"
+        mkdir -p "${dest}"
+        cp -a "${src}/." "${dest}/"
+        rm -rf "${src}"
+        ln -s "usr/$(basename "${dest}")" "${src}"
+    }
+    merge_into /work/rootfs/bin /work/rootfs/usr/bin
+    merge_into /work/rootfs/sbin /work/rootfs/usr/sbin
 
-# 4. Compress to qcow2 and stage the kernel artifacts.
+    # Render the ext4 rootfs disk (~700 MiB: Alpine base + kernel +
+    # supervisor with headroom for runtime).
+    mkfs.ext4 -F -q -d /work/rootfs /work/disk.raw 700m
+
+    # Alpine 3.22 stock initramfs-virt is missing the /sysroot mountpoint
+    # its own init mounts the root filesystem on, so root mounting fails
+    # with ENOENT. Repack the initramfs with the directory added.
+    mkdir -p /work/initrd
+    cd /work/initrd
+    zcat /work/rootfs/boot/initramfs-virt | cpio -idm --quiet
+    mkdir -p sysroot
+    find . | cpio -o -H newc --quiet | gzip -9 > /work/initramfs-virt
+'
+
+# 3. Compress to qcow2 and stage the kernel artifacts.
 qemu-img convert -c -O qcow2 "${WORKDIR}/disk.raw" "${WORKDIR}/disk.qcow2"
 cp "${ROOTFS}/boot/vmlinuz-virt" "${WORKDIR}/vmlinuz-virt"
-
-# Alpine 3.22's stock initramfs-virt is missing the /sysroot mountpoint its
-# own init mounts the root filesystem on, so root mounting fails with
-# ENOENT. Repack the initramfs with the directory added.
-mkdir -p "${WORKDIR}/initrd"
-(
-    cd "${WORKDIR}/initrd"
-    zcat "${ROOTFS}/boot/initramfs-virt" | cpio -idm --quiet
-    mkdir -p sysroot
-    find . | cpio -o -H newc --quiet | gzip -9 > "${WORKDIR}/initramfs-virt"
-)
 
 # 5. Assemble the containerDisk image. KubeVirt >= 1.9 runs each
 #    containerDisk image as a virt-launcher init container executing
