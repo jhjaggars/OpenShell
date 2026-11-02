@@ -32,8 +32,14 @@ command -v qemu-img >/dev/null || { echo "qemu-img is required" >&2; exit 1; }
 # The build stages ~360 MB under WORKDIR; always remove it on exit unless
 # KEEP_WORKDIR is set for debugging.
 cleanup() {
-    if [ -z "${KEEP_WORKDIR:-}" ] && [ -n "${WORKDIR:-}" ]; then
-        rm -rf "${WORKDIR}"
+    if [ -z "${KEEP_WORKDIR:-}" ] && [ -n "${WORKDIR:-}" ] && [ -d "${WORKDIR}" ]; then
+        # The root-run build container leaves root-owned, relabeled files
+        # behind; remove them with the same privilege (falling back to the
+        # best-effort host delete for pre-container leftovers).
+        docker run --rm -v "${WORKDIR}:/work:Z" alpine:3.22 \
+            sh -c 'rm -rf /work/* /work/.[!.]* 2>/dev/null || true' \
+            >/dev/null 2>&1 || true
+        rm -rf "${WORKDIR}" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
@@ -71,7 +77,7 @@ docker rm kvpoc-guest-rootfs >/dev/null
 #    built by `mkfs.ext4 -d`) would be owned by the build uid instead of
 #    root; the container keeps every filesystem step ownership-correct
 #    without requiring root on the host.
-docker run --rm -v "${WORKDIR}:/work" alpine:3.22 sh -c '
+docker run --rm -v "${WORKDIR}:/work:Z" alpine:3.22 sh -c '
     set -eu
     apk add --no-cache e2fsprogs >/dev/null
 
