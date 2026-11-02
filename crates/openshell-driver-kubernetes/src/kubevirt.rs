@@ -71,6 +71,17 @@ const REASON_VM_NOT_READY: &str = "Starting";
 /// the public `Error` phase rather than leaving the sandbox provisioning.
 const REASON_VM_FAILED: &str = "VMFailed";
 
+/// Non-transient condition reason for a dedicated generation whose
+/// supervisor Pod is gone (`restartPolicy: Never`): without a supervisor
+/// the boundary can never connect, so the sandbox maps to the public
+/// `Error` phase instead of provisioning forever.
+pub const REASON_SUPERVISOR_FAILED: &str = "SupervisorFailed";
+
+/// Non-transient condition reason for a create whose Halted window
+/// outlived the deadline (M7): the gateway died mid-create and nothing is
+/// driving the VM to `Once`.
+pub const REASON_CREATE_TIMED_OUT: &str = "CreateTimedOut";
+
 /// Classify a terminal VM failure from the printable status and the paired
 /// VMI's phase. Returns a human-readable summary when the VM has failed.
 ///
@@ -323,6 +334,26 @@ pub const KUBEVIRT_WORKLOAD_GID: u32 = 10001;
 /// `Halted` VM WITHOUT the annotation is a user stop (`Suspended=True`).
 pub const KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION: &str = "openshell.ai/kubevirt-create-in-flight";
 
+/// How long the create's Halted window may last before the driver maps the
+/// VM to a terminal create timeout (M7). The window is seconds in a healthy
+/// create; a gateway that died mid-create leaves the VM Halted with the
+/// in-flight annotation, and a gateway restarted from a clean database has
+/// no sandbox record for its own provisioning-deadline reclaim — the
+/// driver-side deadline makes the wedge visible (public Error) either way.
+pub const KUBEVIRT_CREATE_DEADLINE_MS: i64 = 10 * 60 * 1000;
+
+/// The create's in-flight annotation value: the Unix-millisecond timestamp
+/// of the Halted-window start (older revisions wrote a bare "true", which
+/// parses to no deadline).
+fn kubevirt_create_in_flight_since(obj: &DynamicObject) -> Option<i64> {
+    obj.metadata
+        .annotations
+        .as_ref()?
+        .get(KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION)?
+        .parse::<i64>()
+        .ok()
+}
+
 pub fn bootstrap_secret_name(kube_name: &str) -> String {
     format!("{kube_name}-bootstrap")
 }
@@ -351,10 +382,25 @@ fn sandbox_from_vm_object(
 /// the phase of the paired `VirtualMachineInstance` when known (the VMI
 /// carries the same labels); it distinguishes a failed or completed guest
 /// from one that has not booted yet.
-pub fn sandbox_from_vm_object_with_vmi(
+#[cfg(test)]
+fn sandbox_from_vm_object_with_vmi(
     namespace: &str,
     obj: DynamicObject,
     vmi_phase: Option<&str>,
+) -> Result<(String, Sandbox), String> {
+    sandbox_from_vm_object_with_runtime(namespace, obj, vmi_phase, None, None)
+}
+
+/// The full snapshot join: the VM object, its VMI's phase, the dedicated
+/// supervisor Pod's failure (when its generation's supervisor is gone or
+/// crashed), and the fence drift marker (when the watch reconciler restored
+/// a drifted or deleted fence).
+pub fn sandbox_from_vm_object_with_runtime(
+    namespace: &str,
+    obj: DynamicObject,
+    vmi_phase: Option<&str>,
+    supervisor_failure: Option<&str>,
+    fence_restored_at: Option<&str>,
 ) -> Result<(String, Sandbox), String> {
     let kube_name = obj.metadata.name.clone().unwrap_or_default();
 
@@ -376,7 +422,13 @@ pub fn sandbox_from_vm_object_with_vmi(
         .namespace
         .clone()
         .unwrap_or_else(|| namespace.to_string());
-    let status = vm_status_from_object(&obj, &name, vmi_phase);
+    let status = vm_status_from_object(
+        &obj,
+        &name,
+        vmi_phase,
+        supervisor_failure,
+        fence_restored_at,
+    );
 
     Ok((
         kube_name,
@@ -406,6 +458,8 @@ fn vm_status_from_object(
     obj: &DynamicObject,
     sandbox_name: &str,
     vmi_phase: Option<&str>,
+    supervisor_failure: Option<&str>,
+    fence_restored_at: Option<&str>,
 ) -> Option<SandboxStatus> {
     let status = obj.data.get("status")?;
     let status_obj = status.as_object()?;
@@ -436,7 +490,7 @@ fn vm_status_from_object(
         .annotations
         .as_ref()
         .and_then(|annotations| annotations.get(KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION))
-        .is_some_and(|value| value == "true");
+        .is_some_and(|value| !value.is_empty());
     let stopped = halted && !create_in_flight;
 
     let printable = status_obj
@@ -446,6 +500,22 @@ fn vm_status_from_object(
 
     let terminal = terminal_vm_failure(printable, vmi_phase, ready);
 
+    // A create whose Halted window outlived the deadline is a terminal
+    // failure (M7): the gateway died mid-create, and a gateway restarted
+    // from a clean database has no record to reclaim with.
+    let create_timed_out = halted
+        && create_in_flight
+        && kubevirt_create_in_flight_since(obj).is_some_and(|since| {
+            openshell_core::time::now_ms() - since > KUBEVIRT_CREATE_DEADLINE_MS
+        });
+
+    // A dedicated generation whose supervisor Pod is gone or crashed is a
+    // terminal failure (`restartPolicy: Never`): the boundary can never
+    // connect, so the sandbox surfaces as Error rather than provisioning
+    // forever. It wins over the not-ready fallback but not over an
+    // already-terminal VM failure.
+    let supervisor_failed = supervisor_failure.filter(|_| !ready && terminal.is_none());
+
     let mut conditions = Vec::new();
     conditions.push(DriverCondition {
         r#type: "Ready".to_string(),
@@ -454,6 +524,10 @@ fn vm_status_from_object(
             "VMReady".to_string()
         } else if terminal.is_some() {
             REASON_VM_FAILED.to_string()
+        } else if create_timed_out {
+            REASON_CREATE_TIMED_OUT.to_string()
+        } else if supervisor_failed.is_some() {
+            REASON_SUPERVISOR_FAILED.to_string()
         } else {
             REASON_VM_NOT_READY.to_string()
         },
@@ -461,11 +535,36 @@ fn vm_status_from_object(
             "VirtualMachineInstance is running".to_string()
         } else if let Some(terminal) = terminal {
             format!("VirtualMachine failed: {terminal}")
+        } else if create_timed_out {
+            "the create's Halted window outlived the deadline (the gateway \
+             likely died mid-create); stop or delete the sandbox"
+                .to_string()
+        } else if let Some(failure) = supervisor_failed {
+            format!("dedicated supervisor Pod failed: {failure}")
+        } else if let Some(phase) = vmi_phase {
+            // Surface the VMI's phase alongside the printable status so
+            // launcher-side problems (e.g. an image pull stuck on Pending)
+            // are visible instead of hiding behind "Starting".
+            format!("VirtualMachine status: {printable} (VMI {phase})")
         } else {
             format!("VirtualMachine status: {printable}")
         },
         transition_time: None,
     });
+    // The watch reconciler re-fenced a drifted or deleted fence and stamped
+    // this marker; surface the event so operators see that isolation
+    // briefly depended on the namespace-wide default-deny floor.
+    if let Some(restored_at) = fence_restored_at {
+        conditions.push(DriverCondition {
+            r#type: "FenceRestored".to_string(),
+            status: "True".to_string(),
+            reason: "ReFencedAfterDrift".to_string(),
+            message: format!(
+                "the egress fence drifted or was deleted and was re-created by the driver at                  {restored_at}"
+            ),
+            transition_time: None,
+        });
+    }
     if halted && create_in_flight {
         conditions.push(DriverCondition {
             r#type: "Bootstrapping".to_string(),
@@ -861,6 +960,32 @@ pub async fn delete_and_wait(
     timeout: Duration,
 ) -> Result<(), KubernetesDriverError> {
     let _ = api.delete(name, &DeleteParams::default()).await;
+    wait_until_gone(api, name, what, timeout).await
+}
+
+/// Delete an object with a UID precondition and wait until it is gone, so a
+/// concurrent replacement of the same name is never deleted.
+pub async fn delete_and_wait_with_uid(
+    api: &Api<DynamicObject>,
+    name: &str,
+    what: &str,
+    uid: &str,
+    timeout: Duration,
+) -> Result<(), KubernetesDriverError> {
+    let preconditions = DeleteParams::default().preconditions(Preconditions {
+        uid: Some(uid.to_string()),
+        resource_version: None,
+    });
+    let _ = api.delete(name, &preconditions).await;
+    wait_until_gone(api, name, what, timeout).await
+}
+
+async fn wait_until_gone(
+    api: &Api<DynamicObject>,
+    name: &str,
+    what: &str,
+    timeout: Duration,
+) -> Result<(), KubernetesDriverError> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match api.get(name).await {
@@ -1092,7 +1217,7 @@ mod kubevirt_review_tests {
             .get_or_insert_with(Default::default)
             .insert(
                 KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION.to_string(),
-                "true".to_string(),
+                openshell_core::time::now_ms().to_string(),
             );
         let (_, sbx) =
             sandbox_from_vm_object_with_vmi("kvpoc-sandboxes", vm, None).expect("converts");
@@ -1130,6 +1255,133 @@ mod kubevirt_review_tests {
                 .iter()
                 .any(|condition| condition.r#type == "Bootstrapping"),
             "user-stopped Halted VM must not report Bootstrapping: {conditions:?}"
+        );
+    }
+
+    #[test]
+    fn supervisor_failure_maps_to_terminal_error() {
+        // M2: a dedicated generation whose supervisor Pod is gone or
+        // crashed maps the sandbox to the public Error phase (a
+        // non-transient Ready=False reason) instead of provisioning
+        // forever.
+        let cfg = review_config();
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+        vm.data["spec"]["runStrategy"] = serde_json::json!("Once");
+        vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Running"});
+        let (_, sbx) = sandbox_from_vm_object_with_runtime(
+            "kvpoc-sandboxes",
+            vm,
+            Some("Running"),
+            Some("supervisor Pod is gone"),
+            None,
+        )
+        .expect("converts");
+        let ready = sbx.status.unwrap().conditions[0].clone();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, REASON_SUPERVISOR_FAILED);
+        assert!(ready.message.contains("supervisor Pod is gone"));
+        // Without the failure the same VM stays transient.
+        let cfg = review_config();
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+        vm.data["spec"]["runStrategy"] = serde_json::json!("Once");
+        vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Running"});
+        let (_, sbx) =
+            sandbox_from_vm_object_with_runtime("kvpoc-sandboxes", vm, Some("Running"), None, None)
+                .expect("converts");
+        let ready = sbx.status.unwrap().conditions[0].clone();
+        assert_eq!(ready.reason, REASON_VM_NOT_READY);
+    }
+
+    #[test]
+    fn stale_create_window_maps_to_terminal_timeout() {
+        // M7: a create whose Halted window outlived the deadline (the
+        // gateway died mid-create; a gateway restarted from a clean
+        // database has no record to reclaim with) maps the sandbox to the
+        // public Error phase instead of provisioning forever.
+        let cfg = review_config();
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+        vm.data["spec"]["runStrategy"] = serde_json::json!("Halted");
+        vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Stopped"});
+        vm.metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION.to_string(),
+                (openshell_core::time::now_ms() - KUBEVIRT_CREATE_DEADLINE_MS - 1).to_string(),
+            );
+        let (_, sbx) = sandbox_from_vm_object_with_runtime("kvpoc-sandboxes", vm, None, None, None)
+            .expect("converts");
+        let conditions = sbx.status.unwrap().conditions;
+        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, REASON_CREATE_TIMED_OUT);
+        assert!(ready.message.contains("outlived the deadline"));
+        // A fresh window stays Bootstrapping (Provisioning), not Error.
+        let cfg = review_config();
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+        vm.data["spec"]["runStrategy"] = serde_json::json!("Halted");
+        vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Stopped"});
+        vm.metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION.to_string(),
+                openshell_core::time::now_ms().to_string(),
+            );
+        let (_, sbx) = sandbox_from_vm_object_with_runtime("kvpoc-sandboxes", vm, None, None, None)
+            .expect("converts");
+        let conditions = sbx.status.unwrap().conditions;
+        assert!(
+            conditions
+                .iter()
+                .any(|condition| condition.r#type == "Bootstrapping" && condition.status == "True")
+        );
+        let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+        assert_eq!(ready.reason, REASON_VM_NOT_READY);
+    }
+
+    #[test]
+    fn fence_restored_marker_surfaces_as_condition() {
+        // M1: the reconciler's restore marker surfaces as a FenceRestored
+        // condition so operators see that isolation briefly depended on
+        // the namespace-wide default-deny floor.
+        let cfg = review_config();
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+        vm.data["status"] = serde_json::json!({"ready": true});
+        vm.metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                "openshell.ai/kubevirt-fence-restored-at".to_string(),
+                "1760000000000".to_string(),
+            );
+        let (_, sbx) = sandbox_from_vm_object_with_runtime(
+            "kvpoc-sandboxes",
+            vm,
+            None,
+            None,
+            Some("1760000000000"),
+        )
+        .expect("converts");
+        let conditions = sbx.status.unwrap().conditions;
+        let restored = conditions
+            .iter()
+            .find(|condition| condition.r#type == "FenceRestored")
+            .expect("FenceRestored condition present");
+        assert_eq!(restored.status, "True");
+        assert_eq!(restored.reason, "ReFencedAfterDrift");
+        // Without the marker there is no condition.
+        let cfg = review_config();
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+        vm.data["status"] = serde_json::json!({"ready": true});
+        let (_, sbx) = sandbox_from_vm_object_with_runtime("kvpoc-sandboxes", vm, None, None, None)
+            .expect("converts");
+        assert!(
+            !sbx.status
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|condition| condition.r#type == "FenceRestored")
         );
     }
 

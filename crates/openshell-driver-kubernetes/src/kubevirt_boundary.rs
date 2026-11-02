@@ -1296,6 +1296,62 @@ mod payload_tests {
         }
     }
 
+    #[test]
+    fn decoded_guest_payload_carries_no_token_values() {
+        // Decode the real rendered payload (the guest init's view) and
+        // prove no gateway material survives into it: no token values, no
+        // JWT fragments, no gateway endpoint — only the boundary config,
+        // session TLS, and workload uid/gid.
+        let auth = test_launch_authentication();
+        let target = KubeVirtSupervisorTarget::Dedicated {
+            authority: "os-supervisor-sbx-1.kvpoc-sandboxes.svc:5500".to_string(),
+            address: "10.43.5.10:5500".parse().unwrap(),
+            supervisor_pod_uid: "supervisor-pod-uid-1".to_string(),
+            pod_selector: BTreeMap::new(),
+            port: 5500,
+        };
+        let bootstrap = render_kubevirt_bootstrap(
+            &auth,
+            "sbx-1",
+            "sandbox-1",
+            "vm-uid-1",
+            "kvpoc/openshell-sandbox-vm:dev",
+            "np-uid-1",
+            "1945",
+            serde_json::json!({}),
+            &target,
+            10001,
+            10001,
+        )
+        .expect("render");
+        let decoded = bootstrap
+            .guest_payload
+            .lines()
+            .filter(|line| line.starts_with("OPENSHELL_BOUNDARY_"))
+            .filter_map(|line| line.split_once('=').map(|(_, value)| value))
+            .map(|value| {
+                String::from_utf8(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(value)
+                        .expect("boundary artifact values are base64"),
+                )
+                .expect("boundary artifacts are UTF-8")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!decoded.contains("gateway.token.value"));
+        assert!(!decoded.contains("sandbox.token.value"));
+        assert!(!decoded.contains("172.18.0.1"));
+        assert!(!decoded.contains("grpc_endpoint"));
+        assert!(!decoded.contains("18085"));
+        // The boundary artifacts themselves are present: the config (with
+        // the gateway's public verification key — public material the
+        // boundary needs) and the session certificate.
+        assert!(decoded.contains("boundary_id"));
+        assert!(decoded.contains("public-key"));
+        assert!(decoded.contains("BEGIN CERTIFICATE"));
+    }
+
     /// W3: the rendered descriptor's TLS must be the session material's
     /// `server_name` and `trust_anchor_pem` verbatim — the same fields the
     /// pod path passes to `SandboxTlsClientConfig`. The trust anchor is
