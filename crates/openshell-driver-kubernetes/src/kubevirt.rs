@@ -82,6 +82,67 @@ pub const REASON_SUPERVISOR_FAILED: &str = "SupervisorFailed";
 /// driving the VM to `Once`.
 pub const REASON_CREATE_TIMED_OUT: &str = "CreateTimedOut";
 
+/// How long the launcher's image-pull backoff may persist before the
+/// snapshot maps it to a terminal failure (L4): kubelet retries with
+/// exponential backoff (capped at five minutes), so a pull that has not
+/// succeeded after two minutes — four failed attempts — is effectively
+/// permanent, and the CLI's provision timeout would otherwise expire with
+/// only the configuration gate's message. Below the threshold the state
+/// stays transient: a slow registry can legitimately back off once.
+pub const IMAGE_PULL_BACKOFF_TERMINAL_AFTER_MS: i64 = 2 * 60 * 1000;
+
+/// Minimal parser for the Kubernetes RFC 3339 timestamp format
+/// (`YYYY-MM-DDTHH:MM:SS(.sss)?Z`, always UTC) to Unix milliseconds.
+fn rfc3339_to_unix_ms(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+        return None;
+    }
+    let num = |range: std::ops::Range<usize>| -> Option<i64> {
+        std::str::from_utf8(&bytes[range]).ok()?.parse().ok()
+    };
+    let year = num(0..4)?;
+    let month = num(5..7)?;
+    let day = num(8..10)?;
+    let hour = num(11..13)?;
+    let minute = num(14..16)?;
+    let second = num(17..19)?;
+    let mut millis = 0;
+    if bytes.len() > 20 && bytes[19] == b'.' {
+        let fraction: String = value[20..].trim_end_matches('Z').chars().take(3).collect();
+        if !fraction.is_empty() {
+            millis = fraction.parse().ok()?;
+        }
+    }
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_prime = (month + 9) % 12;
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000 + millis)
+}
+
+/// The VMI's not-ready-since time in Unix milliseconds, from its `Ready`
+/// condition's `lastTransitionTime`. `None` when the VMI carries no such
+/// condition — the caller then keeps the pull-backoff state transient
+/// (timing fails open, isolation never does).
+pub fn vmi_not_ready_since_ms(vmi: &DynamicObject) -> Option<i64> {
+    let condition = vmi
+        .data
+        .get("status")?
+        .get("conditions")?
+        .as_array()?
+        .iter()
+        .find(|condition| {
+            condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
+        })?;
+    let stamped = condition.get("lastTransitionTime")?.as_str()?;
+    rfc3339_to_unix_ms(stamped)
+}
+
 /// Classify a terminal VM failure from the printable status and the paired
 /// VMI's phase. Returns a human-readable summary when the VM has failed.
 ///
@@ -400,7 +461,7 @@ fn sandbox_from_vm_object_with_vmi(
     obj: DynamicObject,
     vmi_phase: Option<&str>,
 ) -> Result<(String, Sandbox), String> {
-    sandbox_from_vm_object_with_runtime(namespace, obj, vmi_phase, None, None)
+    sandbox_from_vm_object_with_runtime(namespace, obj, vmi_phase, None, None, None)
 }
 
 /// The full snapshot join: the VM object, its VMI's phase, the dedicated
@@ -413,6 +474,7 @@ pub fn sandbox_from_vm_object_with_runtime(
     vmi_phase: Option<&str>,
     supervisor_failure: Option<&str>,
     fence_restored_at: Option<&str>,
+    vmi_not_ready_since_ms: Option<i64>,
 ) -> Result<(String, Sandbox), String> {
     let kube_name = obj.metadata.name.clone().unwrap_or_default();
 
@@ -440,6 +502,7 @@ pub fn sandbox_from_vm_object_with_runtime(
         vmi_phase,
         supervisor_failure,
         fence_restored_at,
+        vmi_not_ready_since_ms,
     );
 
     Ok((
@@ -472,6 +535,7 @@ fn vm_status_from_object(
     vmi_phase: Option<&str>,
     supervisor_failure: Option<&str>,
     fence_restored_at: Option<&str>,
+    vmi_not_ready_since_ms: Option<i64>,
 ) -> Option<SandboxStatus> {
     let status = obj.data.get("status")?;
     let status_obj = status.as_object()?;
@@ -510,7 +574,17 @@ fn vm_status_from_object(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
 
-    let terminal = terminal_vm_failure(printable, vmi_phase, ready);
+    let terminal = terminal_vm_failure(printable, vmi_phase, ready).or_else(|| {
+        // L4: an image-pull backoff that has persisted past the threshold
+        // is terminal — the pull is effectively permanent, and the gateway
+        // would otherwise surface only the configuration gate's message
+        // until the CLI's provision timeout expires.
+        (printable == "ImagePullBackOff"
+            && vmi_not_ready_since_ms.is_some_and(|since| {
+                openshell_core::time::now_ms() - since > IMAGE_PULL_BACKOFF_TERMINAL_AFTER_MS
+            }))
+        .then(|| "guest image pull stuck in backoff (the image cannot be pulled)".to_string())
+    });
 
     // A create whose Halted window outlived the deadline is a terminal
     // failure (M7): the gateway died mid-create, and a gateway restarted
@@ -1300,6 +1374,7 @@ mod kubevirt_review_tests {
             Some("Running"),
             Some("supervisor Pod is gone"),
             None,
+            None,
         )
         .expect("converts");
         let ready = sbx.status.unwrap().conditions[0].clone();
@@ -1319,6 +1394,7 @@ mod kubevirt_review_tests {
             Some("Running"),
             Some("supervisor Pod is gone"),
             None,
+            None,
         )
         .expect("converts");
         let ready = sbx.status.unwrap().conditions[0].clone();
@@ -1329,9 +1405,15 @@ mod kubevirt_review_tests {
         let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["spec"]["runStrategy"] = serde_json::json!("Once");
         vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Running"});
-        let (_, sbx) =
-            sandbox_from_vm_object_with_runtime("kvpoc-sandboxes", vm, Some("Running"), None, None)
-                .expect("converts");
+        let (_, sbx) = sandbox_from_vm_object_with_runtime(
+            "kvpoc-sandboxes",
+            vm,
+            Some("Running"),
+            None,
+            None,
+            None,
+        )
+        .expect("converts");
         let ready = sbx.status.unwrap().conditions[0].clone();
         assert_eq!(ready.reason, REASON_VM_NOT_READY);
     }
@@ -1358,6 +1440,7 @@ mod kubevirt_review_tests {
             vm,
             None,
             Some("supervisor Pod is gone"),
+            None,
             None,
         )
         .expect("converts");
@@ -1388,8 +1471,9 @@ mod kubevirt_review_tests {
                 KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION.to_string(),
                 (openshell_core::time::now_ms() - KUBEVIRT_CREATE_DEADLINE_MS - 1).to_string(),
             );
-        let (_, sbx) = sandbox_from_vm_object_with_runtime("kvpoc-sandboxes", vm, None, None, None)
-            .expect("converts");
+        let (_, sbx) =
+            sandbox_from_vm_object_with_runtime("kvpoc-sandboxes", vm, None, None, None, None)
+                .expect("converts");
         let conditions = sbx.status.unwrap().conditions;
         let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
         assert_eq!(ready.status, "False");
@@ -1407,8 +1491,9 @@ mod kubevirt_review_tests {
                 KUBEVIRT_CREATE_IN_FLIGHT_ANNOTATION.to_string(),
                 openshell_core::time::now_ms().to_string(),
             );
-        let (_, sbx) = sandbox_from_vm_object_with_runtime("kvpoc-sandboxes", vm, None, None, None)
-            .expect("converts");
+        let (_, sbx) =
+            sandbox_from_vm_object_with_runtime("kvpoc-sandboxes", vm, None, None, None, None)
+                .expect("converts");
         let conditions = sbx.status.unwrap().conditions;
         assert!(
             conditions
@@ -1440,6 +1525,7 @@ mod kubevirt_review_tests {
             None,
             None,
             Some("1760000000000"),
+            None,
         )
         .expect("converts");
         let conditions = sbx.status.unwrap().conditions;
@@ -1453,8 +1539,9 @@ mod kubevirt_review_tests {
         let cfg = review_config();
         let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["status"] = serde_json::json!({"ready": true});
-        let (_, sbx) = sandbox_from_vm_object_with_runtime("kvpoc-sandboxes", vm, None, None, None)
-            .expect("converts");
+        let (_, sbx) =
+            sandbox_from_vm_object_with_runtime("kvpoc-sandboxes", vm, None, None, None, None)
+                .expect("converts");
         assert!(
             !sbx.status
                 .unwrap()
@@ -1462,6 +1549,72 @@ mod kubevirt_review_tests {
                 .iter()
                 .any(|condition| condition.r#type == "FenceRestored")
         );
+    }
+
+    #[test]
+    fn rfc3339_parser_reads_kubernetes_timestamps() {
+        // The parser backs the image-pull-backoff terminal rule (L4).
+        assert_eq!(
+            rfc3339_to_unix_ms("2026-11-02T21:34:56Z"),
+            Some(1_793_655_296_000)
+        );
+        assert_eq!(rfc3339_to_unix_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            rfc3339_to_unix_ms("2026-11-02T21:34:56.123Z"),
+            Some(1_793_655_296_123)
+        );
+        assert_eq!(rfc3339_to_unix_ms("not-a-timestamp"), None);
+    }
+
+    #[test]
+    fn image_pull_backoff_becomes_terminal_after_the_threshold() {
+        // L4: below the threshold the backoff stays transient (a slow
+        // registry can legitimately back off); past it the pull is
+        // effectively permanent and the sandbox maps to Error with a
+        // message users see, instead of hiding behind the gateway's
+        // configuration gate until the CLI's provision timeout.
+        let cfg = review_config();
+        let stale = || {
+            let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+            vm.data["status"] =
+                serde_json::json!({"ready": false, "printableStatus": "ImagePullBackOff"});
+            vm
+        };
+        let fresh_since = openshell_core::time::now_ms();
+        let (_, sbx) = sandbox_from_vm_object_with_runtime(
+            "kvpoc-sandboxes",
+            stale(),
+            None,
+            None,
+            None,
+            Some(fresh_since),
+        )
+        .expect("converts");
+        let ready = sbx.status.unwrap().conditions[0].clone();
+        assert_eq!(ready.reason, REASON_VM_NOT_READY);
+        assert!(ready.message.contains("ImagePullBackOff"));
+
+        let stale_since = openshell_core::time::now_ms() - IMAGE_PULL_BACKOFF_TERMINAL_AFTER_MS - 1;
+        let (_, sbx) = sandbox_from_vm_object_with_runtime(
+            "kvpoc-sandboxes",
+            stale(),
+            None,
+            None,
+            None,
+            Some(stale_since),
+        )
+        .expect("converts");
+        let ready = sbx.status.unwrap().conditions[0].clone();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, REASON_VM_FAILED);
+        assert!(ready.message.contains("image pull"));
+
+        // No timestamp: the rule cannot fire (timing fails open).
+        let (_, sbx) =
+            sandbox_from_vm_object_with_runtime("kvpoc-sandboxes", stale(), None, None, None, None)
+                .expect("converts");
+        let ready = sbx.status.unwrap().conditions[0].clone();
+        assert_eq!(ready.reason, REASON_VM_NOT_READY);
     }
 
     #[test]

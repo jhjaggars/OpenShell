@@ -310,6 +310,11 @@ material); delete it to fully reset.
 - **Image identity**: the VM driver claims the registry digest; this PoC
   claims the configured `guest_image` tag, which is weaker (a tag does not
   identify an image). The production path is a digest-pinned guest image.
+- An unpullable guest image maps the sandbox to `Error` only after two
+  minutes of pull backoff (`ImagePullBackOff` with a stale VMI
+  not-ready condition): kubelet retries with exponential backoff, so an
+  earlier verdict would flip slow-but-working registry pulls to `Error`.
+  Below the threshold the state stays transient.
 - The dedicated topology creates the namespace-wide supervisor egress
   policy (`openshell-sandbox-supervisors`, the supervisor half of the pod
   path's workload fence) once per namespace; it is shared infrastructure

@@ -2803,12 +2803,13 @@ impl KubernetesComputeDriver {
                 .await;
             let mut sandboxes = Vec::with_capacity(list.items.len());
             for obj in list.items {
-                let phase = obj
+                let vmi_state = obj
                     .metadata
                     .name
                     .as_deref()
                     .and_then(|name| vmi_phases.get(name))
-                    .cloned();
+                    .cloned()
+                    .unwrap_or((None, None));
                 let supervisor_failure =
                     kubevirt_supervisor_failure(&self.client, &namespace, &obj).await;
                 let fence_restored = obj
@@ -2820,9 +2821,10 @@ impl KubernetesComputeDriver {
                 if let Ok((_, sandbox)) = crate::kubevirt::sandbox_from_vm_object_with_runtime(
                     &namespace,
                     obj,
-                    phase.as_deref(),
+                    vmi_state.0.as_deref(),
                     supervisor_failure.as_deref(),
                     fence_restored.as_deref(),
+                    vmi_state.1,
                 ) {
                     sandboxes.push(sandbox);
                 }
@@ -5150,6 +5152,40 @@ impl KubernetesComputeDriver {
         agent_uid: u32,
         agent_gid: u32,
     ) -> Result<String, KubernetesDriverError> {
+        self.ensure_kubevirt_supervisor_networking(sandbox_id, namespace, names, owner.clone())
+            .await?;
+        // The gated supervisor Pod, created before the bootstrap Secret so
+        // its UID can be claimed; it stays scheduled-gated until the fence,
+        // bootstrap Secret, and workload config are in place.
+        let staged = self.read_staged_bootstrap_material().await?;
+        self.create_sandbox_runtime_supervisor(
+            namespace,
+            names,
+            sandbox_id,
+            sandbox_name,
+            owner,
+            agent_uid,
+            agent_gid,
+            main_process_spec,
+            log_level,
+            staged.upstream_proxy_ca_bundle.is_some(),
+        )
+        .await
+    }
+
+    /// Ensure the dedicated generation's network objects: the per-sandbox
+    /// Service the guest's boundary dials, the namespace-wide supervisor
+    /// egress policy, and the pair-scoped control policy. Idempotent
+    /// (create-or-validate), so start re-creates a Service that was
+    /// deleted under a running sandbox instead of failing every later
+    /// start with a `NotFound` boundary Service.
+    async fn ensure_kubevirt_supervisor_networking(
+        &self,
+        sandbox_id: &str,
+        namespace: &str,
+        names: &SandboxRuntimeNames,
+        owner: OwnerReference,
+    ) -> Result<(), KubernetesDriverError> {
         // The per-sandbox Service the guest's boundary dials (the pod
         // path's runtime-initiated supervisor Service, selecting this
         // sandbox's supervisor Pod).
@@ -5172,27 +5208,9 @@ impl KubernetesComputeDriver {
         // The pair-scoped control policy: workload-to-supervisor ingress
         // and egress on the boundary port. Its UID is not claimed (the
         // fence evidence stays the virt-launcher NetworkPolicy).
-        self.ensure_sandbox_runtime_control_policy(namespace, names, sandbox_id, owner.clone())
+        self.ensure_sandbox_runtime_control_policy(namespace, names, sandbox_id, owner)
             .await?;
-        // The gated supervisor Pod, created before the bootstrap Secret so
-        // its UID can be claimed; it stays scheduled-gated until the fence,
-        // bootstrap Secret, and workload config are in place.
-        let staged = self.read_staged_bootstrap_material().await?;
-        let pod_uid = self
-            .create_sandbox_runtime_supervisor(
-                namespace,
-                names,
-                sandbox_id,
-                sandbox_name,
-                owner,
-                agent_uid,
-                agent_gid,
-                main_process_spec,
-                log_level,
-                staged.upstream_proxy_ca_bundle.is_some(),
-            )
-            .await?;
-        Ok(pod_uid)
+        Ok(())
     }
 
     /// Create or validate the namespace-wide supervisor egress policy (the
@@ -5527,9 +5545,10 @@ impl KubernetesComputeDriver {
         let Some(vm) = list.items.into_iter().next() else {
             return Ok(None);
         };
-        let vmi_phase = self
-            .kubevirt_vmi_phase(&namespace, vm.metadata.name.as_deref().unwrap_or_default())
-            .await;
+        let vmi_state = self
+            .kubevirt_vmi_state(&namespace, vm.metadata.name.as_deref().unwrap_or_default())
+            .await
+            .unwrap_or((None, None));
         let supervisor_failure = kubevirt_supervisor_failure(&self.client, &namespace, &vm).await;
         let fence_restored = vm
             .metadata
@@ -5540,9 +5559,10 @@ impl KubernetesComputeDriver {
         Ok(crate::kubevirt::sandbox_from_vm_object_with_runtime(
             &namespace,
             vm,
-            vmi_phase.as_deref(),
+            vmi_state.0.as_deref(),
             supervisor_failure.as_deref(),
             fence_restored.as_deref(),
+            vmi_state.1,
         )
         .ok()
         .map(|(_, sandbox)| sandbox))
@@ -5551,16 +5571,29 @@ impl KubernetesComputeDriver {
     /// Phase of the paired `VirtualMachineInstance` (same name as the VM),
     /// when it exists. `None` covers both a missing and an unreadable VMI.
     async fn kubevirt_vmi_phase(&self, namespace: &str, kube_name: &str) -> Option<String> {
+        self.kubevirt_vmi_state(namespace, kube_name).await?.0
+    }
+
+    /// The paired VMI's phase and its not-ready-since time (Unix ms, from
+    /// the `Ready` condition's `lastTransitionTime` — used by the snapshot's
+    /// image-pull-backoff terminal rule, L4).
+    async fn kubevirt_vmi_state(
+        &self,
+        namespace: &str,
+        kube_name: &str,
+    ) -> Option<(Option<String>, Option<i64>)> {
         let api = crate::kubevirt::virtual_machine_instance_api(&self.client, namespace);
         let vmi = tokio::time::timeout(KUBE_API_TIMEOUT, api.get(kube_name))
             .await
             .ok()?
             .ok()?;
-        vmi.data
+        let phase = vmi
+            .data
             .get("status")
             .and_then(|status| status.get("phase"))
             .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
+            .map(str::to_string);
+        Some((phase, crate::kubevirt::vmi_not_ready_since_ms(&vmi)))
     }
 
     /// Map of VM name -> VMI phase for all driver-owned VMIs matching
@@ -5569,7 +5602,7 @@ impl KubernetesComputeDriver {
         &self,
         namespace: &str,
         selector: &str,
-    ) -> std::collections::HashMap<String, String> {
+    ) -> std::collections::HashMap<String, (Option<String>, Option<i64>)> {
         let api = crate::kubevirt::virtual_machine_instance_api(&self.client, namespace);
         let Ok(list) = tokio::time::timeout(
             KUBE_API_TIMEOUT,
@@ -5585,14 +5618,15 @@ impl KubernetesComputeDriver {
         list.items
             .into_iter()
             .filter_map(|vmi| {
+                let not_ready_since = crate::kubevirt::vmi_not_ready_since_ms(&vmi);
                 let name = vmi.metadata.name?;
                 let phase = vmi
                     .data
-                    .get("status")?
-                    .get("phase")
+                    .get("status")
+                    .and_then(|status| status.get("phase"))
                     .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)?;
-                Some((name, phase))
+                    .map(str::to_string);
+                Some((name, (phase, not_ready_since)))
             })
             .collect()
     }
@@ -5743,7 +5777,19 @@ impl KubernetesComputeDriver {
             SupervisorPlacement::Dedicated => {
                 // The dedicated generation's Service and selector are
                 // stable across generations; the supervisor Pod UID is
-                // bound after the new Pod exists, below.
+                // bound after the new Pod exists, below. A Service deleted
+                // out of band (under a running sandbox) is re-created here
+                // — create-or-validate — so the start does not wedge on a
+                // NotFound boundary Service.
+                let owner = crate::sandbox_runtime::sandbox_owner_reference(
+                    "VirtualMachine",
+                    &kube_name,
+                    &vm_uid,
+                    "kubevirt.io/v1",
+                    false,
+                );
+                self.ensure_kubevirt_supervisor_networking(sandbox_id, &namespace, &names, owner)
+                    .await?;
                 self.resolve_dedicated_kubevirt_target(&namespace, &names, sandbox_id, "")
                     .await
                     .map_err(KubernetesDriverError::Precondition)?
@@ -6345,14 +6391,14 @@ impl KubernetesComputeDriver {
             async fn emit(
                 vm: DynamicObject,
                 namespace: &str,
-                vmi_phases: &std::collections::HashMap<String, String>,
+                vmi_phases: &std::collections::HashMap<String, (Option<String>, Option<i64>)>,
                 client: &Client,
                 tx: &mpsc::Sender<Result<WatchSandboxesEvent, KubernetesDriverError>>,
             ) -> bool {
                 let Some(kube_name) = vm.metadata.name.clone() else {
                     return true;
                 };
-                let phase = vmi_phases.get(&kube_name).cloned();
+                let vmi_state = vmi_phases.get(&kube_name).cloned().unwrap_or((None, None));
                 // Enrich the snapshot with the dedicated supervisor Pod's
                 // health (M2) and the fence-restored marker (M1).
                 let supervisor_failure = kubevirt_supervisor_failure(client, namespace, &vm).await;
@@ -6365,9 +6411,10 @@ impl KubernetesComputeDriver {
                 let Ok((_, sandbox)) = crate::kubevirt::sandbox_from_vm_object_with_runtime(
                     namespace,
                     vm,
-                    phase.as_deref(),
+                    vmi_state.0.as_deref(),
                     supervisor_failure.as_deref(),
                     fence_restored.as_deref(),
+                    vmi_state.1,
                 ) else {
                     return true;
                 };
@@ -6383,7 +6430,7 @@ impl KubernetesComputeDriver {
 
             // VM name -> current VMI phase, maintained by the instance
             // stream.
-            let mut vmi_phases: std::collections::HashMap<String, String> =
+            let mut vmi_phases: std::collections::HashMap<String, (Option<String>, Option<i64>)> =
                 std::collections::HashMap::new();
 
             loop {
@@ -6426,15 +6473,15 @@ impl KubernetesComputeDriver {
                                 if is_delete {
                                     vmi_phases.remove(&name);
                                 } else {
-                                    let phase = obj
-                                        .data
-                                        .get("status")
-                                        .and_then(|status| status.get("phase"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(str::to_string);
-                                    if let Some(phase) = phase {
-                                        vmi_phases.insert(name, phase);
-                                    }
+                                    let state = (
+                                        obj.data
+                                            .get("status")
+                                            .and_then(|status| status.get("phase"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .map(str::to_string),
+                                        crate::kubevirt::vmi_not_ready_since_ms(&obj),
+                                    );
+                                    vmi_phases.insert(name, state);
                                 }
                             }
                             // Re-emit the paired VM snapshot with the new

@@ -56,7 +56,7 @@ BRIDGE_IP="$(docker network inspect "k3d-${CLUSTER}" \
     -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
 if [ -z "${BRIDGE_IP}" ]; then
     BRIDGE_IP="$(podman network inspect "k3d-${CLUSTER}" \
-        -f '{{(index .subnets 0).gateway}}' 2>/dev/null || true)"
+        -f '{{(index .Subnets 0).Gateway}}' 2>/dev/null || true)"
 fi
 [ -n "${BRIDGE_IP}" ] || { echo "could not resolve the k3d-${CLUSTER} bridge gateway IP" >&2; exit 1; }
 GRPC_ENDPOINT="https://${BRIDGE_IP}:${PORT}"
