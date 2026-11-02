@@ -91,38 +91,15 @@ pub const REASON_CREATE_TIMED_OUT: &str = "CreateTimedOut";
 /// stays transient: a slow registry can legitimately back off once.
 pub const IMAGE_PULL_BACKOFF_TERMINAL_AFTER_MS: i64 = 2 * 60 * 1000;
 
-/// Minimal parser for the Kubernetes RFC 3339 timestamp format
-/// (`YYYY-MM-DDTHH:MM:SS(.sss)?Z`, always UTC) to Unix milliseconds.
+/// Parse the Kubernetes RFC 3339 timestamp format to Unix milliseconds,
+/// through `k8s-openapi`'s `Time` (already a dependency — the same
+/// deserializer the API types use).
 fn rfc3339_to_unix_ms(value: &str) -> Option<i64> {
-    let bytes = value.as_bytes();
-    if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
-        return None;
-    }
-    let num = |range: std::ops::Range<usize>| -> Option<i64> {
-        std::str::from_utf8(&bytes[range]).ok()?.parse().ok()
-    };
-    let year = num(0..4)?;
-    let month = num(5..7)?;
-    let day = num(8..10)?;
-    let hour = num(11..13)?;
-    let minute = num(14..16)?;
-    let second = num(17..19)?;
-    let mut millis = 0;
-    if bytes.len() > 20 && bytes[19] == b'.' {
-        let fraction: String = value[20..].trim_end_matches('Z').chars().take(3).collect();
-        if !fraction.is_empty() {
-            millis = fraction.parse().ok()?;
-        }
-    }
-    // Days from the civil date (Howard Hinnant's algorithm).
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let month_prime = (month + 9) % 12;
-    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days = era * 146_097 + day_of_era - 719_468;
-    Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000 + millis)
+    serde_json::from_value::<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>(
+        serde_json::Value::String(value.to_string()),
+    )
+    .ok()
+    .map(|time| time.0.timestamp_millis())
 }
 
 /// The VMI's not-ready-since time in Unix milliseconds, from its `Ready`
