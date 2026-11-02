@@ -1160,6 +1160,19 @@ async fn kubevirt_supervisor_failure(
     if !matches!(supervisor_placement(vm), Ok(SupervisorPlacement::Dedicated)) {
         return None;
     }
+    // Only a started VM can have a lost supervisor: during the create's
+    // Halted window (and while it is still gated) the Pod legitimately does
+    // not exist yet, and a stopped sandbox's stop deletes the Pod by
+    // design.
+    let halted = vm
+        .data
+        .get("spec")
+        .and_then(|spec| spec.get("runStrategy"))
+        .and_then(serde_json::Value::as_str)
+        == Some("Halted");
+    if halted {
+        return None;
+    }
     let sandbox_id = sandbox_id_from_object(vm).ok()?;
     let names = SandboxRuntimeNames::new(&sandbox_id);
     let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
