@@ -275,10 +275,21 @@ echo "fence check: launcher pod -> 1.1.1.1:443 refused (Connection refused)"
 # awaits its boundary, not an s_client), so success is judged ONLY by the
 # absence of "Connection refused" — the previous `&&` formulation could
 # never fail because a refused connect fails the exec and short-circuits.
-kubectl exec -n "${SANDBOX_NAMESPACE}" "${LAUNCHER}" -c compute -- \
-    timeout 8 openssl s_client -connect "${SUPERVISOR_IP}:5500" \
-    > ${WORKDIR}/fence-control.log 2>&1 || true
-if grep -q "Connection refused" ${WORKDIR}/fence-control.log; then
+# A fresh ClusterIP's first new connections can race the endpoint
+# programming and be refused once; retry briefly before declaring the
+# fence too narrow.
+CONTROL_OK=1
+for _ in 1 2 3 4 5; do
+    kubectl exec -n "${SANDBOX_NAMESPACE}" "${LAUNCHER}" -c compute -- \
+        timeout 8 openssl s_client -connect "${SUPERVISOR_IP}:5500" \
+        > ${WORKDIR}/fence-control.log 2>&1 || true
+    if ! grep -q "Connection refused" ${WORKDIR}/fence-control.log; then
+        CONTROL_OK=0
+        break
+    fi
+    sleep 3
+done
+if [ "${CONTROL_OK}" != "0" ]; then
     cat ${WORKDIR}/fence-control.log >&2
     fail "launcher pod -> supervisor Service connect was refused (fence too narrow?)"
 fi
