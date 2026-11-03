@@ -1129,7 +1129,12 @@ impl KubernetesComputeDriver {
                 bytes::Bytes,
             >::new()))
         });
-        let client = Client::new(service, "default");
+        Self::with_test_client(Client::new(service, "default"), config)
+    }
+
+    /// A driver whose API traffic goes to `client`, for scripted tests.
+    #[cfg(test)]
+    pub(crate) fn with_test_client(client: Client, config: KubernetesComputeConfig) -> Self {
         Self {
             client: client.clone(),
             watch_client: client,

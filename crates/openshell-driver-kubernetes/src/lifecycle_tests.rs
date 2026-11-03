@@ -322,3 +322,425 @@ mod lifecycle_reconciliation {
         ));
     }
 }
+
+/// Golden request sequences for each branch of the per-sandbox runtime
+/// reconcile. These pin the observable Kubernetes API traffic so the body can
+/// be refactored and shared with the `NetworkPolicy` guard without changing what
+/// the 30-second pass does.
+mod reconcile_request_sequences {
+    use super::*;
+
+    pub(super) const NS: &str = "openshell";
+    pub(super) const CR_PATH: &str = "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr";
+    pub(super) const LIST_PATH: &str = "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes";
+    pub(super) const WORKLOAD_FENCE_PATH: &str =
+        "/apis/networking.k8s.io/v1/namespaces/openshell/networkpolicies/openshell-sandbox-workloads";
+    pub(super) const SUPERVISOR_FENCE_PATH: &str =
+        "/apis/networking.k8s.io/v1/namespaces/openshell/networkpolicies/openshell-sandbox-supervisors";
+    pub(super) const POLICIES_PATH: &str =
+        "/apis/networking.k8s.io/v1/namespaces/openshell/networkpolicies";
+
+    pub(super) type Recorded = (http::Method, String, Option<serde_json::Value>);
+    type Routes = std::collections::HashMap<(http::Method, String), VecDeque<(u16, serde_json::Value)>>;
+
+    /// A fake API server holding a small object world. Reads of unknown paths
+    /// return 404; writes must be scripted, so an unexpected write fails the
+    /// test. Every request is recorded with its decoded body.
+    #[derive(Clone, Default)]
+    pub(super) struct World {
+        routes: Arc<std::sync::Mutex<Routes>>,
+        pub(super) log: Arc<std::sync::Mutex<Vec<Recorded>>>,
+    }
+
+    impl World {
+        /// Answer `method path` with `status body`. Several answers for one
+        /// route are served in order; the last one repeats.
+        pub(super) fn on(&self, method: http::Method, path: &str, status: u16, body: serde_json::Value) -> &Self {
+            self.routes
+                .lock()
+                .unwrap()
+                .entry((method, path.to_string()))
+                .or_default()
+                .push_back((status, body));
+            self
+        }
+
+        pub(super) fn requests(&self) -> Vec<String> {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(method, path, _)| format!("{method} {path}"))
+                .collect()
+        }
+
+        pub(super) fn bodies(&self, method: &http::Method, path: &str) -> Vec<serde_json::Value> {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, p, _)| m == method && p == path)
+                .filter_map(|(_, _, body)| body.clone())
+                .collect()
+        }
+
+        pub(super) fn driver(&self, config: KubernetesComputeConfig) -> KubernetesComputeDriver {
+            use http_body_util::BodyExt as _;
+            let world = self.clone();
+            let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                let world = world.clone();
+                async move {
+                    let method = request.method().clone();
+                    let path = request.uri().path().to_string();
+                    let body = request.into_body().collect().await.unwrap().to_bytes();
+                    let body = (!body.is_empty()).then(|| serde_json::from_slice(&body).unwrap());
+                    world.log.lock().unwrap().push((method.clone(), path.clone(), body));
+                    let answer = {
+                        let mut routes = world.routes.lock().unwrap();
+                        routes.get_mut(&(method.clone(), path.clone())).and_then(|queue| {
+                            if queue.len() > 1 { queue.pop_front() } else { queue.front().cloned() }
+                        })
+                    };
+                    let (status, body) = answer.unwrap_or_else(|| {
+                        assert!(
+                            method == http::Method::GET || method == http::Method::DELETE,
+                            "unexpected write {method} {path}"
+                        );
+                        (404, not_found_status())
+                    });
+                    Ok::<_, std::convert::Infallible>(kube_test_response(
+                        http::StatusCode::from_u16(status).unwrap(),
+                        body,
+                    ))
+                }
+            });
+            let client = Client::new(service, NS);
+            let driver = KubernetesComputeDriver::with_test_client(client, config);
+            driver.sandbox_api_version.set(SANDBOX_VERSION_V1BETA1).unwrap();
+            driver
+        }
+    }
+
+    pub(super) fn not_found_status() -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1", "kind": "Status", "status": "Failure",
+            "message": "not found", "reason": "NotFound", "code": 404
+        })
+    }
+
+    /// A sandbox CR whose stored generation binds the namespace fence with
+    /// UID `fence-uid` at generation 1.
+    pub(super) fn sandbox(running: bool) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1", "kind": "Sandbox",
+            "metadata": {
+                "name": "sandbox-cr", "namespace": NS, "uid": "cr-uid", "resourceVersion": "42",
+                "labels": {LABEL_SANDBOX_ID: "sandbox-1", LABEL_SANDBOX_WORKSPACE: "team-a",
+                    LABEL_MANAGED_BY: LABEL_MANAGED_BY_VALUE},
+                "annotations": {
+                    crate::resource_admission::CONFIG_USED: "false",
+                    crate::resource_admission::IDENTITIES: "{}",
+                    ANNOTATION_SANDBOX_RUNTIME_READINESS: if running { "ready" } else { "unavailable" },
+                    ANNOTATION_SANDBOX_RUNTIME_GENERATION: "gen2",
+                    ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: "workload-uid",
+                    ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: "supervisor-uid",
+                    ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: "fence-uid",
+                    ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: "1"
+                }
+            },
+            "spec": {
+                "operatingMode": if running { "Running" } else { "Suspended" },
+                "podTemplate": {"spec": {
+                    "automountServiceAccountToken": false,
+                    "volumes": [{"name": SANDBOX_BOOTSTRAP_VOLUME_NAME,
+                        "secret": {"secretName": "os-sandbox-sandbox-1-gen2"}}]
+                }}
+            }
+        })
+    }
+
+    pub(super) fn sandbox_list(items: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({"apiVersion": "agents.x-k8s.io/v1beta1", "kind": "SandboxList", "items": items})
+    }
+
+    /// The two namespace fences as the API server stores them.
+    pub(super) fn stored_fences() -> (NetworkPolicy, NetworkPolicy) {
+        let mut fence = workload_fence(NS, &SandboxRuntimeNames::new("sandbox-1"), 5500);
+        for (policy, component, uid) in [
+            (&mut fence.workload_policy, "sandbox-workload-fence", "fence-uid"),
+            (&mut fence.supervisor_policy, "sandbox-supervisor-egress", "supervisor-fence-uid"),
+        ] {
+            policy.metadata.labels.get_or_insert_default().extend([
+                (LABEL_MANAGED_BY.to_string(), LABEL_MANAGED_BY_VALUE.to_string()),
+                ("openshell.ai/component".to_string(), component.to_string()),
+            ]);
+            policy.metadata.uid = Some(uid.to_string());
+            policy.metadata.generation = Some(1);
+            policy.metadata.resource_version = Some("100".to_string());
+        }
+        (fence.workload_policy, fence.supervisor_policy)
+    }
+
+    pub(super) fn world_with(sandbox: serde_json::Value) -> World {
+        let world = World::default();
+        let (workload, supervisor) = stored_fences();
+        world
+            .on(http::Method::GET, LIST_PATH, 200, sandbox_list(vec![sandbox.clone()]))
+            .on(http::Method::GET, CR_PATH, 200, sandbox)
+            .on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(workload).unwrap())
+            .on(http::Method::GET, SUPERVISOR_FENCE_PATH, 200, serde_json::to_value(supervisor).unwrap());
+        world
+    }
+
+    fn running_pods(world: &World) {
+        world
+            .on(http::Method::GET, "/api/v1/namespaces/openshell/services/os-boundary-sandbox-1", 200, serde_json::json!({
+                "apiVersion": "v1", "kind": "Service", "metadata": {"name": "os-boundary-sandbox-1"},
+                "spec": {"selector": {BOUNDARY_PAIR_LABEL: "sandbox-1", BOUNDARY_ROLE_LABEL: "workload"}}
+            }))
+            .on(http::Method::GET, "/api/v1/namespaces/openshell/pods/sandbox-cr", 200, serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "sandbox-cr", "uid": "workload-uid"},
+                "spec": {"containers": []}, "status": {"phase": "Running"}
+            }))
+            .on(http::Method::GET, "/api/v1/namespaces/openshell/pods/os-supervisor-sandbox-1", 200, serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "os-supervisor-sandbox-1", "uid": "supervisor-uid"},
+                "spec": {"containers": []},
+                "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]}
+            }));
+    }
+
+    fn suspended(world: &World) -> bool {
+        world.bodies(&http::Method::PATCH, CR_PATH).iter().any(|body| {
+            body["spec"]["operatingMode"] == "Suspended"
+                && body["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE]
+                    == SandboxRuntimeBootstrapPhase::Suspending.as_str()
+        })
+    }
+
+    fn get(path: &str) -> String {
+        format!("GET {path}")
+    }
+    fn patch(path: &str) -> String {
+        format!("PATCH {path}")
+    }
+
+    #[tokio::test]
+    async fn refresh_not_found_stops_before_any_dependency_read() {
+        let world = world_with(sandbox(true));
+        world.on(http::Method::GET, CR_PATH, 404, not_found_status());
+        world.routes.lock().unwrap().get_mut(&(http::Method::GET, CR_PATH.to_string())).unwrap().pop_front();
+        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        assert_eq!(world.requests(), [get(LIST_PATH), get(CR_PATH)]);
+    }
+
+    #[tokio::test]
+    async fn admission_precondition_suspends_without_reading_fences() {
+        let mut object = sandbox(true);
+        object["metadata"]["annotations"]
+            .as_object_mut()
+            .unwrap()
+            .remove(crate::resource_admission::IDENTITIES);
+        let world = world_with(object);
+        world.on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        assert_eq!(world.requests(), [get(LIST_PATH), get(CR_PATH), patch(CR_PATH)]);
+        assert!(suspended(&world));
+    }
+
+    #[tokio::test]
+    async fn altered_workload_fence_suspends() {
+        let world = world_with(sandbox(true));
+        let (mut workload, _) = stored_fences();
+        workload.spec.as_mut().unwrap().egress = Some(vec![k8s_openapi::api::networking::v1::NetworkPolicyEgressRule::default()]);
+        world.routes.lock().unwrap().remove(&(http::Method::GET, WORKLOAD_FENCE_PATH.to_string()));
+        world
+            .on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(workload).unwrap())
+            .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        assert_eq!(
+            world.requests(),
+            [get(LIST_PATH), get(CR_PATH), get(WORKLOAD_FENCE_PATH), patch(CR_PATH)]
+        );
+        assert!(suspended(&world));
+    }
+
+    #[tokio::test]
+    async fn label_stripped_workload_fence_suspends_today() {
+        let world = world_with(sandbox(true));
+        let (mut workload, _) = stored_fences();
+        workload.metadata.labels = None;
+        world.routes.lock().unwrap().remove(&(http::Method::GET, WORKLOAD_FENCE_PATH.to_string()));
+        world
+            .on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(workload).unwrap())
+            .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        assert_eq!(
+            world.requests(),
+            [get(LIST_PATH), get(CR_PATH), get(WORKLOAD_FENCE_PATH), patch(CR_PATH)]
+        );
+        assert!(suspended(&world));
+    }
+
+    #[tokio::test]
+    async fn missing_workload_fence_is_created_then_generation_mismatch_suspends() {
+        let world = world_with(sandbox(true));
+        let (mut workload, _) = stored_fences();
+        workload.metadata.uid = Some("recreated-uid".to_string());
+        world.routes.lock().unwrap().remove(&(http::Method::GET, WORKLOAD_FENCE_PATH.to_string()));
+        world
+            .on(http::Method::GET, WORKLOAD_FENCE_PATH, 404, not_found_status())
+            .on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(&workload).unwrap())
+            .on(http::Method::POST, POLICIES_PATH, 201, serde_json::to_value(&workload).unwrap())
+            .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        assert_eq!(
+            world.requests(),
+            [
+                get(LIST_PATH),
+                get(CR_PATH),
+                get(WORKLOAD_FENCE_PATH),
+                format!("POST {POLICIES_PATH}"),
+                get(SUPERVISOR_FENCE_PATH),
+                get(WORKLOAD_FENCE_PATH),
+                patch(CR_PATH),
+            ]
+        );
+        assert!(suspended(&world));
+    }
+
+    #[tokio::test]
+    async fn fence_generation_change_suspends_a_running_generation() {
+        let world = world_with(sandbox(true));
+        let (mut workload, _) = stored_fences();
+        workload.metadata.generation = Some(2);
+        world.routes.lock().unwrap().remove(&(http::Method::GET, WORKLOAD_FENCE_PATH.to_string()));
+        world
+            .on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(workload).unwrap())
+            .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        assert_eq!(
+            world.requests(),
+            [
+                get(LIST_PATH),
+                get(CR_PATH),
+                get(WORKLOAD_FENCE_PATH),
+                get(SUPERVISOR_FENCE_PATH),
+                get(WORKLOAD_FENCE_PATH),
+                patch(CR_PATH),
+            ]
+        );
+        assert!(suspended(&world));
+    }
+
+    #[tokio::test]
+    async fn fence_generation_change_leaves_a_stopped_sandbox_alone() {
+        let world = world_with(sandbox(false));
+        let (mut workload, _) = stored_fences();
+        workload.metadata.generation = Some(2);
+        world.routes.lock().unwrap().remove(&(http::Method::GET, WORKLOAD_FENCE_PATH.to_string()));
+        world.on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(workload).unwrap());
+        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        assert!(!suspended(&world), "{:#?}", world.requests());
+    }
+
+    #[tokio::test]
+    async fn missing_boundary_service_suspends_a_running_generation() {
+        let world = world_with(sandbox(true));
+        world.on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        assert_eq!(
+            world.requests(),
+            [
+                get(LIST_PATH),
+                get(CR_PATH),
+                get(WORKLOAD_FENCE_PATH),
+                get(SUPERVISOR_FENCE_PATH),
+                get(WORKLOAD_FENCE_PATH),
+                get("/api/v1/namespaces/openshell/services/os-boundary-sandbox-1"),
+                patch(CR_PATH),
+            ]
+        );
+        assert!(suspended(&world));
+    }
+
+    #[tokio::test]
+    async fn healthy_running_generation_is_only_read() {
+        let world = world_with(sandbox(true));
+        running_pods(&world);
+        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        let boundary = "/api/v1/namespaces/openshell/services/os-boundary-sandbox-1";
+        let supervisor = "/api/v1/namespaces/openshell/pods/os-supervisor-sandbox-1";
+        assert_eq!(
+            world.requests(),
+            [
+                get(LIST_PATH),
+                get(CR_PATH),
+                get(WORKLOAD_FENCE_PATH),
+                get(SUPERVISOR_FENCE_PATH),
+                get(WORKLOAD_FENCE_PATH),
+                get(boundary),
+                get("/api/v1/namespaces/openshell/pods/sandbox-cr"),
+                get(supervisor),
+                get(supervisor),
+                get(boundary),
+                get(WORKLOAD_FENCE_PATH),
+                get(SUPERVISOR_FENCE_PATH),
+                get(supervisor),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_runtime_control_policy_suspends() {
+        let mut object = sandbox(true);
+        let annotations = &mut object["metadata"]["annotations"];
+        annotations[ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION] = serde_json::json!("runtime-initiated");
+        annotations[ANNOTATION_SANDBOX_RUNTIME_CONTROL_GENERATION] = serde_json::json!("gen2");
+        annotations[ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_UID] = serde_json::json!("control-uid");
+        annotations[ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_GENERATION] = serde_json::json!("1");
+        let world = world_with(object);
+        world
+            .on(http::Method::GET, "/api/v1/namespaces/openshell/services/os-supervisor-sandbox-1", 200, serde_json::json!({
+                "apiVersion": "v1", "kind": "Service", "metadata": {"name": "os-supervisor-sandbox-1"},
+                "spec": {"selector": {BOUNDARY_PAIR_LABEL: "sandbox-1", BOUNDARY_ROLE_LABEL: "supervisor"},
+                    "publishNotReadyAddresses": true}
+            }))
+            .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        assert_eq!(
+            world.requests()[5..],
+            [
+                get("/api/v1/namespaces/openshell/services/os-supervisor-sandbox-1"),
+                get("/apis/networking.k8s.io/v1/namespaces/openshell/networkpolicies/os-control-sandbox-1"),
+                patch(CR_PATH),
+            ]
+        );
+        assert!(suspended(&world));
+    }
+
+    #[tokio::test]
+    async fn releasing_sandbox_runs_only_the_release_path() {
+        let mut object = sandbox(false);
+        let annotations = &mut object["metadata"]["annotations"];
+        annotations[ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING] = serde_json::json!("true");
+        annotations[ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION] = serde_json::json!("stop");
+        annotations[ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE] =
+            serde_json::json!(SandboxRuntimeBootstrapPhase::Releasing.as_str());
+        let world = world_with(object);
+        world.on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        let requests = world.requests();
+        assert!(!requests.iter().any(|r| r.contains("networkpolicies")), "{requests:#?}");
+        assert_eq!(requests.last().unwrap(), &patch(CR_PATH));
+        assert!(suspended(&world));
+    }
+
+    #[tokio::test]
+    async fn busy_gate_skips_the_sandbox_after_listing() {
+        let world = world_with(sandbox(true));
+        let driver = world.driver(KubernetesComputeConfig::default());
+        let _held = driver.lifecycle_gates.gate_for("sandbox-1").lock_owned().await;
+        driver.reconcile_sandbox_runtime_resources().await;
+        assert_eq!(world.requests(), [get(LIST_PATH)]);
+    }
+}
