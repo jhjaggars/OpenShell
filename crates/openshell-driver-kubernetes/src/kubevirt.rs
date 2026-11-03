@@ -141,13 +141,32 @@ pub fn guest_image_digest(
     let Some(init_statuses) = status.init_container_statuses.as_ref() else {
         return GuestImageDigest::Absent;
     };
-    for container in init_statuses
-        .iter()
-        // Match the container running the VM's guest image reference
-        // (containerd may normalize the tag, so compare loosely: the
-        // repository and tag must match).
-        .filter(|container| image_ref_matches(&container.image, guest_image))
-    {
+    // Match by the POD SPEC's init container image — exactly what KubeVirt
+    // rendered from the VM spec — not the status `.image`: the CRI may
+    // report the status image under a DIFFERENT name the node knows the
+    // same digest as (e.g. a side-loaded copy of a registry-pulled tag),
+    // and matching on the status reference silently skips the pin.
+    let spec_images: std::collections::HashMap<&str, &str> = launcher_pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.init_containers.as_ref())
+        .map(|containers| {
+            containers
+                .iter()
+                .map(|container| {
+                    (
+                        container.name.as_str(),
+                        container.image.as_deref().unwrap_or(""),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for container in init_statuses.iter().filter(|container| {
+        spec_images
+            .get(container.name.as_str())
+            .is_some_and(|spec_image| image_ref_matches(spec_image, guest_image))
+    }) {
         let image_id = container.image_id.as_str();
         if image_id.is_empty() {
             continue;
@@ -1589,9 +1608,12 @@ mod kubevirt_review_tests {
 
     #[test]
     fn guest_image_digest_classifies_launcher_init_containers() {
-        use k8s_openapi::api::core::v1::{ContainerStatus, Pod, PodStatus};
+        use k8s_openapi::api::core::v1::{Container, ContainerStatus, Pod, PodSpec, PodStatus};
         const GUEST: &str = "kvpoc/openshell-sandbox-vm:dev";
-        let pod = |statuses: &[(&str, &str, &str)]| {
+        // statuses: (name, status image, imageID); specs: the pod spec's
+        // init container image references (what KubeVirt rendered from the
+        // VM spec — the selection key).
+        let pod = |statuses: &[(&str, &str, &str)], specs: &[(&str, &str)]| {
             let status = PodStatus {
                 init_container_statuses: Some(
                     statuses
@@ -1606,14 +1628,34 @@ mod kubevirt_review_tests {
                 ),
                 ..PodStatus::default()
             };
+            let spec = PodSpec {
+                init_containers: Some(
+                    specs
+                        .iter()
+                        .map(|(name, image)| Container {
+                            name: name.to_string(),
+                            image: Some(image.to_string()),
+                            ..Container::default()
+                        })
+                        .collect(),
+                ),
+                ..PodSpec::default()
+            };
             Pod {
                 status: Some(status),
+                spec: Some(spec),
                 ..Pod::default()
             }
         };
         // The launcher runs other init containers (guest-console-log) on
         // the VIRT-LAUNCHER image whose digest must never be pinned: the
-        // status is matched by the VM's guest image reference.
+        // status is matched by the POD SPEC image (what KubeVirt rendered
+        // from the VM spec), keyed by container name.
+        let spec = [
+            ("guest-console-log", "quay.io/kubevirt/virt-launcher:v1.9.1"),
+            ("volumerootdisk", GUEST),
+            ("volumekernel-boot-volume", GUEST),
+        ];
         let launcher_statuses = [
             (
                 "guest-console-log",
@@ -1632,9 +1674,36 @@ mod kubevirt_review_tests {
             ),
         ];
         assert_eq!(
-            guest_image_digest(&pod(&launcher_statuses), GUEST),
+            guest_image_digest(&pod(&launcher_statuses, &spec), GUEST),
             GuestImageDigest::Patch(
                 "docker.io/kvpoc/openshell-sandbox-vm@sha256:5a58c279".to_string()
+            )
+        );
+        // The node knows the same digest under ANOTHER name (a side-loaded
+        // copy of the registry tag): the status .image disagrees with the
+        // VM spec, but the POD SPEC image — the selection key — matches,
+        // so the pin still resolves.
+        let renamed = [
+            (
+                "guest-console-log",
+                "quay.io/kubevirt/virt-launcher:v1.9.1",
+                "quay.io/kubevirt/virt-launcher@sha256:53e6d121",
+            ),
+            (
+                "volumerootdisk",
+                "docker.io/kvreview/openshell-sandbox-vm:dev",
+                "k3d-kvreview-registry:5050/openshell-sandbox-vm@sha256:fe7f1fae",
+            ),
+            (
+                "volumekernel-boot-volume",
+                "docker.io/kvreview/openshell-sandbox-vm:dev",
+                "k3d-kvreview-registry:5050/openshell-sandbox-vm@sha256:fe7f1fae",
+            ),
+        ];
+        assert_eq!(
+            guest_image_digest(&pod(&renamed, &spec), GUEST),
+            GuestImageDigest::Patch(
+                "k3d-kvreview-registry:5050/openshell-sandbox-vm@sha256:fe7f1fae".to_string()
             )
         );
         // Side-loaded (k3d/ctr import): a bare config digest, no
@@ -1652,7 +1721,7 @@ mod kubevirt_review_tests {
             ),
         ];
         assert_eq!(
-            guest_image_digest(&pod(&side_loaded), GUEST),
+            guest_image_digest(&pod(&side_loaded, &spec), GUEST),
             GuestImageDigest::SideLoaded
         );
         // Nothing observed yet (no statuses, or none matching the guest
@@ -1667,7 +1736,7 @@ mod kubevirt_review_tests {
             "",
         )];
         assert_eq!(
-            guest_image_digest(&pod(&empty), GUEST),
+            guest_image_digest(&pod(&empty, &spec), GUEST),
             GuestImageDigest::Absent
         );
         // Reference normalization: containerd's docker.io/library form

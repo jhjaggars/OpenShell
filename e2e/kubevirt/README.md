@@ -197,12 +197,17 @@ OPENSHELL_KVPOC_TOPOLOGY=gateway e2e/kubevirt/demo.sh --demo
 #     ServiceAccount and Roles for the kubevirt runtime, mint a kubeconfig
 #     from the gateway ServiceAccount token, and run the gateway on it
 #     (the demo's own kubectl scaffolding keeps the ambient KUBECONFIG):
+# The serviceaccount template renders the gateway SA first (namespace-less)
+# and then the sandbox SA (pinned to the sandbox namespace, which -n
+# openshell would reject — the demos do not need it): take the first
+# document only.
 helm template kvpoc deploy/helm/openshell -n openshell \
     --set agentSandbox.preflight.enabled=false \
     --set gatewayConfig."openshell\.drivers\.kubernetes"."runtime"=kubevirt \
     --set gatewayConfig."openshell\.drivers\.kubernetes".supervisor_topology=gateway \
     --set server.sandboxNamespace=kvpoc-sandboxes \
     -s templates/serviceaccount.yaml \
+    | sed -n '1,/^---$/p' \
     | kubectl apply -n openshell -f -
 helm template kvpoc deploy/helm/openshell -n openshell \
     --set agentSandbox.preflight.enabled=false \

@@ -1608,7 +1608,20 @@ async fn reconcile_kubevirt_image_pins(client: &Client, namespace: &str) {
                     .patch(&kube_name, &PatchParams::default(), &Patch::Merge(&patch))
                     .await;
             }
-            crate::kubevirt::GuestImageDigest::Absent => {}
+            crate::kubevirt::GuestImageDigest::Absent => {
+                // The launcher exists but no init container matching the
+                // VM's guest image has reported an imageID yet. Transient
+                // while the image pulls; if it persists (the pod spec and
+                // the VM disagree, or the pull never completes), the VM
+                // simply keeps the configured tag — surfaced at debug so
+                // operators can see why a pin did not happen.
+                debug!(
+                    sandbox_id = %sandbox_id,
+                    vm = %kube_name,
+                    "KubeVirt guest image digest not observed yet; the VirtualMachine keeps \
+                     the configured tag"
+                );
+            }
         }
     }
 }
