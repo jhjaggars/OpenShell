@@ -135,8 +135,8 @@ is user-serviceable, so the guard (`netpol_guard*.rs`) restores them.
   can't come back; `sandbox start` re-creates a missing one. A bound
   `os-shared-control-*` policy is not rewritten just because the live shared
   supervisor Service changed. Writes carry the diagnostic
-  `openshell.ai/rendered-by` annotation, which no check reads. A budget of 5
-  repairs per policy per 10 minutes stops a fight with another controller.
+  `openshell.ai/rendered-by` annotation, which no check reads. A budget of 10
+  repairs per policy per minute stops a fight with another controller.
 - **Fail closed.** After a repair, the shared per-sandbox reconcile
   (`reconcile_one_sandbox_runtime`) runs for each affected sandbox. A generation
   bound to the drifted workload fence or control policy no longer matches its

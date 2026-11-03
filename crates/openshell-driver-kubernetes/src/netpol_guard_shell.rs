@@ -32,8 +32,11 @@ use tracing::{debug, warn};
 /// policy would otherwise fight the guard forever; past the budget the
 /// guard stops writing that policy and the periodic pass keeps failing
 /// closed.
-pub const REPAIR_BUDGET: usize = 5;
-pub const REPAIR_BUDGET_WINDOW: Duration = Duration::from_mins(10);
+/// A fighting controller rewrites within moments of each repair, so ten
+/// repairs a minute stops it quickly while leaving room for an operator's or
+/// a test's legitimate burst of edits.
+pub const REPAIR_BUDGET: usize = 10;
+pub const REPAIR_BUDGET_WINDOW: Duration = Duration::from_mins(1);
 /// Retry delay for a busy lifecycle gate or a raced write.
 pub const REQUEUE_DELAY: Duration = Duration::from_secs(1);
 
