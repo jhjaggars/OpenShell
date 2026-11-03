@@ -4023,6 +4023,7 @@ mod linux {
                 provider_env_revision,
                 provider_env,
                 ca_file_paths,
+                privileged: self.qualification.privileged,
             };
             let provider_file_count = provider_files.len();
             if let Err(error) = self.network_broker.provider_files().replace(provider_files) {
@@ -4423,6 +4424,7 @@ mod linux {
         provider_env_revision: u64,
         provider_env: std::collections::HashMap<String, String>,
         ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+        privileged: bool,
     }
 
     fn resolve_agent_spec(mut spec: AgentSpecWire) -> Result<AgentSpecWire, String> {
@@ -4457,6 +4459,7 @@ mod linux {
                 provider_env_revision,
                 provider_env,
                 ca_file_paths,
+                privileged,
             } = launch;
             debug_assert!(!spec.program.is_empty());
             let boundary_runtime = BoundaryRuntimeState::new_exclusive_pid_namespace();
@@ -4475,6 +4478,7 @@ mod linux {
                     spec.interactive,
                     &policy,
                     entrypoint_pid,
+                    privileged,
                     provider_credentials.clone(),
                     provider_env,
                     ca_file_paths,
@@ -9862,6 +9866,7 @@ mod linux {
                         provider_env_revision: 0,
                         provider_env: std::collections::HashMap::new(),
                         ca_file_paths: None,
+                        privileged: false,
                     },
                     prepared,
                 )

@@ -46,6 +46,11 @@ const CLONE_NAMESPACE_FLAGS: u32 = (libc::CLONE_NEWCGROUP
 /// A prebuilt child filter that can be installed without heap allocation.
 pub struct ChildHardeningProgram {
     instructions: Vec<libc::sock_filter>,
+    /// Whether  sets . False only for the
+    /// privileged (root-workload) noop:  is meaningless for
+    /// root but inherited by every descendant, breaking setuid binaries
+    /// (sudo, su, ping) for non-root users the root workload creates.
+    set_no_new_privs: bool,
 }
 
 impl ChildHardeningProgram {
@@ -57,6 +62,7 @@ impl ChildHardeningProgram {
     pub fn noop() -> Self {
         Self {
             instructions: Vec::new(),
+            set_no_new_privs: false,
         }
     }
 
@@ -66,7 +72,9 @@ impl ChildHardeningProgram {
     /// sandbox-wide TSYNC work and the launcher's `NEW_LISTENER` filter.
     pub fn install(&mut self) -> io::Result<()> {
         mark_inherited_descriptors_close_on_exec()?;
-        set_no_new_privileges()?;
+        if self.set_no_new_privs {
+            set_no_new_privileges()?;
+        }
         let len = u16::try_from(self.instructions.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -261,7 +269,10 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
     }
 
     instructions.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
-    Ok(ChildHardeningProgram { instructions })
+    Ok(ChildHardeningProgram {
+        instructions,
+        set_no_new_privs: true,
+    })
 }
 
 fn append_unconditional_deny(
