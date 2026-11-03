@@ -224,6 +224,10 @@ echo "  namespace:  ${SANDBOX_NAMESPACE}"
 echo "  guest disk: ${GUEST_IMAGE}"
 echo
 
+# Stamp the attach-wait window BEFORE the gateway launches: a supervisor
+# whose token is still valid can attach within a second of the gateway
+# coming up, and a later stamp would miss its log line.
+GATEWAY_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # The gateway may run on a restricted kubeconfig (e.g. one minted from the
 # chart's gateway ServiceAccount, to prove the Helm RBAC is sufficient):
 # set OPENSHELL_KVPOC_GATEWAY_KUBECONFIG. The demo's own kubectl calls keep
@@ -252,10 +256,9 @@ if [ "${RUN_DEMO}" = "1" ]; then
     # create racing that attach leaves the boundary's dial refused.
     if [ "${TOPOLOGY}" = "gateway" ]; then
         echo "==> waiting for the shared supervisor replica to attach"
-        # Match only lines logged after this gateway started, so a quick
-        # rerun cannot satisfy the check with the previous gateway's attach
-        # line.
-        GATEWAY_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        # Only lines logged after this gateway's launch count (the stamp
+        # was taken before the binary started), so a quick rerun cannot
+        # satisfy the check with the previous gateway's attach line.
         ATTACHED=1
         for _ in $(seq 1 60); do
             if kubectl logs -n "${SUPERVISOR_NAMESPACE}" deployment/"${SUPERVISOR_SERVICE}" \

@@ -200,16 +200,23 @@ OPENSHELL_KVPOC_TOPOLOGY=gateway e2e/kubevirt/demo.sh --demo
 helm template kvpoc deploy/helm/openshell -n openshell \
     --set agentSandbox.preflight.enabled=false \
     --set gatewayConfig."openshell\.drivers\.kubernetes"."runtime"=kubevirt \
+    --set gatewayConfig."openshell\.drivers\.kubernetes".supervisor_topology=gateway \
     --set server.sandboxNamespace=kvpoc-sandboxes \
-    --set supervisorTopology=gateway \
-    -s templates/serviceaccount.yaml -s templates/role.yaml \
-    -s templates/rolebinding.yaml -s templates/clusterrole.yaml \
-    -s templates/clusterrolebinding.yaml -s templates/peer-role.yaml \
+    -s templates/serviceaccount.yaml \
+    | kubectl apply -n openshell -f -
+helm template kvpoc deploy/helm/openshell -n openshell \
+    --set agentSandbox.preflight.enabled=false \
+    --set gatewayConfig."openshell\.drivers\.kubernetes"."runtime"=kubevirt \
+    --set gatewayConfig."openshell\.drivers\.kubernetes".supervisor_topology=gateway \
+    --set server.sandboxNamespace=kvpoc-sandboxes \
+    -s templates/role.yaml -s templates/rolebinding.yaml \
+    -s templates/clusterrole.yaml -s templates/clusterrolebinding.yaml \
+    -s templates/peer-role.yaml \
     | kubectl apply -f -
 SA=kvpoc-openshell  # match the chart's gateway ServiceAccount name (release-openshell)
 TOKEN="$(kubectl create token "${SA}" -n openshell --duration=2h)"
-SERVER="$(kubectl config view -o jsonpath='{.clusters[0].cluster.server}')"
-CA="$(kubectl config view -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')"
+SERVER="$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.server}')"
+CA="$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')"
 cat > /tmp/kvpoc-sa-kubeconfig <<EOF
 apiVersion: v1
 kind: Config
@@ -283,6 +290,18 @@ fence verification, dead-runtime Error, and clean teardown all verified
 Stop semantics: stop waits for the VM's ready flag to clear; the VMI and
 virt-launcher pod can take another ~30 seconds to terminate, during which
 the fence (owner-referenced to the VM) still applies.
+
+Boundary-port ingress (L2): the control-ingress policy
+(`os-control-<id>`) selects only the pair's supervisor Pod, so no pod —
+forged labels or not — can reach the virt-launcher on the boundary port;
+the fence's deny-all ingress is the whole story for the launcher.
+Residual, inherent to `NetworkPolicy` label selection: a pod that forges
+the pair's workload labels can still REACH the supervisor's boundary
+port at the network level. The actual boundary is the supervisor's
+pinned TLS plus the descriptor/claims check (a forged pod cannot
+authenticate), and namespace RBAC — the gateway's `ServiceAccount` should
+be the only identity allowed to create pods in the sandbox namespace
+(the chart's RBAC delivers the gateway side; step 5b proves it).
 
 Start semantics: the plan is decided from the run strategy, the VM status,
 and the paired VMI's phase. A halted VM boots with a single `Once` patch

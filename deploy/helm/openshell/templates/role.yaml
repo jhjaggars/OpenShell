@@ -43,10 +43,11 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create", "delete", "get", "list", "patch"]
-  # The per-sandbox workspace PVC.
+  # The per-sandbox workspace PVC, and the label-based cleanup of
+  # non-owner-referenced claims when the VM is already gone.
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["create", "delete", "get"]
+    verbs: ["create", "delete", "get", "list"]
   # The egress fence, the namespace-wide launcher isolation floor, and the
   # control-ingress policy: created or validated, and deleted on teardown
   # or drift.

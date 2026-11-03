@@ -137,7 +137,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["persistentvolumeclaims"]
-            verbs: ["create", "delete", "get"]
+            verbs: ["create", "delete", "get", "list"]
       - contains:
           path: rules
           content:
