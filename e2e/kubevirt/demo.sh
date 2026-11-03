@@ -177,6 +177,7 @@ guest_image = "${GUEST_IMAGE}"
 guest_image_pull_policy = "IfNotPresent"
 cpu_cores = 1
 memory = "1Gi"
+workload = "${OPENSHELL_KVPOC_WORKLOAD:-sandboxed}"
 ${SHARED_SUPERVISOR_CONFIG}
 EOF
 

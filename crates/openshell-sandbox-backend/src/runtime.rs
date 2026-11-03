@@ -622,13 +622,30 @@ pub fn validate_runtime_coordinates(
         ));
     }
     let identity = &runtime_descriptor.workload_identity;
-    let normalized = ResolvedWorkloadIdentity::new(
-        identity.uid,
-        identity.gid,
-        identity.supplementary_gids.clone(),
-        identity.source.clone(),
-        identity.resource_digest.clone(),
-    )?;
+    // The privileged (root-workload) mode uses a uid-0 identity by design;
+    // the standard constructor refuses it, so the mode claim (present in
+    // the descriptor's resource_claims) decides which constructor
+    // normalizes — and an unknown mode fails closed (the standard
+    // constructor refuses uid 0).
+    let privileged_mode = runtime_descriptor
+        .resource_claims
+        .get("kubevirt.workload_mode")
+        .map(String::as_str)
+        == Some("root");
+    let normalized = if privileged_mode {
+        ResolvedWorkloadIdentity::new_privileged(
+            identity.source.clone(),
+            identity.resource_digest.clone(),
+        )?
+    } else {
+        ResolvedWorkloadIdentity::new(
+            identity.uid,
+            identity.gid,
+            identity.supplementary_gids.clone(),
+            identity.source.clone(),
+            identity.resource_digest.clone(),
+        )?
+    };
     if normalized != *identity {
         return Err(BackendError::Descriptor(
             "workload identity is not canonical".into(),
