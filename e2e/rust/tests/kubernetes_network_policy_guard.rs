@@ -227,6 +227,17 @@ async fn mutate(ns: &str, name: &str, mutation: Mutation) -> Instant {
             kubectl(&["-n", ns, "delete", "networkpolicy", name, "--wait=false"]).await;
         }
         Mutation::Edit => {
+            // A JSON patch, because a merge patch can't empty an object such
+            // as `podSelector`.
+            let patch: Vec<serde_json::Value> = widening(name)["spec"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| {
+                    serde_json::json!({"op": "replace", "path": format!("/spec/{key}"), "value": value})
+                })
+                .collect();
+            let patch = serde_json::Value::from(patch).to_string();
             kubectl(&[
                 "-n",
                 ns,
@@ -234,9 +245,9 @@ async fn mutate(ns: &str, name: &str, mutation: Mutation) -> Instant {
                 "networkpolicy",
                 name,
                 "--type",
-                "merge",
+                "json",
                 "-p",
-                &widening(name).to_string(),
+                &patch,
             ])
             .await;
         }
@@ -641,39 +652,35 @@ async fn each_repair_is_signalled_once_across_gateway_replicas() {
     tokio::time::sleep(Duration::from_secs(35)).await;
     let gateway_ns =
         std::env::var("OPENSHELL_E2E_GATEWAY_NAMESPACE").unwrap_or_else(|_| "openshell".into());
-    let pods: serde_json::Value = serde_json::from_str(
-        &kubectl(&[
-            "-n",
-            &gateway_ns,
-            "get",
-            "pods",
-            "-l",
-            "app.kubernetes.io/name=openshell",
-            "-o",
-            "json",
-        ])
-        .await,
-    )
-    .unwrap();
+    let pods: serde_json::Value =
+        serde_json::from_str(&kubectl(&["-n", &gateway_ns, "get", "pods", "-o", "json"]).await)
+            .unwrap();
+    let needle = format!("NetworkPolicy restored {ns}/{SUPERVISORS}");
     let mut count = 0;
     let mut replicas = 0;
     for pod in pods["items"].as_array().unwrap() {
-        let name = pod["metadata"]["name"].as_str().unwrap();
-        if !name.contains("supervisor")
-            && pod["metadata"]["labels"]["app.kubernetes.io/component"] != "supervisor"
-        {
-            let (ok, logs, _) =
-                kubectl_raw(&["-n", &gateway_ns, "logs", name, "--since=2m"], None).await;
-            if ok && logs.contains("openshell") {
-                replicas += 1;
-                count += logs
-                    .lines()
-                    .filter(|line| {
-                        line.contains(&format!("NetworkPolicy restored {ns}/{SUPERVISORS}"))
-                    })
-                    .count();
-            }
+        let is_gateway = pod["spec"]["containers"]
+            .as_array()
+            .is_some_and(|containers| containers.iter().any(|c| c["name"] == "openshell-gateway"));
+        if !is_gateway {
+            continue;
         }
+        replicas += 1;
+        let name = pod["metadata"]["name"].as_str().unwrap();
+        let logs = kubectl(&[
+            "-n",
+            &gateway_ns,
+            "logs",
+            name,
+            "-c",
+            "openshell-gateway",
+            "--since=3m",
+        ])
+        .await;
+        count += strip_ansi(&logs)
+            .lines()
+            .filter(|line| line.contains("OCSF CONFIG:RESTORED") && line.contains(&needle))
+            .count();
     }
     println!("NETPOL_SIGNALS replicas={replicas} restored_events={count}");
     assert_eq!(
