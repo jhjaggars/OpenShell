@@ -439,9 +439,12 @@ pub(crate) enum SuspendWrite {
 }
 
 #[path = "netpol_guard.rs"]
-// The I/O shell that uses the rest of the core lands in the next commit.
+// The watcher that uses the rest of the core and shell lands in a later commit.
 #[allow(dead_code)]
 mod netpol_guard;
+#[path = "netpol_guard_shell.rs"]
+#[allow(dead_code)]
+mod netpol_guard_shell;
 
 /// Operator-provided bootstrap bytes read once per runtime generation.
 struct StagedBootstrapMaterial {
@@ -1155,6 +1158,8 @@ pub struct KubernetesComputeDriver {
     /// Desired shared sandbox instances while new generations use the gateway
     /// topology.
     shared_supervisor: Option<SharedSupervisor>,
+    /// Per-replica state of the `NetworkPolicy` guard.
+    netpol_guard: Arc<netpol_guard_shell::GuardState>,
 }
 
 impl std::fmt::Debug for KubernetesComputeDriver {
@@ -1204,6 +1209,7 @@ impl KubernetesComputeDriver {
             network_trust_bundle: None,
             operator_allowlist: None,
             shared_supervisor: None,
+            netpol_guard: Arc::default(),
         }
     }
 
@@ -1352,6 +1358,7 @@ impl KubernetesComputeDriver {
             network_trust_bundle,
             operator_allowlist,
             shared_supervisor,
+            netpol_guard: Arc::default(),
         };
 
         if driver.workspace_mode() == WorkspaceMode::Shared {
@@ -9585,16 +9592,8 @@ mod tests {
             }
         });
         let client = Client::new(service, "openshell");
-        let driver = KubernetesComputeDriver {
-            client: client.clone(),
-            watch_client: client,
-            sandbox_api_version: Arc::new(OnceCell::new()),
-            lifecycle_gates: Arc::default(),
-            config: KubernetesComputeConfig::default(),
-            network_trust_bundle: None,
-            operator_allowlist: None,
-            shared_supervisor: None,
-        };
+        let driver =
+            KubernetesComputeDriver::with_test_client(client, KubernetesComputeConfig::default());
         driver
             .sandbox_api_version
             .set(SANDBOX_VERSION_V1BETA1)
@@ -10842,16 +10841,8 @@ mod tests {
             }
         });
         let client = Client::new(service, "openshell");
-        let driver = KubernetesComputeDriver {
-            client: client.clone(),
-            watch_client: client,
-            sandbox_api_version: Arc::new(OnceCell::new()),
-            lifecycle_gates: Arc::default(),
-            config: KubernetesComputeConfig::default(),
-            operator_allowlist: None,
-            shared_supervisor: None,
-            network_trust_bundle: None,
-        };
+        let driver =
+            KubernetesComputeDriver::with_test_client(client, KubernetesComputeConfig::default());
         driver
             .sandbox_api_version
             .set(SANDBOX_VERSION_V1BETA1)
@@ -10935,16 +10926,8 @@ mod tests {
             SANDBOX_VERSION_V1BETA1,
             "openshell",
         );
-        let driver = KubernetesComputeDriver {
-            client: client.clone(),
-            watch_client: client,
-            sandbox_api_version: Arc::new(OnceCell::new()),
-            lifecycle_gates: Arc::default(),
-            config: KubernetesComputeConfig::default(),
-            operator_allowlist: None,
-            shared_supervisor: None,
-            network_trust_bundle: None,
-        };
+        let driver =
+            KubernetesComputeDriver::with_test_client(client, KubernetesComputeConfig::default());
 
         driver
             .reconcile_sandbox_runtime_control_release(
@@ -13703,16 +13686,7 @@ mod tests {
             }
         });
         let client = Client::new(service, "openshell");
-        let driver = KubernetesComputeDriver {
-            client: client.clone(),
-            watch_client: client,
-            sandbox_api_version: Arc::new(OnceCell::new()),
-            lifecycle_gates: Arc::default(),
-            config,
-            network_trust_bundle: None,
-            operator_allowlist: None,
-            shared_supervisor: None,
-        };
+        let driver = KubernetesComputeDriver::with_test_client(client, config);
         (driver, steps, bodies)
     }
 
@@ -14009,16 +13983,7 @@ mod tests {
                 }
             });
             let client = Client::new(service, "openshell");
-            let driver = KubernetesComputeDriver {
-                client: client.clone(),
-                watch_client: client,
-                sandbox_api_version: Arc::new(OnceCell::new()),
-                lifecycle_gates: Arc::default(),
-                config: managed_config(&[]),
-                network_trust_bundle: None,
-                operator_allowlist: None,
-                shared_supervisor: None,
-            };
+            let driver = KubernetesComputeDriver::with_test_client(client, managed_config(&[]));
             let service = crate::ComputeDriverService::new(driver);
 
             let error = call_ensure_workspace(&service)

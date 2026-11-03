@@ -232,6 +232,7 @@ fn fixture(
         lifecycle_gates: Arc::default(),
         shared_supervisor: None,
         network_trust_bundle: None,
+        netpol_guard: Arc::default(),
         config: KubernetesComputeConfig {
             allow_driver_config: true,
             workspace_mode: if operator {
