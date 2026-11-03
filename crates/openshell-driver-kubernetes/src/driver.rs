@@ -1528,7 +1528,139 @@ async fn ensure_kubevirt_launcher_isolation_with(
     create_or_validate_sandbox_runtime_fence(&policies, &expected).await
 }
 
-/// Exactly one `VirtualMachine` must match the sandbox's selector; more/// Exactly one `VirtualMachine` must match the sandbox's selector; more
+/// Digest-pin the guest image (M6, option A): once the launcher Pod has
+/// pulled the guest image, pin the VM spec's containerDisk and kernelBoot
+/// images to the resolved `repo@sha256:<manifest digest>` so starts after
+/// a tag move boot the same image, and the image-identity claim (read from
+/// the VM spec) carries the digest. A side-loaded image (k3d/ctr import)
+/// reports a bare `sha256:<config digest>` with no repository, which is
+/// not pullable: never patch those — record the unpinnable state so the
+/// snapshot surfaces an `ImagePin` condition. The first generation boots the
+/// configured tag (the digest does not exist until something pulls it) —
+/// the documented first-boot window.
+async fn reconcile_kubevirt_image_pins(client: &Client, namespace: &str) {
+    let vm_api = crate::kubevirt::virtual_machine_api(client, namespace);
+    let selector = openshell_sandbox_label_selector();
+    let Ok(list) = vm_api.list(&ListParams::default().labels(&selector)).await else {
+        return;
+    };
+    for vm in list.items {
+        if vm.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        let Some(kube_name) = vm.metadata.name.clone() else {
+            continue;
+        };
+        let Ok(sandbox_id) = sandbox_id_from_object(&vm) else {
+            continue;
+        };
+        // Already pinned (or the annotation says unpinnable): idempotent.
+        let boot_image = crate::kubevirt::kubevirt_boot_image(&vm);
+        let pinned = boot_image.contains("@sha256:");
+        let marked_unpinnable = vm
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(crate::kubevirt::IMAGE_PIN_STATE_ANNOTATION))
+            .map(String::as_str)
+            == Some(crate::kubevirt::IMAGE_PIN_NO_REPOSITORY_DIGEST);
+        if pinned || marked_unpinnable {
+            continue;
+        }
+        // The launcher Pod's init containers carry the guest image.
+        let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+        let pod_selector = format!("kubevirt.io=virt-launcher,{LABEL_SANDBOX_ID}={sandbox_id}");
+        let Ok(pod_list) = pods
+            .list(&ListParams::default().labels(&pod_selector))
+            .await
+        else {
+            continue;
+        };
+        let Some(launcher) = pod_list.items.into_iter().next() else {
+            continue;
+        };
+        match crate::kubevirt::guest_image_digest(&launcher) {
+            crate::kubevirt::GuestImageDigest::Patch(pinned_ref) => {
+                info!(
+                    sandbox_id = %sandbox_id,
+                    vm = %kube_name,
+                    image = %pinned_ref,
+                    "KubeVirt guest image resolved; pinning the VirtualMachine spec to the digest"
+                );
+                if let Err(error) =
+                    pin_kubevirt_guest_image(client, namespace, &vm, &pinned_ref).await
+                {
+                    warn!(sandbox_id = %sandbox_id, %error, "KubeVirt image pin failed");
+                }
+            }
+            crate::kubevirt::GuestImageDigest::SideLoaded => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    vm = %kube_name,
+                    "KubeVirt guest image is side-loaded (no repository digest); the VirtualMachine \
+                     keeps the configured tag and cannot be digest-pinned"
+                );
+                let patch = serde_json::json!({"metadata": {"annotations": {
+                    crate::kubevirt::IMAGE_PIN_STATE_ANNOTATION:
+                        crate::kubevirt::IMAGE_PIN_NO_REPOSITORY_DIGEST
+                }}});
+                let _ = vm_api
+                    .patch(&kube_name, &PatchParams::default(), &Patch::Merge(&patch))
+                    .await;
+            }
+            crate::kubevirt::GuestImageDigest::Absent => {}
+        }
+    }
+}
+
+/// Patch one VM's containerDisk and kernelBoot images to the pinned
+/// reference. The rootdisk volume's entry is resolved from the current
+/// image, not assumed; merge patch replaces arrays wholesale, so the full
+/// volumes array is sent with the one entry mutated.
+async fn pin_kubevirt_guest_image(
+    client: &Client,
+    namespace: &str,
+    vm: &DynamicObject,
+    pinned_ref: &str,
+) -> Result<(), String> {
+    let kube_name = vm
+        .metadata
+        .name
+        .clone()
+        .ok_or("VirtualMachine has no name")?;
+    let mut volumes = vm
+        .data
+        .pointer("/spec/template/spec/volumes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("VirtualMachine has no volumes")?
+        .clone();
+    let disk_index = volumes
+        .iter()
+        .position(|volume| {
+            volume
+                .pointer("/containerDisk/image")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|image| !image.contains("@sha256:"))
+        })
+        .ok_or("VirtualMachine has no unpinned containerDisk volume")?;
+    volumes[disk_index]["containerDisk"]["image"] = serde_json::json!(pinned_ref);
+    let patch = serde_json::json!({
+        "spec": {"template": {"spec": {
+            "volumes": volumes,
+            "domain": {"firmware": {"kernelBoot": {"container": {
+                "image": pinned_ref
+            }}}}
+        }}}
+    });
+    let vm_api = crate::kubevirt::virtual_machine_api(client, namespace);
+    vm_api
+        .patch(&kube_name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("pin the guest image: {error}"))
+}
+
+/// Exactly one `VirtualMachine` must match the sandbox's selector; more/// Exactly one `VirtualMachine` must match the sandbox's selector; more/// Exactly one `VirtualMachine` must match the sandbox's selector; more
 /// than one is an ambiguous identity the caller must not guess between.
 fn select_single_kubevirt_vm(
     objects: Vec<DynamicObject>,
@@ -5205,11 +5337,25 @@ impl KubernetesComputeDriver {
         // virt-launcher fence plays that role for `KubeVirt` sandboxes.
         self.ensure_kubevirt_supervisor_egress_policy(namespace, names)
             .await?;
-        // The pair-scoped control policy: workload-to-supervisor ingress
-        // and egress on the boundary port. Its UID is not claimed (the
-        // fence evidence stays the virt-launcher NetworkPolicy).
-        self.ensure_sandbox_runtime_control_policy(namespace, names, sandbox_id, owner)
-            .await?;
+        // The pair-scoped control ingress (L2): only this pair's supervisor
+        // Pod accepts boundary-port connections, only from this pair's
+        // workload-role pods — the virt-launcher never does. The egress
+        // half is the fence's job here. Its UID is not claimed (the fence
+        // evidence stays the virt-launcher NetworkPolicy).
+        let mut expected = serde_json::from_value::<NetworkPolicy>(
+            crate::kubevirt_boundary::render_control_ingress(
+                namespace,
+                sandbox_id,
+                &crate::sandbox_runtime::pair_label_value(sandbox_id),
+                self.config.sandbox_runtime.boundary_port,
+            ),
+        )
+        .map_err(|error| {
+            KubernetesDriverError::Message(format!("render control ingress policy: {error}"))
+        })?;
+        expected.metadata.owner_references = Some(vec![owner]);
+        let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
+        create_or_validate_sandbox_runtime_fence(&policies, &expected).await?;
         Ok(())
     }
 
@@ -6542,6 +6688,10 @@ impl KubernetesComputeDriver {
                             &reconcile_config,
                         )
                         .await;
+                        // M6 (option A): digest-pin the guest image once
+                        // the launcher has pulled it.
+                        reconcile_kubevirt_image_pins(&reconcile_client, &reconcile_namespace)
+                            .await;
                         // M2: re-emit every sandbox's snapshot so a
                         // dedicated supervisor Pod deleted under a quiet
                         // Ready sandbox surfaces as Error within one

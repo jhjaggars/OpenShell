@@ -192,6 +192,33 @@ kubectl rollout status deployment/kvpoc-openshell-supervisor -n openshell --time
 #    dedicated; run both for the full acceptance:
 e2e/kubevirt/demo.sh --demo
 OPENSHELL_KVPOC_TOPOLOGY=gateway e2e/kubevirt/demo.sh --demo
+
+# 5b. (Optional) prove the chart's RBAC is sufficient: render the chart's
+#     ServiceAccount and Roles for the kubevirt runtime, mint a kubeconfig
+#     from the gateway ServiceAccount token, and run the gateway on it
+#     (the demo's own kubectl scaffolding keeps the ambient KUBECONFIG):
+helm template kvpoc deploy/helm/openshell -n openshell \
+    --set agentSandbox.preflight.enabled=false \
+    --set gatewayConfig."openshell\.drivers\.kubernetes"."runtime"=kubevirt \
+    --set server.sandboxNamespace=kvpoc-sandboxes \
+    --set supervisorTopology=gateway \
+    -s templates/serviceaccount.yaml -s templates/role.yaml \
+    -s templates/rolebinding.yaml -s templates/clusterrole.yaml \
+    -s templates/clusterrolebinding.yaml -s templates/peer-role.yaml \
+    | kubectl apply -f -
+SA=kvpoc-openshell  # match the chart's gateway ServiceAccount name (release-openshell)
+TOKEN="$(kubectl create token "${SA}" -n openshell --duration=2h)"
+SERVER="$(kubectl config view -o jsonpath='{.clusters[0].cluster.server}')"
+CA="$(kubectl config view -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')"
+cat > /tmp/kvpoc-sa-kubeconfig <<EOF
+apiVersion: v1
+kind: Config
+clusters: [{name: kvpoc, cluster: {server: ${SERVER}, certificate-authority-data: ${CA}}}]
+contexts: [{name: kvpoc, context: {cluster: kvpoc, user: ${SA}}}]
+current-context: kvpoc
+users: [{name: ${SA}, user: {token: ${TOKEN}}}]
+EOF
+OPENSHELL_KVPOC_GATEWAY_KUBECONFIG=/tmp/kvpoc-sa-kubeconfig e2e/kubevirt/demo.sh --demo
 ```
 
 The demo gateway's PKI lives in `.cache/gateway-kubevirt/tls/pki/`; deleting
@@ -307,9 +334,19 @@ material); delete it to fully reset.
 
 ## Known gaps / follow-ups
 
-- **Image identity**: the VM driver claims the registry digest; this PoC
-  claims the configured `guest_image` tag, which is weaker (a tag does not
-  identify an image). The production path is a digest-pinned guest image.
+- **Image identity (digest pinning, option A)**: the first boot uses the
+  configured `guest_image` tag (the digest does not exist until something
+  pulls it — the documented first-generation window). Once the launcher
+  Pod has pulled the guest image, the driver pins the VM spec's
+  containerDisk and kernelBoot images to the resolved
+  `repo@sha256:<manifest digest>` on its 30-second reconcile tick, so
+  starts after a tag move boot and claim the same digest, and a new
+  create after the retag gets the new image. Side-loaded images (the
+  k3d/ctr import path this demo uses) report a bare `sha256:` config
+  digest with no repository, which is not pullable: those are never
+  pinned — the tag stays and the sandbox surfaces an
+  `ImagePin: False (NoRepositoryDigest)` condition. Registry-backed
+  guest images (pulled from a real registry) pin cleanly.
 - An unpullable guest image maps the sandbox to `Error` only after two
   minutes of pull backoff (`ImagePullBackOff` with a stale VMI
   not-ready condition): kubelet retries with exponential backoff, so an

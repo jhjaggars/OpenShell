@@ -102,6 +102,56 @@ fn rfc3339_to_unix_ms(value: &str) -> Option<i64> {
     .map(|time| time.0.timestamp_millis())
 }
 
+/// VM annotation recording why the guest image could not be digest-pinned
+/// (the side-loaded case: the launcher's init container reports a bare
+/// `sha256:` config digest with no repository, which is not pullable).
+/// Surfaced as an `ImagePin` condition by the snapshot.
+pub const IMAGE_PIN_STATE_ANNOTATION: &str = "openshell.ai/kubevirt-image-pin-state";
+/// The annotation's value for the unpinnable side-loaded case.
+pub const IMAGE_PIN_NO_REPOSITORY_DIGEST: &str = "no-repository-digest";
+
+/// The digest decision for one observed launcher init-container imageID
+/// (M6 digest pinning, option A):
+/// - `Patch(String)`: a registry-backed `repo@sha256:<manifest digest>` —
+///   the VM spec can be pinned to it verbatim;
+/// - `SideLoaded`: a bare `sha256:<config digest>` with no repository
+///   (the k3d/ctr side-load path) — never patchable, the tag stays;
+/// - `Absent`: nothing observed yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestImageDigest {
+    Patch(String),
+    SideLoaded,
+    Absent,
+}
+
+/// Read the guest image digest from the launcher Pod's init containers:
+/// `KubeVirt` runs the containerDisk as init containers (`volumerootdisk`,
+/// `volumekernel-boot-volume`), so `containerStatuses` holds the
+/// virt-launcher image instead. Both init containers reference the same
+/// guest image; the first observed imageID decides.
+pub fn guest_image_digest(launcher_pod: &k8s_openapi::api::core::v1::Pod) -> GuestImageDigest {
+    let Some(status) = launcher_pod.status.as_ref() else {
+        return GuestImageDigest::Absent;
+    };
+    let Some(init_statuses) = status.init_container_statuses.as_ref() else {
+        return GuestImageDigest::Absent;
+    };
+    for container in init_statuses {
+        let image_id = container.image_id.as_str();
+        if image_id.is_empty() {
+            continue;
+        }
+        if image_id.contains('@') {
+            // A registry-backed reference: repo@sha256:<manifest digest>.
+            return GuestImageDigest::Patch(image_id.to_string());
+        }
+        // A bare sha256:<config digest>: the side-loaded path, not
+        // pullable as a reference.
+        return GuestImageDigest::SideLoaded;
+    }
+    GuestImageDigest::Absent
+}
+
 /// The VMI's not-ready-since time in Unix milliseconds, from its `Ready`
 /// condition's `lastTransitionTime`. `None` when the VMI carries no such
 /// condition — the caller then keeps the pull-backoff state transient
@@ -572,6 +622,18 @@ fn vm_status_from_object(
             openshell_core::time::now_ms() - since > KUBEVIRT_CREATE_DEADLINE_MS
         });
 
+    // The image-pin state annotation (M6 digest pinning, side-loaded case)
+    // surfaces as an ImagePin condition so operators see that the guest
+    // image cannot be digest-pinned.
+    let image_not_pinned = matches!(
+        obj.metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(IMAGE_PIN_STATE_ANNOTATION))
+            .map(String::as_str),
+        Some(IMAGE_PIN_NO_REPOSITORY_DIGEST)
+    );
+
     // A dedicated generation whose supervisor Pod is gone or crashed is a
     // terminal failure (`restartPolicy: Never`): the boundary can never
     // connect, so the sandbox surfaces as Error rather than provisioning
@@ -626,6 +688,17 @@ fn vm_status_from_object(
     // The watch reconciler re-fenced a drifted or deleted fence and stamped
     // this marker; surface the event so operators see that isolation
     // briefly depended on the namespace-wide default-deny floor.
+    if image_not_pinned {
+        conditions.push(DriverCondition {
+            r#type: "ImagePin".to_string(),
+            status: "False".to_string(),
+            reason: "NoRepositoryDigest".to_string(),
+            message: "image not pinned: no repository digest (side-loaded guest \
+                     image); the configured tag is used directly"
+                .to_string(),
+            transition_time: None,
+        });
+    }
     if let Some(restored_at) = fence_restored_at {
         conditions.push(DriverCondition {
             r#type: "FenceRestored".to_string(),
@@ -1479,6 +1552,84 @@ mod kubevirt_review_tests {
         );
         let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
         assert_eq!(ready.reason, REASON_VM_NOT_READY);
+    }
+
+    #[test]
+    fn guest_image_digest_classifies_launcher_init_containers() {
+        use k8s_openapi::api::core::v1::{ContainerStatus, Pod, PodStatus};
+        let pod = |image_id: &str| {
+            let mut pod = Pod::default();
+            let mut status = PodStatus::default();
+            let container = ContainerStatus {
+                name: "volumerootdisk".to_string(),
+                image_id: image_id.to_string(),
+                ..ContainerStatus::default()
+            };
+            status.init_container_statuses = Some(vec![container]);
+            pod.status = Some(status);
+            pod
+        };
+        // Registry-backed: repo@sha256:<manifest digest> — patchable.
+        assert_eq!(
+            guest_image_digest(&pod("docker.io/kvpoc/guest@sha256:5a58c2790000")),
+            GuestImageDigest::Patch("docker.io/kvpoc/guest@sha256:5a58c2790000".to_string())
+        );
+        // Side-loaded (k3d/ctr import): a bare config digest, no
+        // repository — never patchable.
+        assert_eq!(
+            guest_image_digest(&pod("sha256:5a58c2790000")),
+            GuestImageDigest::SideLoaded
+        );
+        // Nothing observed yet.
+        assert_eq!(
+            guest_image_digest(&Pod::default()),
+            GuestImageDigest::Absent
+        );
+        let mut pod = pod("sha256:x");
+        pod.status.as_mut().unwrap().init_container_statuses = Some(vec![]);
+        assert_eq!(guest_image_digest(&pod), GuestImageDigest::Absent);
+    }
+
+    #[test]
+    fn side_loaded_image_surfaces_image_pin_condition() {
+        // M6 (option A): a side-loaded guest image cannot be digest-pinned;
+        // the reconciler's annotation surfaces as an ImagePin condition so
+        // operators see the unpinned state.
+        let cfg = review_config();
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+        vm.data["status"] = serde_json::json!({"ready": true});
+        vm.metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                IMAGE_PIN_STATE_ANNOTATION.to_string(),
+                IMAGE_PIN_NO_REPOSITORY_DIGEST.to_string(),
+            );
+        let (_, sbx) =
+            sandbox_from_vm_object_with_runtime("kvpoc-sandboxes", vm, None, None, None, None)
+                .expect("converts");
+        let conditions = sbx.status.unwrap().conditions;
+        let pin = conditions
+            .iter()
+            .find(|condition| condition.r#type == "ImagePin")
+            .expect("ImagePin condition present");
+        assert_eq!(pin.status, "False");
+        assert_eq!(pin.reason, "NoRepositoryDigest");
+        assert!(pin.message.contains("no repository digest"));
+        // Without the annotation there is no condition.
+        let cfg = review_config();
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+        vm.data["status"] = serde_json::json!({"ready": true});
+        let (_, sbx) =
+            sandbox_from_vm_object_with_runtime("kvpoc-sandboxes", vm, None, None, None, None)
+                .expect("converts");
+        assert!(
+            !sbx.status
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|condition| condition.r#type == "ImagePin")
+        );
     }
 
     #[test]

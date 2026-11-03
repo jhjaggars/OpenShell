@@ -879,6 +879,76 @@ pub fn render_fence(
     })
 }
 
+/// Render the `KubeVirt` control-ingress `NetworkPolicy` (L2).
+///
+/// The ONLY pods that may accept connections on the boundary port are this
+/// pair's supervisor Pods, and the only admitted sources are this pair's
+/// workload-role pods — the virt-launcher pod itself never accepts
+/// boundary-port traffic. The pod path's pair-wide control policy applies
+/// its ingress rule to the whole pair (workload pods there listen too);
+/// the `KubeVirt` workload is a VM whose boundary dials out, so the ingress
+/// half alone is needed and the fence already carries the egress half.
+/// Residual, inherent to `NetworkPolicy`: a pod that forges the pair labels
+/// can still REACH the supervisor's port, but cannot authenticate (the
+/// supervisor verifies the boundary's pinned TLS and descriptor claims);
+/// binding source identity needs namespace governance (pod creation
+/// restricted to the driver's `ServiceAccount`).
+#[must_use]
+pub fn render_control_ingress(
+    namespace: &str,
+    sandbox_id: &str,
+    pair: &str,
+    port: u16,
+) -> serde_json::Value {
+    use std::collections::BTreeMap;
+    let pair_role = |role: &str| {
+        BTreeMap::from([
+            ("openshell.ai/boundary-pair".to_string(), pair.to_string()),
+            ("openshell.ai/boundary-role".to_string(), role.to_string()),
+        ])
+    };
+    let selector = |labels: &BTreeMap<String, String>| {
+        labels
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+            .collect::<serde_json::Map<String, serde_json::Value>>()
+    };
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        openshell_core::driver_utils::LABEL_MANAGED_BY.to_string(),
+        openshell_core::driver_utils::LABEL_MANAGED_BY_VALUE.to_string(),
+    );
+    labels.insert(
+        openshell_core::driver_utils::LABEL_SANDBOX_ID.to_string(),
+        sandbox_id.to_string(),
+    );
+    serde_json::json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+            "name": control_ingress_name(sandbox_id),
+            "namespace": namespace,
+            "labels": labels,
+        },
+        "spec": {
+            "podSelector": {"matchLabels": selector(&pair_role("supervisor"))},
+            "policyTypes": ["Ingress"],
+            "ingress": [{
+                "from": [{"podSelector": {"matchLabels": selector(&pair_role("workload"))}}],
+                "ports": [{"port": port, "protocol": "TCP"}]
+            }]
+        }
+    })
+}
+
+/// Name of the control-ingress `NetworkPolicy` for one sandbox (the same
+/// name the pod path's control policy uses, so a namespace never carries
+/// both shapes).
+#[must_use]
+pub fn control_ingress_name(sandbox_id: &str) -> String {
+    format!("os-control-{}", sandbox_id.to_ascii_lowercase())
+}
+
 /// Name of the fence `NetworkPolicy` for one sandbox.
 #[must_use]
 pub fn fence_name(sandbox_id: &str) -> String {
@@ -1104,6 +1174,44 @@ mod fence_tests {
             "supervisor"
         );
         assert_eq!(fence["spec"]["egress"][0]["ports"][0]["port"], 5500);
+    }
+
+    #[test]
+    fn control_ingress_scopes_the_boundary_port_to_the_supervisor_pod() {
+        // L2: only this pair's supervisor Pod accepts boundary-port
+        // connections, and the policy carries no egress rules — the
+        // virt-launcher never accepts boundary-port inbound, and its
+        // egress allowance is the fence's job.
+        let policy = render_control_ingress("kvpoc-sandboxes", "sbx-1", "sbx-1", 5500);
+        assert_eq!(
+            policy["spec"]["podSelector"]["matchLabels"]["openshell.ai/boundary-role"],
+            "supervisor",
+            "the policy must select only the supervisor role"
+        );
+        assert_eq!(
+            policy["spec"]["podSelector"]["matchLabels"]["openshell.ai/boundary-pair"],
+            "sbx-1"
+        );
+        let policy_types = policy["spec"]["policyTypes"].as_array().unwrap();
+        assert_eq!(policy_types, &vec![serde_json::json!("Ingress")]);
+        assert!(policy["spec"]["egress"].is_null());
+        let ingress = &policy["spec"]["ingress"][0];
+        assert_eq!(
+            ingress["from"][0]["podSelector"]["matchLabels"]["openshell.ai/boundary-role"],
+            "workload",
+            "only this pair's workload role may connect"
+        );
+        assert_eq!(ingress["ports"][0]["port"], 5500);
+        assert_eq!(
+            policy["metadata"]["labels"]["openshell.ai/sandbox-id"],
+            "sbx-1"
+        );
+        assert_eq!(
+            control_ingress_name("sbx-1"),
+            "os-control-sbx-1",
+            "the same name the pod path's control policy uses, so a namespace \
+             never carries both shapes"
+        );
     }
 
     #[test]

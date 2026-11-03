@@ -224,7 +224,13 @@ echo "  namespace:  ${SANDBOX_NAMESPACE}"
 echo "  guest disk: ${GUEST_IMAGE}"
 echo
 
-OPENSHELL_DRIVERS=kubernetes "${GATEWAY_BIN}" \
+# The gateway may run on a restricted kubeconfig (e.g. one minted from the
+# chart's gateway ServiceAccount, to prove the Helm RBAC is sufficient):
+# set OPENSHELL_KVPOC_GATEWAY_KUBECONFIG. The demo's own kubectl calls keep
+# the ambient KUBECONFIG (they are demo scaffolding: namespace and CA
+# Secret setup).
+KUBECONFIG="${OPENSHELL_KVPOC_GATEWAY_KUBECONFIG:-${KUBECONFIG}}" \
+    OPENSHELL_DRIVERS=kubernetes "${GATEWAY_BIN}" \
     --config "${CONFIG_PATH}" \
     --port "${PORT}" \
     --log-level "${LOG_LEVEL}" \
@@ -246,10 +252,15 @@ if [ "${RUN_DEMO}" = "1" ]; then
     # create racing that attach leaves the boundary's dial refused.
     if [ "${TOPOLOGY}" = "gateway" ]; then
         echo "==> waiting for the shared supervisor replica to attach"
+        # Match only lines logged after this gateway started, so a quick
+        # rerun cannot satisfy the check with the previous gateway's attach
+        # line.
+        GATEWAY_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         ATTACHED=1
         for _ in $(seq 1 60); do
             if kubectl logs -n "${SUPERVISOR_NAMESPACE}" deployment/"${SUPERVISOR_SERVICE}" \
-                --since=5m 2>/dev/null | grep -q "gateway accepted the supervisor host"; then
+                --since-time="${GATEWAY_STARTED_AT}" 2>/dev/null \
+                | grep -q "gateway accepted the supervisor host"; then
                 ATTACHED=0
                 break
             fi
