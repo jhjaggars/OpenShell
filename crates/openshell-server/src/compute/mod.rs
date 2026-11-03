@@ -5579,6 +5579,18 @@ impl ComputeRuntime {
             }
             Some(watch_sandboxes_event::Payload::PlatformEvent(platform_event)) => {
                 if let Some(event) = platform_event.event {
+                    if network_policy_drift_audit_kind(&event).is_some() {
+                        let name = self
+                            .store
+                            .get(Sandbox::object_type(), &platform_event.sandbox_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|record| decode_sandbox_record(&record).ok())
+                            .map(|sandbox| sandbox.object_name().to_string())
+                            .unwrap_or_default();
+                        emit_network_policy_drift_audit(&platform_event.sandbox_id, &name, &event);
+                    }
                     self.tracing_log_bus.platform_event_bus.publish(
                         &platform_event.sandbox_id,
                         openshell_core::proto::SandboxStreamEvent {
@@ -8111,6 +8123,105 @@ fn public_condition_from_driver(condition: &DriverCondition) -> SandboxCondition
     }
 }
 
+/// `source` the Kubernetes driver puts on its own platform events. Kubernetes
+/// Events are forwarded with source `kubernetes`, and anyone who can create an
+/// Event in a sandbox namespace controls their reason, so audit records key on
+/// this source, never on the reason alone.
+const KUBERNETES_DRIVER_EVENT_SOURCE: &str = "openshell-driver-kubernetes";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkPolicyDriftAudit {
+    Restored,
+    Suspended,
+}
+
+fn network_policy_drift_audit_kind(event: &DriverPlatformEvent) -> Option<NetworkPolicyDriftAudit> {
+    if event.source != KUBERNETES_DRIVER_EVENT_SOURCE {
+        return None;
+    }
+    match event.reason.as_str() {
+        "NetworkPolicyRestored" => Some(NetworkPolicyDriftAudit::Restored),
+        "NetworkPolicyDriftSuspended" => Some(NetworkPolicyDriftAudit::Suspended),
+        _ => None,
+    }
+}
+
+/// Build the OCSF records for a driver `NetworkPolicy` drift event: a
+/// configuration change and, because tampering with sandbox isolation is a
+/// security finding, a detection finding. Restoring the managed SSH policy
+/// isn't an isolation boundary, so it has no finding. Neither record carries
+/// the policy spec.
+fn network_policy_drift_audit_events(
+    sandbox_id: &str,
+    sandbox_name: &str,
+    event: &DriverPlatformEvent,
+) -> Vec<openshell_ocsf::OcsfEvent> {
+    use openshell_ocsf::{
+        ConfigStateChangeBuilder, DetectionFindingBuilder, FindingInfo, SeverityId, StateId,
+    };
+    let Some(kind) = network_policy_drift_audit_kind(event) else {
+        return Vec::new();
+    };
+    let field = |key: &str| event.metadata.get(key).map_or("", String::as_str);
+    let (namespace, policy, drift, action) = (
+        field("namespace"),
+        field("policy"),
+        field("drift"),
+        field("action"),
+    );
+    let ctx = crate::gateway_ocsf::context(sandbox_id, sandbox_name);
+    let (state_label, message) = match kind {
+        NetworkPolicyDriftAudit::Restored => (
+            "restored",
+            format!("NetworkPolicy restored {namespace}/{policy} ({drift})"),
+        ),
+        NetworkPolicyDriftAudit::Suspended => (
+            "suspended",
+            format!("Sandbox suspended after NetworkPolicy drift {namespace}/{policy}"),
+        ),
+    };
+    let mut events = vec![
+        ConfigStateChangeBuilder::new(&ctx)
+            .severity(SeverityId::Medium)
+            .state(StateId::Other, state_label)
+            .unmapped("namespace", namespace)
+            .unmapped("policy", policy)
+            .unmapped("drift", drift)
+            .unmapped("action", action)
+            .message(message.clone())
+            .build(),
+    ];
+    if policy != "openshell-sandbox-ssh" {
+        events.push(
+            DetectionFindingBuilder::new(&ctx)
+                .severity(SeverityId::High)
+                .finding_info(FindingInfo::new(
+                    "openshell.kubernetes.network_policy_drift",
+                    "Sandbox isolation NetworkPolicy was changed",
+                ))
+                .evidence_pairs(&[
+                    ("namespace", namespace),
+                    ("policy", policy),
+                    ("drift", drift),
+                    ("action", action),
+                ])
+                .message(message)
+                .build(),
+        );
+    }
+    events
+}
+
+fn emit_network_policy_drift_audit(
+    sandbox_id: &str,
+    sandbox_name: &str,
+    event: &DriverPlatformEvent,
+) {
+    for audit in network_policy_drift_audit_events(sandbox_id, sandbox_name, event) {
+        openshell_ocsf::ocsf_emit!(audit);
+    }
+}
+
 fn public_platform_event_from_driver(event: &DriverPlatformEvent) -> PlatformEvent {
     PlatformEvent {
         event_time: event.event_time,
@@ -8386,6 +8497,10 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
         "containercreated",
         "healthcheckstarting",
         "inspectfailed",
+        // The Kubernetes driver suspended the sandbox after a NetworkPolicy
+        // it owns drifted and restored the policy. It is stopped, not
+        // failed, and `sandbox start` must stay allowed.
+        "networkpolicydrift",
     ];
     !transient_reasons.contains(&reason.as_str())
 }
@@ -12665,6 +12780,116 @@ mod tests {
                 derive_phase(Some(&status)),
                 SandboxPhase::Provisioning,
                 "Expected Provisioning for transient reason={reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_policy_drift_is_stopped_or_provisioning_never_error() {
+        let ready = make_driver_condition(
+            "NetworkPolicyDrift",
+            "NetworkPolicy openshell-sandbox-workloads was changed and has been restored",
+        );
+        // While the driver finishes the suspension, Ready=False alone.
+        let status = make_driver_status(ready.clone());
+        assert_eq!(derive_phase(Some(&status)), SandboxPhase::Provisioning);
+        // Once suspended, the sandbox is stopped and `sandbox start` applies.
+        let mut status = make_driver_status(ready);
+        status.conditions.push(DriverCondition {
+            r#type: "Suspended".to_string(),
+            status: "True".to_string(),
+            reason: "NetworkPolicyDrift".to_string(),
+            message: String::new(),
+            transition_time: None,
+        });
+        assert_eq!(derive_phase(Some(&status)), SandboxPhase::Stopped);
+    }
+
+    fn drift_event(source: &str, reason: &str, policy: &str) -> DriverPlatformEvent {
+        DriverPlatformEvent {
+            source: source.to_string(),
+            r#type: "Warning".to_string(),
+            reason: reason.to_string(),
+            message: "restored".to_string(),
+            metadata: [
+                ("namespace", "openshell"),
+                ("policy", policy),
+                ("drift", "spec"),
+                ("action", "replaced"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn driver_network_policy_drift_events_produce_valid_ocsf_records() {
+        for reason in ["NetworkPolicyRestored", "NetworkPolicyDriftSuspended"] {
+            let events = network_policy_drift_audit_events(
+                "sb-1",
+                "my-sandbox",
+                &drift_event(
+                    KUBERNETES_DRIVER_EVENT_SOURCE,
+                    reason,
+                    "openshell-sandbox-workloads",
+                ),
+            );
+            assert_eq!(events.len(), 2, "{reason}");
+            let values: Vec<serde_json::Value> = events
+                .iter()
+                .map(|event| serde_json::to_value(event).unwrap())
+                .collect();
+            for value in &values {
+                openshell_ocsf_validate::validate_event(value)
+                    .unwrap_or_else(|e| panic!("{e}\n{value}"));
+                assert!(
+                    value.to_string().contains("openshell-sandbox-workloads"),
+                    "{value}"
+                );
+            }
+            assert_eq!(
+                values[0]["class_uid"], 5019,
+                "config state change: {}",
+                values[0]
+            );
+            assert_eq!(values[0]["severity_id"], 3);
+            assert_eq!(
+                values[1]["class_uid"], 2004,
+                "detection finding: {}",
+                values[1]
+            );
+            assert_eq!(values[1]["severity_id"], 4);
+        }
+        // The SSH policy is not an isolation boundary: no finding.
+        let ssh = network_policy_drift_audit_events(
+            "sb-1",
+            "my-sandbox",
+            &drift_event(
+                KUBERNETES_DRIVER_EVENT_SOURCE,
+                "NetworkPolicyRestored",
+                "openshell-sandbox-ssh",
+            ),
+        );
+        assert_eq!(ssh.len(), 1);
+    }
+
+    #[test]
+    fn a_kubernetes_event_with_the_same_reason_produces_no_ocsf() {
+        for source in ["kubernetes", "", "OpenShell-Driver-Kubernetes"] {
+            assert!(
+                network_policy_drift_audit_events(
+                    "sb-1",
+                    "my-sandbox",
+                    &drift_event(
+                        source,
+                        "NetworkPolicyDriftSuspended",
+                        "openshell-sandbox-workloads"
+                    ),
+                )
+                .is_empty(),
+                "{source}"
             );
         }
     }
