@@ -233,6 +233,7 @@ fn fixture(
         shared_supervisor: None,
         network_trust_bundle: None,
         netpol_guard: Arc::default(),
+        shutdown: None,
         config: KubernetesComputeConfig {
             allow_driver_config: true,
             workspace_mode: if operator {

@@ -352,8 +352,13 @@ impl KubernetesComputeDriver {
             return GuardOutcome::Skipped("policy-unreadable");
         };
 
+        // A per-sandbox policy that was never bound (a supervisor-initiated
+        // or stopped generation) is legitimately absent.
+        let unbound_absent = write == RepairWrite::None(NoAction::PerSandboxMissing)
+            && owner_sandbox.is_none_or(|sandbox| sandbox.bound_state().bound_generation.is_none());
         // A raced or failed write is re-read on requeue before deciding.
         if drift == Drift::InSync
+            || unbound_absent
             || matches!(
                 write,
                 RepairWrite::Raced | RepairWrite::Vanished | RepairWrite::Failed(_)
@@ -480,6 +485,55 @@ impl KubernetesComputeDriver {
             }
         }
         true
+    }
+
+    /// Every key the driver expects in `namespace`: the namespace fences and
+    /// each listed sandbox's per-sandbox policies. Queued after a relist and
+    /// on the periodic resync, so a change whose event was missed is found.
+    pub(crate) async fn expected_guard_keys(&self, namespace: &str) -> Vec<PolicyKey> {
+        let Ok(lookup_api) = self
+            .supported_sandbox_api_for_lookup(self.client.clone())
+            .await
+        else {
+            return Vec::new();
+        };
+        let api =
+            Self::agent_sandbox_api(self.client.clone(), &lookup_api.resource.version, namespace);
+        let Ok(Ok(list)) = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            api.api
+                .list(&ListParams::default().labels(&self.openshell_sandbox_selector())),
+        )
+        .await
+        else {
+            return Vec::new();
+        };
+        let mut keys = vec![
+            PolicyKey::new(
+                namespace,
+                crate::sandbox_runtime::NAMESPACE_WORKLOAD_POLICY_NAME,
+            ),
+            PolicyKey::new(
+                namespace,
+                crate::sandbox_runtime::NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME,
+            ),
+        ];
+        if self.guards_managed_ssh() {
+            keys.push(PolicyKey::new(
+                namespace,
+                super::MANAGED_SSH_NETWORK_POLICY_NAME,
+            ));
+        }
+        for object in &list.items {
+            if let Ok(sandbox_id) = sandbox_id_from_object(object) {
+                let names = crate::sandbox_runtime::SandboxRuntimeNames::new(&sandbox_id);
+                keys.push(PolicyKey::new(namespace, &names.control_policy));
+                if self.shared_supervisor.is_some() {
+                    keys.push(PolicyKey::new(namespace, &names.shared_control_policy));
+                }
+            }
+        }
+        keys
     }
 
     /// The SSH policy is guarded once its own commit lands.

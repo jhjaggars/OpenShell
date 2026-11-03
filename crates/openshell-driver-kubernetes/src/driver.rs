@@ -439,12 +439,11 @@ pub(crate) enum SuspendWrite {
 }
 
 #[path = "netpol_guard.rs"]
-// The watcher that uses the rest of the core and shell lands in a later commit.
-#[allow(dead_code)]
 mod netpol_guard;
 #[path = "netpol_guard_shell.rs"]
-#[allow(dead_code)]
 mod netpol_guard_shell;
+#[path = "netpol_guard_watch.rs"]
+mod netpol_guard_watch;
 
 /// Operator-provided bootstrap bytes read once per runtime generation.
 struct StagedBootstrapMaterial {
@@ -1160,6 +1159,8 @@ pub struct KubernetesComputeDriver {
     shared_supervisor: Option<SharedSupervisor>,
     /// Per-replica state of the `NetworkPolicy` guard.
     netpol_guard: Arc<netpol_guard_shell::GuardState>,
+    /// Gateway shutdown, so background guards stop before other drains.
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl std::fmt::Debug for KubernetesComputeDriver {
@@ -1210,6 +1211,7 @@ impl KubernetesComputeDriver {
             operator_allowlist: None,
             shared_supervisor: None,
             netpol_guard: Arc::default(),
+            shutdown: None,
         }
     }
 
@@ -1359,6 +1361,7 @@ impl KubernetesComputeDriver {
             operator_allowlist,
             shared_supervisor,
             netpol_guard: Arc::default(),
+            shutdown: Some(shutdown_rx),
         };
 
         if driver.workspace_mode() == WorkspaceMode::Shared {
@@ -5871,6 +5874,7 @@ impl KubernetesComputeDriver {
         .boxed();
         let (tx, rx) = mpsc::channel(256);
         self.spawn_sandbox_runtime_periodic_reconcile(tx.clone());
+        self.spawn_netpol_guard(tx.clone());
         let readiness_client = self.watch_client.clone();
         let readiness_shared = self.shared_supervisor.clone();
 
@@ -6306,6 +6310,7 @@ where
 {
     let (tx, rx) = mpsc::channel(256);
     driver.spawn_sandbox_runtime_periodic_reconcile(tx.clone());
+    driver.spawn_netpol_guard(tx.clone());
     let readiness_shared = driver.shared_supervisor;
 
     tokio::spawn(async move {

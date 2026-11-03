@@ -964,6 +964,8 @@ mod netpol_guard_repairs {
         let annotations = &mut object["metadata"]["annotations"];
         annotations[ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION] = serde_json::json!("runtime-initiated");
         annotations[ANNOTATION_SANDBOX_RUNTIME_CONTROL_GENERATION] = serde_json::json!("gen2");
+        annotations[ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_UID] = serde_json::json!("control-uid");
+        annotations[ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_GENERATION] = serde_json::json!("1");
         let world = guarded_world(object);
         world
             .on(http::Method::GET, "/api/v1/namespaces/openshell/services/os-supervisor-sandbox-1", 200, serde_json::json!({
@@ -1091,6 +1093,126 @@ mod netpol_guard_repairs {
         let outcome = driver.guard_policy_key(&workload_key()).await;
         assert_eq!(write_of(&outcome).1, RepairWrite::BudgetExhausted);
         assert_eq!(world.bodies(&http::Method::PUT, WORKLOAD_FENCE_PATH).len(), REPAIR_BUDGET);
+    }
+
+    /// Feed watch events through the guard exactly as the worker does.
+    async fn drive(
+        driver: &KubernetesComputeDriver,
+        events: Vec<Event<NetworkPolicy>>,
+    ) -> Vec<(PolicyKey, GuardOutcome)> {
+        use crate::driver::netpol_guard_watch::{GuardMessage, messages_for_event};
+        let mut outcomes = Vec::new();
+        for event in events {
+            for message in messages_for_event(NS, &event) {
+                let keys = match message {
+                    GuardMessage::Key(key) => vec![key],
+                    GuardMessage::Namespace(namespace) => driver.expected_guard_keys(&namespace).await,
+                };
+                for key in keys {
+                    let outcome = driver.guard_policy_key(&key).await;
+                    outcomes.push((key, outcome));
+                }
+            }
+        }
+        outcomes
+    }
+
+    fn for_workload_fence(outcomes: &[(PolicyKey, GuardOutcome)]) -> Vec<GuardOutcome> {
+        outcomes
+            .iter()
+            .filter(|(key, _)| *key == workload_key())
+            .map(|(_, outcome)| outcome.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn strip_then_widen_before_the_get_is_one_full_repair() {
+        let world = guarded_world(sandbox(true));
+        let (fence, _) = stored_fences();
+        let mut stripped = fence.clone();
+        stripped.metadata.labels = None;
+        let mut stripped_and_widened = widened(&fence);
+        stripped_and_widened.metadata.labels = None;
+        // The strip leaves the selection: the watch reports DELETED. The
+        // widening lands before the queued GET-by-name runs.
+        reads(&world, WORKLOAD_FENCE_PATH, &stripped_and_widened, &repaired(&fence, 3));
+        world
+            .on(http::Method::PUT, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(repaired(&fence, 3)).unwrap())
+            .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        let driver = world.driver(KubernetesComputeConfig::default());
+        let outcomes = drive(&driver, vec![Event::Delete(stripped)]).await;
+        let outcomes = for_workload_fence(&outcomes);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(write_of(&outcomes[0]), (Drift::Spec, RepairWrite::Replaced));
+        assert_eq!(reconciled(&outcomes[0]), [suspended_by_fence_generation()]);
+        let put = &world.bodies(&http::Method::PUT, WORKLOAD_FENCE_PATH)[0];
+        assert_eq!(put["metadata"]["labels"][LABEL_MANAGED_BY], LABEL_MANAGED_BY_VALUE);
+        assert_eq!(put["spec"]["egress"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn strip_then_widen_after_the_label_repair_is_seen_through_the_selector() {
+        let world = guarded_world(sandbox(true));
+        let (fence, _) = stored_fences();
+        let mut stripped = fence.clone();
+        stripped.metadata.labels = None;
+        let relabelled = repaired(&fence, 1);
+        // The GET sees only the strip; the label repair succeeds.
+        reads(&world, WORKLOAD_FENCE_PATH, &stripped, &relabelled);
+        world.on(http::Method::PUT, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(&relabelled).unwrap());
+        world_running_pods(&world);
+        let driver = world.driver(KubernetesComputeConfig::default());
+        let first = for_workload_fence(&drive(&driver, vec![Event::Delete(stripped)]).await);
+        assert_eq!(write_of(&first[0]), (Drift::Metadata, RepairWrite::Replaced));
+        assert_eq!(reconciled(&first[0]), [ReconcileOutcome::Reconciled]);
+
+        // Then the spec is widened. The object carries its labels again, so
+        // the watch delivers MODIFIED.
+        let mut widened_after = widened(&relabelled);
+        widened_after.metadata.resource_version = Some("201".into());
+        reads(&world, WORKLOAD_FENCE_PATH, &widened_after, &repaired(&fence, 3));
+        world.forget(http::Method::PUT, WORKLOAD_FENCE_PATH);
+        world
+            .on(http::Method::PUT, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(repaired(&fence, 3)).unwrap())
+            .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        let second = for_workload_fence(&drive(&driver, vec![Event::Apply(widened_after)]).await);
+        assert_eq!(write_of(&second[0]), (Drift::Spec, RepairWrite::Replaced));
+        assert_eq!(reconciled(&second[0]), [suspended_by_fence_generation()]);
+        let puts = world.bodies(&http::Method::PUT, WORKLOAD_FENCE_PATH);
+        assert_eq!(puts[1]["metadata"]["resourceVersion"], "201");
+        assert_eq!(puts[1]["spec"]["egress"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_relist_with_no_event_still_repairs_every_expected_name() {
+        let world = guarded_world(sandbox(true));
+        let (fence, _) = stored_fences();
+        let mut stripped_and_widened = widened(&fence);
+        stripped_and_widened.metadata.labels = None;
+        // The change happened during a watch gap; after 410 Gone the relist
+        // never selects the stripped object, so only InitDone arrives.
+        reads(&world, WORKLOAD_FENCE_PATH, &stripped_and_widened, &repaired(&fence, 3));
+        world
+            .on(http::Method::PUT, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(repaired(&fence, 3)).unwrap())
+            .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        let driver = world.driver(KubernetesComputeConfig::default());
+        let outcomes = drive(&driver, vec![Event::Init, Event::InitDone]).await;
+        let keys: Vec<&str> = outcomes.iter().map(|(key, _)| key.name.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "openshell-sandbox-workloads",
+                "openshell-sandbox-supervisors",
+                "os-control-sandbox-1",
+            ]
+        );
+        let fence_outcomes = for_workload_fence(&outcomes);
+        assert_eq!(write_of(&fence_outcomes[0]), (Drift::Spec, RepairWrite::Replaced));
+        assert_eq!(reconciled(&fence_outcomes[0]), [suspended_by_fence_generation()]);
+        // An absent per-sandbox policy the sandbox never bound is left alone.
+        for (key, outcome) in &outcomes[2..] {
+            assert!(reconciled(outcome).is_empty(), "{key:?} {outcome:?}");
+        }
     }
 
     #[tokio::test]
