@@ -60,6 +60,11 @@ pub const CLAIM_VM_UID: &str = "kubevirt.vm_uid";
 pub const CLAIM_GENERATION: &str =
     openshell_sandbox_backend::boundary_protocol::KUBEVIRT_GENERATION_CLAIM;
 pub const CLAIM_IMAGE_IDENTITY: &str = "kubevirt.image_identity";
+/// How the guest workload runs, claimed in both the boundary config and
+/// the descriptor so the supervisor's confirm refuses a mode mismatch
+/// (a sandboxed guest presenting a root config, or the reverse).
+pub const CLAIM_WORKLOAD_MODE: &str = "kubevirt.workload_mode";
+
 /// The dedicated supervisor Pod's UID, claimed only in the dedicated
 /// topology (mirrors the pod path's `kubernetes.supervisor_pod_uid`).
 pub const CLAIM_SUPERVISOR_POD_UID: &str = "kubevirt.supervisor_pod_uid";
@@ -222,6 +227,8 @@ pub struct KubeVirtBoundarySpec {
     pub supervisor_tls: SandboxTlsClientConfig,
     /// The workload identity (uid/gid) the boundary runs as.
     pub workload_identity: ResolvedWorkloadIdentity,
+    /// The workload mode ("root" | "sandboxed") — claimed and confirmed.
+    pub workload_mode: &'static str,
     /// Environment the boundary passes to workload children.
     pub child_env: HashMap<String, String>,
 }
@@ -243,6 +250,10 @@ impl KubeVirtBoundarySpec {
             (
                 CLAIM_IMAGE_IDENTITY.to_string(),
                 self.image_identity.clone(),
+            ),
+            (
+                CLAIM_WORKLOAD_MODE.to_string(),
+                self.workload_mode.to_string(),
             ),
         ]);
         // The dedicated topology claims the supervisor Pod's UID (mirroring
@@ -415,6 +426,7 @@ mod tests {
             }],
             vm_uid: "vm-uid-1".to_string(),
             image_identity: "kvpoc/openshell-sandbox-vm:dev".to_string(),
+            workload_mode: "sandboxed",
             network_policy_uid: "np-uid-1".to_string(),
             network_policy_resource_version: "1945".to_string(),
             supervisor,
@@ -609,6 +621,37 @@ mod tests {
                 &provisioned.boundary_config
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn workload_mode_claim_is_in_both_config_and_descriptor() {
+        // The mode claim binds the sandbox class into the confirmed
+        // evidence: the supervisor's descriptor check refuses a mode
+        // mismatch in either direction.
+        let provisioned = spec_with(shared_target()).provision().expect("provision");
+        assert_eq!(
+            provisioned.boundary_config.resource_claims[CLAIM_WORKLOAD_MODE],
+            "sandboxed"
+        );
+        assert_eq!(
+            provisioned.runtime_descriptor.resource_claims[CLAIM_WORKLOAD_MODE],
+            "sandboxed"
+        );
+        // A root-mode config never matches a sandboxed descriptor.
+        let mut root_spec = spec_with(shared_target());
+        root_spec.workload_mode = "root";
+        let root = root_spec.provision().expect("provision");
+        assert_eq!(
+            root.boundary_config.resource_claims[CLAIM_WORKLOAD_MODE],
+            "root"
+        );
+        assert!(
+            !openshell_sandbox_backend::boundary_protocol::descriptor_matches_config(
+                &root.runtime_descriptor,
+                &provisioned.boundary_config
+            ),
+            "a root descriptor must not match a sandboxed config"
         );
     }
 
@@ -1430,6 +1473,7 @@ mod payload_tests {
             &target,
             10001,
             10001,
+            "sandboxed",
         )
         .expect("render");
         let decoded = bootstrap
@@ -1491,6 +1535,7 @@ mod payload_tests {
             &target,
             10001,
             10001,
+            "sandboxed",
         )
         .expect("render");
 
@@ -1577,6 +1622,7 @@ pub fn render_kubevirt_bootstrap(
     target: &KubeVirtSupervisorTarget,
     workload_uid: u32,
     workload_gid: u32,
+    workload_mode: &'static str,
 ) -> Result<KubeVirtBootstrap, String> {
     let launch_inputs = boundary_launch_inputs(launch_authentication)
         .map_err(|error| format!("boundary launch inputs: {error}"))?;
@@ -1603,6 +1649,7 @@ pub fn render_kubevirt_bootstrap(
         verification_keys: launch_inputs.verification_keys,
         vm_uid: vm_uid.to_string(),
         image_identity: guest_image.to_string(),
+        workload_mode: workload_mode,
         network_policy_uid: fence_uid.to_string(),
         network_policy_resource_version: fence_resource_version.to_string(),
         // The supervisor target carries the topology: the per-sandbox

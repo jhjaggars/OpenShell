@@ -1743,6 +1743,12 @@ struct KubeVirtGeneration<'a> {
     /// The guest image the rendered VM actually boots (M6: claimed, not
     /// the configured string).
     boot_image: String,
+    /// The workload uid/gid the guest boundary runs as (0/0 in root mode,
+    /// the provisioned sandbox uid in sandboxed mode).
+    workload_uid: u32,
+    workload_gid: u32,
+    /// The workload mode claim ("root" | "sandboxed").
+    workload_mode: &'static str,
 }
 
 impl KubernetesComputeDriver {
@@ -4639,6 +4645,21 @@ impl KubernetesComputeDriver {
             .await
             .map_err(KubernetesDriverError::Precondition)?;
 
+        // The user's decision: provider files are UNSUPPORTED in root
+        // workload mode — nothing secret enters the guest. The check
+        // walks the effective policy for provider references.
+        if self.config.kubevirt.workload == crate::config::KubeVirtWorkloadMode::Root {
+            if let Some(providers) = crate::kubevirt::policy_provider_references(sandbox) {
+                if !providers.is_empty() {
+                    return Err(KubernetesDriverError::InvalidArgument(format!(
+                        "provider files are not supported in kubevirt root workload mode \
+                         (the guest runs as root and would be fully exposed to the \
+                         credentials); the policy references providers: {providers:?}"
+                    )));
+                }
+            }
+        }
+
         let kube_name = self
             .config
             .kube_resource_name(&sandbox.workspace, &sandbox.name);
@@ -4855,6 +4876,8 @@ impl KubernetesComputeDriver {
         // covers them all (the fence, bootstrap Secret, and PVC are also
         // owner-referenced to the VM, so Kubernetes GC cascades them even
         // if the gateway dies mid-create).
+        let (workload_uid, workload_gid, workload_mode) =
+            crate::kubevirt::guest_workload_identity(&self.config);
         let mut created: Vec<crate::kubevirt::CreatedCompanion> = Vec::new();
         let generation = KubeVirtGeneration {
             sandbox,
@@ -4868,6 +4891,9 @@ impl KubernetesComputeDriver {
             log_level: &log_level,
             launch_authentication: &launch_authentication,
             boot_image: crate::kubevirt::kubevirt_boot_image(&vm),
+            workload_uid,
+            workload_gid,
+            workload_mode,
         };
         let supervisor_component = match self
             .provision_kubevirt_generation(&generation, &mut created)
@@ -5070,8 +5096,9 @@ impl KubernetesComputeDriver {
                 &fence_rv,
                 fence_spec,
                 &supervisor,
-                crate::kubevirt::KUBEVIRT_WORKLOAD_UID,
-                crate::kubevirt::KUBEVIRT_WORKLOAD_GID,
+                generation.workload_uid,
+                generation.workload_gid,
+                generation.workload_mode,
             )
             .map_err(KubernetesDriverError::Precondition)?
         };
@@ -6086,6 +6113,8 @@ impl KubernetesComputeDriver {
         // M6: the image identity claims the image the VM actually boots
         // (its kernelBoot containerDisk), not the configured string.
         let boot_image = crate::kubevirt::kubevirt_boot_image(&object);
+        let (workload_uid, workload_gid, workload_mode) =
+            crate::kubevirt::guest_workload_identity(&self.config);
         let bootstrap = crate::kubevirt_boundary::render_kubevirt_bootstrap(
             &authentication,
             sandbox_id,
@@ -6096,8 +6125,9 @@ impl KubernetesComputeDriver {
             &fence.resource_version,
             fence.spec,
             &supervisor,
-            crate::kubevirt::KUBEVIRT_WORKLOAD_UID,
-            crate::kubevirt::KUBEVIRT_WORKLOAD_GID,
+            workload_uid,
+            workload_gid,
+            workload_mode,
         )
         .map_err(KubernetesDriverError::Precondition)?;
 

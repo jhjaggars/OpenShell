@@ -15,16 +15,24 @@
 //!   path's `restartPolicy: Never` — supervisor exit is terminal),
 //! - one bootstrap `Secret` referenced through a `cloudInitNoCloud` volume
 //!   (transport only — the guest init parses the ISO itself, no cloud-init
-//!   software required). It carries the supervisor environment plus the
-//!   gateway-minted sandbox JWT from `DriverSandboxSpec.sandbox_token`, the
-//!   same pre-minted-token model the libkrun VM driver uses,
+//!   software required). It carries the boundary bootstrap artifacts only:
+//!   the boundary config (claims, supervisor address, public verification
+//!   keys), the session TLS key/cert, and the workload uid/gid. No gateway
+//!   token, no endpoint, no JWT — nothing the guest could use against the
+//!   gateway,
+//! - one egress-fence `NetworkPolicy` plus the namespace-wide launcher
+//!   isolation floor (deny-all ingress and egress for every
+//!   virt-launcher pod; the per-sandbox fence adds only the supervisor
+//!   allowance), both owner-referenced to the `VirtualMachine`,
 //! - one workspace `PersistentVolumeClaim` mounted by the guest init at
-//!   `/sandbox` (mirrors the pod path's PVC-backed workspace).
+//!   `/sandbox` (mirrors the pod path's PVC-backed workspace), and a
+//!   dedicated supervisor Pod with its per-sandbox Service when the
+//!   dedicated topology is configured.
 //!
 //! What the `PoC` deliberately skips: GPU, managed/operator workspace modes,
-//! mTLS to the gateway, `NetworkPolicy` coverage for virt-launcher pods,
-//! live-migration/VMI-replacement semantics, and arbitrary OCI sandbox
-//! images as VM disks (the guest image is a purpose-built containerDisk).
+//! mTLS to the gateway, live-migration/VMI-replacement semantics, and
+//! arbitrary OCI sandbox images as VM disks (the guest image is a
+//! purpose-built containerDisk).
 
 use std::collections::BTreeMap;
 
@@ -432,7 +440,16 @@ pub fn render_virtual_machine(params: &KubeVirtSandboxParams<'_>) -> DynamicObje
                         "devices": {
                             "disks": disks,
                             "filesystems": filesystems,
-                            "interfaces": [{"name": "default", "masquerade": {}}]
+                            "interfaces": [{"name": "default", "masquerade": {}}],
+                            // Minimal device surface: a root guest drives every
+                            // emulated device, so nothing optional is attached.
+                            // No graphics, no memory balloon, no input, no
+                            // USB, no VSOCK, no guest-agent channel — only
+                            // the serial console for the boot log.
+                            "autoattachGraphicsDevice": false,
+                            "autoattachMemBalloon": false,
+                            "autoattachInputDevice": false,
+                            "autoattachSerialConsole": true
                         }
                     },
                     "volumes": volumes,
@@ -459,10 +476,39 @@ pub fn render_virtual_machine(params: &KubeVirtSandboxParams<'_>) -> DynamicObje
 const KUBEVIRT_VM_LABEL: &str = "kubevirt.io/domain";
 const KUBEVIRT_VM_LABEL_VALUE: &str = "openshell";
 
+/// Provider names referenced by a sandbox's effective policy
+/// (credential_binding.provider in network policies), or None when the
+/// policy is absent. Used by the root-mode provider-files rejection.
+pub fn policy_provider_references(sandbox: &Sandbox) -> Option<Vec<String>> {
+    let spec = sandbox.spec.as_ref()?;
+    let policy = spec.policy.as_ref()?;
+    let mut providers = Vec::new();
+    for rule in policy.network_policies.values() {
+        for endpoint in &rule.endpoints {
+            if let Some(binding) = &endpoint.credential_binding {
+                providers.push(binding.provider.clone());
+            }
+        }
+    }
+    Some(providers)
+}
+
 /// The workload identity the `KubeVirt` guest's boundary runs as. The guest
 /// image provisions this uid/gid (the `sandbox` user in the Alpine guest).
 pub const KUBEVIRT_WORKLOAD_UID: u32 = 10001;
 pub const KUBEVIRT_WORKLOAD_GID: u32 = 10001;
+
+/// The workload identity and mode claim for a config: root mode runs as
+/// uid/gid 0 with the "root" mode claim; the sandboxed default keeps the
+/// provisioned sandbox uid/gid with the "sandboxed" claim.
+pub fn guest_workload_identity(config: &KubernetesComputeConfig) -> (u32, u32, &'static str) {
+    match config.kubevirt.workload {
+        crate::config::KubeVirtWorkloadMode::Root => (0, 0, "root"),
+        crate::config::KubeVirtWorkloadMode::Sandboxed => {
+            (KUBEVIRT_WORKLOAD_UID, KUBEVIRT_WORKLOAD_GID, "sandboxed")
+        }
+    }
+}
 
 /// Set on the `VirtualMachine` while the driver's create still holds it
 /// `Halted` (the W6 window between capturing the VM's UID and patching
@@ -892,6 +938,7 @@ mod tests {
                 cpu_cores: 2,
                 memory: "2Gi".to_string(),
                 workspace_pvc: true,
+                workload: Default::default(),
             },
             shared_supervisor: Some(crate::SharedSupervisorConfig {
                 service_name: "openshell-supervisor".to_string(),
@@ -984,6 +1031,20 @@ mod tests {
             .unwrap();
         assert_eq!(filesystems.len(), 1);
         assert_eq!(filesystems[0]["name"], "workspace");
+    }
+
+    #[test]
+    fn virtual_machine_minimizes_the_device_surface() {
+        // The reviewer's condition 6: a root guest drives every emulated
+        // device, so nothing optional is attached — no graphics, no memory
+        // balloon, no input. The serial console stays for the boot log.
+        let cfg = config();
+        let vm = render_virtual_machine(&params(&sandbox(), &cfg));
+        let devices = &vm.data["spec"]["template"]["spec"]["domain"]["devices"];
+        assert_eq!(devices["autoattachGraphicsDevice"], false);
+        assert_eq!(devices["autoattachMemBalloon"], false);
+        assert_eq!(devices["autoattachInputDevice"], false);
+        assert_eq!(devices["autoattachSerialConsole"], true);
     }
 
     #[test]
@@ -1264,6 +1325,7 @@ mod kubevirt_review_tests {
                 cpu_cores: 2,
                 memory: "2Gi".to_string(),
                 workspace_pvc: true,
+                workload: Default::default(),
             },
             shared_supervisor: Some(crate::SharedSupervisorConfig {
                 service_name: "openshell-supervisor".to_string(),
@@ -1972,6 +2034,88 @@ mod kubevirt_review_tests {
         let mut cfg = review_config();
         cfg.supervisor_topology = Some(crate::SupervisorTopology::Gateway);
         cfg.grpc_endpoint = String::new();
+        assert!(cfg.validate_kubevirt_config().is_ok());
+    }
+
+    #[test]
+    fn root_mode_rejects_policy_provider_references() {
+        // The user's decision: provider files are UNSUPPORTED in root
+        // workload mode — nothing secret enters the guest. The helper
+        // walks the proto policy's network_policies for
+        // credential_binding.provider references.
+        use openshell_core::proto::sandbox::v1 as sandbox_proto;
+
+        fn sandbox_with_policy(policy: sandbox_proto::SandboxPolicy) -> Sandbox {
+            Sandbox {
+                spec: Some(openshell_core::proto::compute::v1::DriverSandboxSpec {
+                    policy: Some(policy),
+                    ..Default::default()
+                }),
+                ..review_sandbox()
+            }
+        }
+
+        let endpoint = sandbox_proto::NetworkEndpoint {
+            host: "example.com".to_string(),
+            port: 443,
+            credential_binding: Some(sandbox_proto::NetworkCredentialBinding {
+                provider: "my-secret-provider".to_string(),
+            }),
+            ..Default::default()
+        };
+        let rule = sandbox_proto::NetworkPolicyRule {
+            endpoints: vec![endpoint],
+            ..Default::default()
+        };
+        let policy = sandbox_proto::SandboxPolicy {
+            network_policies: std::collections::HashMap::from([("api".to_string(), rule)]),
+            ..Default::default()
+        };
+        let sandbox = sandbox_with_policy(policy);
+        let providers = policy_provider_references(&sandbox).expect("parsed");
+        assert_eq!(providers, vec!["my-secret-provider".to_string()]);
+
+        // A policy without provider references yields an empty list.
+        let plain_endpoint = sandbox_proto::NetworkEndpoint {
+            host: "example.com".to_string(),
+            port: 443,
+            ..Default::default()
+        };
+        let plain_rule = sandbox_proto::NetworkPolicyRule {
+            endpoints: vec![plain_endpoint],
+            ..Default::default()
+        };
+        let plain_policy = sandbox_proto::SandboxPolicy {
+            network_policies: std::collections::HashMap::from([("api".to_string(), plain_rule)]),
+            ..Default::default()
+        };
+        let plain = sandbox_with_policy(plain_policy);
+        assert_eq!(policy_provider_references(&plain), Some(Vec::new()));
+    }
+
+    #[test]
+    fn root_workload_mode_requires_dedicated_supervisor() {
+        // The privileged root-workload class requires the dedicated
+        // supervisor: a shared supervisor would let a parser bug reached
+        // by a hostile root guest cross tenants.
+        let mut cfg = review_config();
+        cfg.kubevirt.workload = crate::config::KubeVirtWorkloadMode::Root;
+        cfg.shared_supervisor = None;
+        assert!(cfg.validate_kubevirt_config().is_ok());
+
+        cfg.supervisor_topology = Some(crate::SupervisorTopology::Gateway);
+        let err = cfg
+            .validate_kubevirt_config()
+            .expect_err("root + gateway topology is refused");
+        assert!(
+            err.contains("requires the dedicated supervisor topology"),
+            "message should name the requirement: {err}"
+        );
+
+        // The sandboxed default is fine with either topology.
+        let mut cfg = review_config();
+        cfg.kubevirt.workload = crate::config::KubeVirtWorkloadMode::Sandboxed;
+        cfg.supervisor_topology = Some(crate::SupervisorTopology::Gateway);
         assert!(cfg.validate_kubevirt_config().is_ok());
     }
 
