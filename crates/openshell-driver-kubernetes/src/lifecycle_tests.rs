@@ -1508,3 +1508,107 @@ mod network_policy_drift_cause {
         assert_eq!(ready.reason, "DependenciesNotReady");
     }
 }
+
+/// The managed SSH ingress `NetworkPolicy`.
+mod netpol_guard_managed_ssh {
+    use super::reconcile_request_sequences::*;
+    use super::*;
+    use crate::driver::netpol_guard::{Drift, PolicyKey};
+    use crate::driver::netpol_guard_shell::{GuardOutcome, RepairWrite, guard_signals};
+
+    const MANAGED_NS: &str = "openshell-gw-team-a";
+    const SSH_PATH: &str =
+        "/apis/networking.k8s.io/v1/namespaces/openshell-gw-team-a/networkpolicies/openshell-sandbox-ssh";
+
+    fn config() -> KubernetesComputeConfig {
+        KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Managed,
+            gateway_id: "gw".into(),
+            managed_ssh_ingress: crate::ManagedSshIngressConfig {
+                enabled: true,
+                gateway_namespace: "openshell".into(),
+                gateway_pod_selector: BTreeMap::from([("app".into(), "openshell".into())]),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn world(ssh: Option<&NetworkPolicy>) -> World {
+        let world = World::default();
+        let mut object = sandbox(true);
+        object["metadata"]["namespace"] = serde_json::json!(MANAGED_NS);
+        object["metadata"]["labels"][LABEL_GATEWAY_ID] = serde_json::json!("gw");
+        world
+            .on(
+                http::Method::GET,
+                "/api/v1/namespaces/openshell-gw-team-a",
+                200,
+                serde_json::json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": MANAGED_NS}}),
+            )
+            .on(
+                http::Method::GET,
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell-gw-team-a/sandboxes",
+                200,
+                sandbox_list(vec![object]),
+            );
+        if let Some(ssh) = ssh {
+            world.on(http::Method::GET, SSH_PATH, 200, serde_json::to_value(ssh).unwrap());
+        }
+        world
+    }
+
+    fn stored_ssh() -> NetworkPolicy {
+        let mut policy = managed_ssh_network_policy(MANAGED_NS, &config());
+        policy.metadata.resource_version = Some("10".into());
+        policy.metadata.generation = Some(1);
+        policy
+    }
+
+    #[tokio::test]
+    async fn an_edited_ssh_policy_is_replaced_without_suspending_anything() {
+        let mut edited = stored_ssh();
+        edited.spec.as_mut().unwrap().ingress.as_mut().unwrap()[0].from = None;
+        let world = world(Some(&edited));
+        world.on(http::Method::PUT, SSH_PATH, 200, serde_json::to_value(stored_ssh()).unwrap());
+        let key = PolicyKey::new(MANAGED_NS, "openshell-sandbox-ssh");
+        let outcome = world.driver(config()).guard_policy_key(&key).await;
+        let GuardOutcome::Checked { drift, write, reconciled, .. } = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!((*drift, write.clone()), (Drift::Spec, RepairWrite::Replaced));
+        assert!(reconciled.is_empty(), "SSH ingress is not bound into evidence");
+        let put = &world.bodies(&http::Method::PUT, SSH_PATH)[0];
+        assert_eq!(put["metadata"]["resourceVersion"], "10");
+        assert_eq!(put["spec"]["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"], "openshell");
+        assert!(!world.requests().iter().any(|r| r.starts_with("PATCH")));
+        let events = guard_signals(&key, &outcome);
+        assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_ssh_policy_is_recreated() {
+        let world = world(None);
+        world.on(
+            http::Method::POST,
+            "/apis/networking.k8s.io/v1/namespaces/openshell-gw-team-a/networkpolicies",
+            201,
+            serde_json::to_value(stored_ssh()).unwrap(),
+        );
+        let key = PolicyKey::new(MANAGED_NS, "openshell-sandbox-ssh");
+        let outcome = world.driver(config()).guard_policy_key(&key).await;
+        assert!(matches!(
+            outcome,
+            GuardOutcome::Checked { drift: Drift::Missing, write: RepairWrite::Created, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_ssh_policy_is_not_guarded_when_ssh_isolation_is_off() {
+        let world = world(Some(&stored_ssh()));
+        let mut config = config();
+        config.managed_ssh_ingress.enabled = false;
+        let key = PolicyKey::new(MANAGED_NS, "openshell-sandbox-ssh");
+        let outcome = world.driver(config).guard_policy_key(&key).await;
+        assert_eq!(outcome, GuardOutcome::Skipped("not-guarded"));
+    }
+}

@@ -574,10 +574,12 @@ impl KubernetesComputeDriver {
         keys
     }
 
-    /// The SSH policy is guarded once its own commit lands.
-    #[allow(clippy::unused_self)]
-    const fn guards_managed_ssh(&self) -> bool {
-        false
+    /// The managed SSH ingress policy exists only in managed mode with SSH
+    /// ingress isolation enabled; elsewhere Helm owns an SSH policy and the
+    /// guard leaves it alone.
+    fn guards_managed_ssh(&self) -> bool {
+        self.config.workspace_mode == super::WorkspaceMode::Managed
+            && self.config.managed_ssh_ingress.enabled
     }
 }
 
