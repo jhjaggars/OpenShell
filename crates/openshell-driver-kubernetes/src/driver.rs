@@ -4648,16 +4648,15 @@ impl KubernetesComputeDriver {
         // The user's decision: provider files are UNSUPPORTED in root
         // workload mode — nothing secret enters the guest. The check
         // walks the effective policy for provider references.
-        if self.config.kubevirt.workload == crate::config::KubeVirtWorkloadMode::Root {
-            if let Some(providers) = crate::kubevirt::policy_provider_references(sandbox) {
-                if !providers.is_empty() {
-                    return Err(KubernetesDriverError::InvalidArgument(format!(
-                        "provider files are not supported in kubevirt root workload mode \
-                         (the guest runs as root and would be fully exposed to the \
-                         credentials); the policy references providers: {providers:?}"
-                    )));
-                }
-            }
+        if self.config.kubevirt.workload == crate::config::KubeVirtWorkloadMode::Root
+            && let Some(providers) = crate::kubevirt::policy_provider_references(sandbox)
+            && !providers.is_empty()
+        {
+            return Err(KubernetesDriverError::InvalidArgument(format!(
+                "provider files are not supported in kubevirt root workload mode \
+                 (the guest runs as root and would be fully exposed to the \
+                 credentials); the policy references providers: {providers:?}"
+            )));
         }
 
         let kube_name = self

@@ -1649,7 +1649,7 @@ pub fn render_kubevirt_bootstrap(
         verification_keys: launch_inputs.verification_keys,
         vm_uid: vm_uid.to_string(),
         image_identity: guest_image.to_string(),
-        workload_mode: workload_mode,
+        workload_mode,
         network_policy_uid: fence_uid.to_string(),
         network_policy_resource_version: fence_resource_version.to_string(),
         // The supervisor target carries the topology: the per-sandbox

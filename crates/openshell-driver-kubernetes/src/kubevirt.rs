@@ -477,7 +477,7 @@ const KUBEVIRT_VM_LABEL: &str = "kubevirt.io/domain";
 const KUBEVIRT_VM_LABEL_VALUE: &str = "openshell";
 
 /// Provider names referenced by a sandbox's effective policy
-/// (credential_binding.provider in network policies), or None when the
+/// (`credential_binding.provider` in network policies), or None when the
 /// policy is absent. Used by the root-mode provider-files rejection.
 pub fn policy_provider_references(sandbox: &Sandbox) -> Option<Vec<String>> {
     let spec = sandbox.spec.as_ref()?;
@@ -938,7 +938,7 @@ mod tests {
                 cpu_cores: 2,
                 memory: "2Gi".to_string(),
                 workspace_pvc: true,
-                workload: Default::default(),
+                workload: crate::config::KubeVirtWorkloadMode::default(),
             },
             shared_supervisor: Some(crate::SharedSupervisorConfig {
                 service_name: "openshell-supervisor".to_string(),
@@ -1325,7 +1325,7 @@ mod kubevirt_review_tests {
                 cpu_cores: 2,
                 memory: "2Gi".to_string(),
                 workspace_pvc: true,
-                workload: Default::default(),
+                workload: crate::config::KubeVirtWorkloadMode::default(),
             },
             shared_supervisor: Some(crate::SharedSupervisorConfig {
                 service_name: "openshell-supervisor".to_string(),

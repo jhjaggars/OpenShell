@@ -164,12 +164,14 @@ impl std::fmt::Display for KubernetesRuntimeMode {
     }
 }
 
-/// How the guest workload runs: the sandboxed default (unprivileged,
-/// Landlock + seccomp enforced by the in-guest boundary) or the
-/// privileged "root VM" class (root workload, no in-guest enforcement —
-/// the boundary is demoted to an authenticated agent; the fence, the
-/// supervisor's policy, and per-boot trusted code are the boundary).
-/// The privileged class requires the dedicated supervisor topology.
+/// How the guest workload runs.
+///
+/// The sandboxed default (unprivileged, Landlock + seccomp enforced by
+/// the in-guest boundary) or the privileged "root VM" class (root
+/// workload, no in-guest enforcement — the boundary is demoted to an
+/// authenticated agent; the fence, the supervisor's policy, and per-boot
+/// trusted code are the boundary). The privileged class requires the
+/// dedicated supervisor topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum KubeVirtWorkloadMode {
