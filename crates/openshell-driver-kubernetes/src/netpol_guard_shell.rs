@@ -50,6 +50,11 @@ pub struct GuardState {
     repairs: Mutex<HashMap<PolicyKey, VecDeque<Instant>>>,
     /// Label-only repairs made by the periodic pass, signalled after it.
     restored: Mutex<Vec<PolicyKey>>,
+    /// Keys whose fail-closed step after a repair hasn't finished, because a
+    /// lifecycle gate was busy or a suspension raced. The policy is in sync by
+    /// the time the key is requeued, so this is all that remembers the step.
+    /// The value says whether generations must be suspended explicitly.
+    pending_fail_closed: Mutex<HashMap<PolicyKey, bool>>,
 }
 
 impl GuardState {
@@ -90,6 +95,20 @@ impl GuardState {
             );
         }
         false
+    }
+
+    fn take_pending_fail_closed(&self, key: &PolicyKey) -> Option<bool> {
+        self.pending_fail_closed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key)
+    }
+
+    fn set_pending_fail_closed(&self, key: &PolicyKey, suspend_explicitly: bool) {
+        self.pending_fail_closed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.clone(), suspend_explicitly);
     }
 
     fn record_restore(&self, namespace: &str, name: &str) {
@@ -177,12 +196,24 @@ impl GuardOutcome {
                 write, reconciled, ..
             } => {
                 matches!(write, RepairWrite::Raced | RepairWrite::Vanished)
-                    || reconciled.iter().any(|(_, outcome)| {
-                        *outcome == ReconcileOutcome::Skipped(SkipReason::GateBusy)
-                    })
+                    || reconciled
+                        .iter()
+                        .any(|(_, outcome)| fail_closed_unfinished(*outcome))
             }
         }
     }
+}
+
+/// Whether a sandbox's fail-closed step must run again.
+const fn fail_closed_unfinished(outcome: ReconcileOutcome) -> bool {
+    matches!(
+        outcome,
+        ReconcileOutcome::Skipped(SkipReason::GateBusy | SkipReason::RefreshFailed)
+            | ReconcileOutcome::Suspended {
+                write: SuspendWrite::Raced | SuspendWrite::Failed,
+                ..
+            }
+    )
 }
 
 /// Perform a planned repair. Every write carries a precondition: a create
@@ -403,13 +434,16 @@ impl KubernetesComputeDriver {
         let unbound_absent = write == RepairWrite::None(NoAction::PerSandboxMissing)
             && owner_sandbox.is_none_or(|sandbox| sandbox.bound_state().bound_generation.is_none());
         // A raced or failed write is re-read on requeue before deciding.
-        if drift == Drift::InSync
-            || unbound_absent
-            || matches!(
-                write,
-                RepairWrite::Raced | RepairWrite::Vanished | RepairWrite::Failed(_)
-            )
-        {
+        let retry_write = matches!(
+            write,
+            RepairWrite::Raced | RepairWrite::Vanished | RepairWrite::Failed(_)
+        );
+        let pending = if retry_write {
+            None
+        } else {
+            self.netpol_guard.take_pending_fail_closed(key)
+        };
+        if retry_write || ((drift == Drift::InSync || unbound_absent) && pending.is_none()) {
             return GuardOutcome::Checked {
                 kind,
                 drift,
@@ -432,9 +466,10 @@ impl KubernetesComputeDriver {
         // reconcile below would pass once it is repaired. A spec change may
         // have selected workloads and opened their egress, so fail closed
         // explicitly for every generation that may be running.
-        let suspend_explicitly = matches!(kind, GuardedKind::SupervisorEgress)
-            && drift == Drift::Spec
-            && write.written();
+        let suspend_explicitly = pending == Some(true)
+            || (matches!(kind, GuardedKind::SupervisorEgress)
+                && drift == Drift::Spec
+                && write.written());
         for sandbox in reconcile {
             let outcome = if suspend_explicitly && sandbox.bound_state().may_run {
                 self.suspend_after_policy_drift(
@@ -447,6 +482,13 @@ impl KubernetesComputeDriver {
                 Box::pin(self.reconcile_one_sandbox_runtime(&lookup_api, &sandbox.object)).await
             };
             reconciled.push((sandbox.sandbox_id.clone(), outcome));
+        }
+        if reconciled
+            .iter()
+            .any(|(_, outcome)| fail_closed_unfinished(*outcome))
+        {
+            self.netpol_guard
+                .set_pending_fail_closed(key, suspend_explicitly);
         }
         GuardOutcome::Checked {
             kind,

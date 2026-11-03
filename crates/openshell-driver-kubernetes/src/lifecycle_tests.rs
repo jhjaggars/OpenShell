@@ -1347,6 +1347,87 @@ mod netpol_guard_repairs {
         assert!(world.bodies(&http::Method::PATCH, CR_PATH).is_empty());
     }
 
+    #[test]
+    fn create_and_start_validation_accept_every_accepted_render() {
+        let (fence, _) = stored_fences();
+        let mut next_render = fence.clone();
+        next_render.spec.as_mut().unwrap().egress =
+            Some(vec![k8s_openapi::api::networking::v1::NetworkPolicyEgressRule::default()]);
+        let accepted = [fence.clone(), next_render.clone()];
+        // A replica that accepts both renders neither rejects nor suspends on
+        // what the next release wrote, and the stamp doesn't matter either.
+        validate_accepted_sandbox_runtime_policy(&next_render, &accepted).unwrap();
+        let mut stamped = next_render.clone();
+        stamped
+            .metadata
+            .annotations
+            .get_or_insert_default()
+            .insert("openshell.ai/rendered-by".into(), "openshell 999".into());
+        validate_accepted_sandbox_runtime_policy(&stamped, &accepted).unwrap();
+        assert!(sandbox_runtime_namespace_fence_generation_matches(&next_render, &{
+            let object: DynamicObject = serde_json::from_value(sandbox(true)).unwrap();
+            object
+        }));
+        // A release that doesn't accept it fails validation.
+        validate_accepted_sandbox_runtime_policy(&next_render, std::slice::from_ref(&fence))
+            .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn a_busy_gate_during_the_fail_closed_step_retries_after_the_policy_is_in_sync() {
+        let world = guarded_world(sandbox(true));
+        let (fence, _) = stored_fences();
+        reads(&world, WORKLOAD_FENCE_PATH, &widened(&fence), &repaired(&fence, 3));
+        world
+            .on(http::Method::PUT, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(repaired(&fence, 3)).unwrap())
+            .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        let driver = world.driver(KubernetesComputeConfig::default());
+        let held = driver.lifecycle_gates.gate_for("sandbox-1").lock_owned().await;
+        let first = driver.guard_policy_key(&workload_key()).await;
+        assert_eq!(write_of(&first), (Drift::Spec, RepairWrite::Replaced));
+        assert_eq!(reconciled(&first), [ReconcileOutcome::Skipped(SkipReason::GateBusy)]);
+        assert!(first.needs_requeue());
+        drop(held);
+        // Requeued: the policy is now in sync, but the sandbox still suspends.
+        let second = driver.guard_policy_key(&workload_key()).await;
+        assert_eq!(write_of(&second), (Drift::InSync, RepairWrite::None(NoAction::InSync)));
+        assert_eq!(reconciled(&second), [suspended_by_fence_generation()]);
+        assert!(!second.needs_requeue());
+        // Done: the next check of the in-sync policy does nothing.
+        let third = driver.guard_policy_key(&workload_key()).await;
+        assert!(reconciled(&third).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_raced_supervisor_suspension_is_retried_after_the_policy_is_in_sync() {
+        let world = guarded_world(sandbox(true));
+        let (_, supervisor) = stored_fences();
+        let mut edited = supervisor.clone();
+        edited.spec.as_mut().unwrap().pod_selector = LabelSelector::default();
+        edited.metadata.resource_version = Some("101".into());
+        reads(&world, SUPERVISOR_FENCE_PATH, &edited, &repaired(&supervisor, 3));
+        world.on(http::Method::PUT, SUPERVISOR_FENCE_PATH, 200, serde_json::to_value(repaired(&supervisor, 3)).unwrap());
+        for _ in 0..3 {
+            world.on(http::Method::PATCH, CR_PATH, 409, conflict_status());
+        }
+        world.on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        let key = PolicyKey::new(NS, "openshell-sandbox-supervisors");
+        let driver = world.driver(KubernetesComputeConfig::default());
+        let trigger = SuspendTrigger::FenceSpec { supervisor: true };
+        let first = driver.guard_policy_key(&key).await;
+        assert_eq!(
+            reconciled(&first),
+            [ReconcileOutcome::Suspended { trigger, write: SuspendWrite::Raced }]
+        );
+        assert!(first.needs_requeue());
+        let second = driver.guard_policy_key(&key).await;
+        assert_eq!(write_of(&second).0, Drift::InSync);
+        assert_eq!(
+            reconciled(&second),
+            [ReconcileOutcome::Suspended { trigger, write: SuspendWrite::Written }]
+        );
+    }
+
     #[tokio::test]
     async fn no_sandboxes_means_no_repairs() {
         let world = guarded_world(sandbox(true));
