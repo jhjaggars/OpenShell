@@ -342,8 +342,12 @@ impl KubernetesComputeDriver {
             };
             let lock = self.netpol_guard.namespace_lock(&key.namespace);
             let _namespace = lock.lock().await;
-            self.repair_policy(&expected, owner_sandbox.map(TrustedSandbox::bound_state))
-                .await
+            self.repair_policy(
+                &expected,
+                owner_sandbox.map(TrustedSandbox::bound_state),
+                false,
+            )
+            .await
         }) else {
             return GuardOutcome::Skipped("policy-unreadable");
         };
@@ -394,6 +398,7 @@ impl KubernetesComputeDriver {
         &self,
         expected: &ExpectedPolicy,
         bound: Option<BoundState>,
+        metadata_only: bool,
     ) -> Option<(Drift, RepairWrite)> {
         let api: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), &expected.key.namespace);
         let observed = match tokio::time::timeout(KUBE_API_TIMEOUT, api.get_opt(&expected.key.name))
@@ -407,6 +412,9 @@ impl KubernetesComputeDriver {
             Err(_) => return None,
         };
         let drift = classify(observed.as_ref(), expected);
+        if metadata_only && drift != Drift::Metadata {
+            return Some((drift, RepairWrite::None(NoAction::InSync)));
+        }
         let action = plan_repair(
             drift,
             observed.as_ref(),
@@ -426,6 +434,52 @@ impl KubernetesComputeDriver {
             self.netpol_guard.record_repair(&expected.key, now);
         }
         Some((drift, write))
+    }
+
+    /// Restore namespace fences whose spec is intact but whose labels or
+    /// annotations were changed. Returns `true` when both fences now match,
+    /// so the caller can continue with the generation check, which stays
+    /// authoritative. Spec drift, a missing fence or a failed repair returns
+    /// `false` and the caller fails closed as before.
+    pub(crate) async fn restore_label_only_fence_drift(&self, namespace: &str) -> bool {
+        let lock = self.netpol_guard.namespace_lock(namespace);
+        let _namespace = lock.lock().await;
+        for (name, kind) in [
+            (
+                crate::sandbox_runtime::NAMESPACE_WORKLOAD_POLICY_NAME,
+                GuardedKind::WorkloadFence,
+            ),
+            (
+                crate::sandbox_runtime::NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME,
+                GuardedKind::SupervisorEgress,
+            ),
+        ] {
+            let Some(expected) = ExpectedPolicy::build(
+                PolicyKey::new(namespace, name),
+                kind,
+                &RenderInputs {
+                    namespace,
+                    config: &self.config,
+                    owner: None,
+                    shared_target: None,
+                },
+            ) else {
+                return false;
+            };
+            match self.repair_policy(&expected, None, true).await {
+                Some((Drift::InSync, _)) => {}
+                Some((Drift::Metadata, RepairWrite::Replaced)) => {
+                    warn!(
+                        namespace,
+                        policy = name,
+                        drift = Drift::Metadata.as_str(),
+                        "restored NetworkPolicy labels; enforcement was unchanged"
+                    );
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// The SSH policy is guarded once its own commit lands.

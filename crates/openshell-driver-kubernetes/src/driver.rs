@@ -5198,6 +5198,10 @@ impl KubernetesComputeDriver {
         let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), namespace);
         match self.create_sandbox_runtime_fence(namespace, &names).await {
             Ok(()) => {}
+            // Labels alone don't change enforcement: restore them and let the
+            // generation check below decide.
+            Err(KubernetesDriverError::Precondition(_))
+                if self.restore_label_only_fence_drift(namespace).await => {}
             Err(KubernetesDriverError::Precondition(error)) => {
                 warn!(sandbox_id, %error, "sandbox-runtime workload fence is altered; suspending workload");
                 let write = self

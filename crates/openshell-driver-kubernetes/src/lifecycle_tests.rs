@@ -581,27 +581,64 @@ mod reconcile_request_sequences {
         assert_eq!(outcome, suspended_by(SuspendTrigger::FenceSpec));
         assert_eq!(
             world.requests(),
-            [get(LIST_PATH), get(CR_PATH), get(WORKLOAD_FENCE_PATH), patch(CR_PATH)]
+            [
+                get(LIST_PATH),
+                get(CR_PATH),
+                get(WORKLOAD_FENCE_PATH),
+                // The 30-second pass classifies before failing closed.
+                get(WORKLOAD_FENCE_PATH),
+                patch(CR_PATH),
+            ]
         );
         assert!(suspended(&world));
     }
 
     #[tokio::test]
-    async fn label_stripped_workload_fence_suspends_today() {
+    async fn label_stripped_workload_fence_is_restored_without_suspending() {
+        let world = world_with(sandbox(true));
+        let (workload, _) = stored_fences();
+        let mut stripped = workload.clone();
+        stripped.metadata.labels = None;
+        world.forget(http::Method::GET, WORKLOAD_FENCE_PATH);
+        world
+            .on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(&stripped).unwrap())
+            .on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(&stripped).unwrap())
+            .on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(&workload).unwrap())
+            .on(http::Method::PUT, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(&workload).unwrap());
+        world_running_pods(&world);
+        let outcome = reconcile(&world).await;
+        assert_eq!(outcome, ReconcileOutcome::Reconciled);
+        assert!(!suspended(&world), "{:#?}", world.requests());
+        assert_eq!(
+            world.requests()[..6],
+            [
+                get(LIST_PATH),
+                get(CR_PATH),
+                get(WORKLOAD_FENCE_PATH),
+                get(WORKLOAD_FENCE_PATH),
+                format!("PUT {WORKLOAD_FENCE_PATH}"),
+                get(SUPERVISOR_FENCE_PATH),
+            ]
+        );
+        let put = &world.bodies(&http::Method::PUT, WORKLOAD_FENCE_PATH)[0];
+        assert_eq!(put["metadata"]["labels"][LABEL_MANAGED_BY], LABEL_MANAGED_BY_VALUE);
+        assert_eq!(put["metadata"]["resourceVersion"], "100");
+    }
+
+    #[tokio::test]
+    async fn label_stripped_and_widened_fence_still_suspends() {
         let world = world_with(sandbox(true));
         let (mut workload, _) = stored_fences();
         workload.metadata.labels = None;
-        world.routes.lock().unwrap().remove(&(http::Method::GET, WORKLOAD_FENCE_PATH.to_string()));
+        workload.spec.as_mut().unwrap().egress =
+            Some(vec![k8s_openapi::api::networking::v1::NetworkPolicyEgressRule::default()]);
+        world.forget(http::Method::GET, WORKLOAD_FENCE_PATH);
         world
             .on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(workload).unwrap())
             .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
         let outcome = reconcile(&world).await;
         assert_eq!(outcome, suspended_by(SuspendTrigger::FenceSpec));
-        assert_eq!(
-            world.requests(),
-            [get(LIST_PATH), get(CR_PATH), get(WORKLOAD_FENCE_PATH), patch(CR_PATH)]
-        );
-        assert!(suspended(&world));
+        assert!(!world.requests().iter().any(|r| r.starts_with("PUT")));
     }
 
     #[tokio::test]
