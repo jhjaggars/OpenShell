@@ -56,7 +56,7 @@ slow-timeout = { period = "60s", terminate-after = 20 }
 # every sandbox in the namespace, so they run one at a time; each case also
 # stops and restarts its sandbox several times.
 [[profile.e2e-kubernetes.overrides]]
-filter = "test(/^(workload_fence_is_restored_after_every_mutation|supervisor_egress_is_restored_after_every_mutation|control_policy_is_repaired_and_never_resurrected|strip_then_widen_is_repaired_and_fails_closed|each_repair_is_signalled_once_across_gateway_replicas|managed_namespaces_get_the_guard_binding_and_watch|an_existing_managed_namespace_is_guarded_after_a_gateway_restart)$/)"
+filter = "test(/^(workload_fence_is_restored_after_every_mutation|supervisor_egress_is_restored_after_every_mutation|control_policy_is_repaired_and_never_resurrected|shared_control_policy_is_repaired_and_never_resurrected|strip_then_widen_is_repaired_and_fails_closed|each_repair_is_signalled_once_across_gateway_replicas|managed_namespaces_get_the_guard_binding_and_watch|an_existing_managed_namespace_is_guarded_after_a_gateway_restart)$/)"
 test-group = "kubernetes-netpol-guard"
 slow-timeout = { period = "60s", terminate-after = 20 }
 

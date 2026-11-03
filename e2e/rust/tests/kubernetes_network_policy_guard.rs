@@ -14,8 +14,9 @@
 //!
 //! These cases mutate namespace-wide policies, which suspends every sandbox
 //! in the namespace, so they run only when `OPENSHELL_E2E_NETPOL_GUARD`
-//! selects them: `isolation` (the default Helm lane) or `managed` (with
-//! `values-workspace-managed.yaml`). Use `mise run e2e:kubernetes:netpol-guard`.
+//! selects them: `isolation` (the default Helm lane), `shared-supervisor`,
+//! `managed` (with `values-workspace-managed.yaml`) or `ha` (two gateway
+//! replicas). Use the `e2e:kubernetes:netpol-guard*` mise tasks.
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -690,6 +691,61 @@ async fn each_repair_is_signalled_once_across_gateway_replicas() {
     sandbox.cleanup().await;
 }
 
+/// Shared supervisor topology: the per-sandbox allowance to the shared
+/// supervisor is replaced after drift and never re-created by the guard.
+#[tokio::test]
+async fn shared_control_policy_is_repaired_and_never_resurrected() {
+    if !selected("shared-supervisor") {
+        return;
+    }
+    let mut sandbox = create_sandbox().await;
+    let ns = namespace();
+    let id = sandbox_id(&sandbox.name, None).await;
+    let name = format!("os-shared-control-{id}");
+    assert!(
+        policy(&ns, &name).await.is_some(),
+        "{name} missing; this lane must place sandboxes on the shared supervisor"
+    );
+    for mutation in [Mutation::Edit, Mutation::Replace, Mutation::StripLabels] {
+        let case = format!("os-shared-control/{}", mutation.as_str());
+        let expected = baseline(&ns, &name).await;
+        let since = mutate(&ns, &name, mutation).await;
+        wait_restored(&ns, &name, &expected, since, &case).await;
+        if mutation == Mutation::StripLabels {
+            assert_not_suspended(&sandbox.name, None, &case).await;
+        } else {
+            wait_drift_suspended(&sandbox.name, None, &name, since, &case).await;
+            start_and_exec(&sandbox, None, &case.replace('/', "-")).await;
+        }
+    }
+    let since = mutate(&ns, &name, Mutation::Delete).await;
+    wait_drift_suspended(
+        &sandbox.name,
+        None,
+        &name,
+        since,
+        "os-shared-control/delete",
+    )
+    .await;
+    assert!(
+        policy(&ns, &name).await.is_none(),
+        "the guard must not re-create {name}"
+    );
+    start_and_exec(&sandbox, None, "os-shared-control-delete").await;
+    assert!(
+        policy(&ns, &name).await.is_some(),
+        "start re-creates {name}"
+    );
+    mutate(&ns, &name, Mutation::Delete).await;
+    sandbox.delete().await.expect("delete sandbox");
+    tokio::time::sleep(Duration::from_secs(40)).await;
+    assert!(
+        policy(&ns, &name).await.is_none(),
+        "{name} came back after its sandbox was deleted"
+    );
+    println!("NETPOL_NO_RESURRECTION policy={name} observed_s=40");
+}
+
 /// Managed mode: the guard binds its role in each managed namespace and
 /// restores the namespace fences and the SSH ingress policy there.
 #[tokio::test]
@@ -753,8 +809,12 @@ async fn managed_namespaces_get_the_guard_binding_and_watch() {
         "the gateway must not watch NetworkPolicies cluster-wide"
     );
 
-    for policy_name in [SSH, WORKLOADS] {
-        for mutation in [Mutation::Delete, Mutation::Edit] {
+    for (policy_name, mutations) in [
+        (SSH, &Mutation::ALL[..]),
+        (WORKLOADS, &[Mutation::Delete, Mutation::Edit][..]),
+    ] {
+        for mutation in mutations {
+            let mutation = *mutation;
             let case = format!("managed-{policy_name}/{}", mutation.as_str());
             let expected = baseline(&ns, policy_name).await;
             let since = mutate(&ns, policy_name, mutation).await;
@@ -764,6 +824,10 @@ async fn managed_namespaces_get_the_guard_binding_and_watch() {
                 let (output, code) =
                     run_cli(&["sandbox", "start", &name, "--workspace", &workspace]).await;
                 assert_eq!(code, 0, "{case}: start: {output}");
+            } else {
+                // SSH ingress isn't bound into evidence: nothing is suspended.
+                let phase = sandbox_json(&name, Some(&workspace)).await["phase"].clone();
+                assert_eq!(phase, "Ready", "{case}: SSH repair must not suspend");
             }
         }
     }
