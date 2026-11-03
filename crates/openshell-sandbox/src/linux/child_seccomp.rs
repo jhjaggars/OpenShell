@@ -75,6 +75,13 @@ impl ChildHardeningProgram {
         if self.set_no_new_privs {
             set_no_new_privileges()?;
         }
+        // The privileged (root-workload) noop program has no instructions:
+        // the kernel rejects a zero-length seccomp filter with EINVAL, so
+        // skip the syscall entirely. The process invariants (close-on-exec,
+        // optionally no_new_privs) are already applied above.
+        if self.instructions.is_empty() {
+            return Ok(());
+        }
         let len = u16::try_from(self.instructions.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -620,5 +627,37 @@ mod tests {
             "isolated probe failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+#[cfg(test)]
+mod noop_tests {
+    use super::ChildHardeningProgram;
+
+    #[test]
+    fn noop_program_install_skips_the_seccomp_syscall() {
+        // The kernel rejects a zero-length seccomp filter with EINVAL, so
+        // noop().install() must return Ok without making the syscall.
+        // Run in a forked child because install() calls pre-exec-only
+        // operations (setpgid would fail in the parent).
+        unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                let mut program = ChildHardeningProgram::noop();
+                let result = program.install();
+                if result.is_ok() {
+                    std::process::exit(0);
+                } else {
+                    std::process::exit(1);
+                }
+            }
+            let mut status = 0;
+            libc::waitpid(pid, std::ptr::addr_of_mut!(status), 0);
+            assert_eq!(
+                libc::WEXITSTATUS(status),
+                0,
+                "noop().install() must succeed (the seccomp syscall is skipped for empty programs)"
+            );
+        }
     }
 }

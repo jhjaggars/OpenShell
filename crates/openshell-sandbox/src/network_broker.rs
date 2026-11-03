@@ -227,7 +227,7 @@ pub struct NetworkBroker {
     dns_address: SocketAddr,
     healthy: Arc<AtomicBool>,
     /// True when this broker was explicitly constructed as unavailable for
-    /// the privileged (root-workload) mode — not a crash. confirm_healthy
+    /// the privileged (root-workload) mode — not a crash. `confirm_healthy`
     /// succeeds (the state is designed, not a failure); network requests
     /// are still refused because there are no pending channels.
     designed_unavailable: bool,
@@ -247,8 +247,18 @@ impl NetworkBroker {
     /// a clear error instead of silently bypassing policy. The nftables
     /// transparent relay (commit 5) is the replacement mediation path.
     pub(crate) fn unavailable() -> io::Result<Self> {
-        let (_pending_tx, pending_rx) = mpsc::channel(1);
-        let (_dns_tx, dns_rx) = mpsc::channel(1);
+        // Keep the channel senders alive (do NOT drop them): the supervisor's
+        // proxy accept loop and policy DNS open Mediate streams on the
+        // boundary, and dropping the senders ends those streams immediately,
+        // causing a hot retry loop (~0.15 core per idle root sandbox).
+        // Holding the senders keeps the streams open and idle — the proxy
+        // waits for pending connections that never arrive, which is the
+        // correct idle behaviour.
+        let (pending_tx, pending_rx) = mpsc::channel(1);
+        let (dns_tx, dns_rx) = mpsc::channel(1);
+        // Leak the senders so they stay alive for the broker's lifetime.
+        std::mem::forget(pending_tx);
+        std::mem::forget(dns_tx);
         let healthy = Arc::new(AtomicBool::new(false));
         let broker = Self {
             provider_files: crate::provider_files::ProviderFiles::default(),

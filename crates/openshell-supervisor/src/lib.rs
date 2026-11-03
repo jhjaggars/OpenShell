@@ -1658,6 +1658,11 @@ pub async fn run_sandbox_instance(
     // streams end immediately and exit, which the lifecycle treats as fatal.
     // Skip the proxy-exit signal for that mode — the proxy stays running but
     // has nothing to mediate until the relay lands.
+    //
+    // The mode is read from the confirmed boundary's confirmation, which is
+    // equivalent to the trusted launch descriptor because confirm enforces
+    // confirmation.resource_claims == self.resource_claims (the descriptor's
+    // claims) — the boundary cannot pick the mode.
     let privileged_mode = confirmed
         .confirmation()
         .resource_claims
