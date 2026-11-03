@@ -443,12 +443,21 @@ pub fn render_virtual_machine(params: &KubeVirtSandboxParams<'_>) -> DynamicObje
                             "interfaces": [{"name": "default", "masquerade": {}}],
                             // Minimal device surface: a root guest drives every
                             // emulated device, so nothing optional is attached.
-                            // No graphics, no memory balloon, no input, no
-                            // USB, no VSOCK, no guest-agent channel — only
-                            // the serial console for the boot log.
+                            // No graphics, no memory balloon, no VSOCK — the
+                            // serial console stays for the boot log. Still
+                            // present per the live domain XML: the guest-agent
+                            // virtio-serial channel (KubeVirt adds it
+                            // unconditionally; a hook sidecar is the removal
+                            // path, pending a design call), the q35 implicit
+                            // PS/2 input devices, the iTCO watchdog (a root
+                            // guest can arm it for an in-place reset — the
+                            // reset detection covers it), and empty SATA/SCSI
+                            // controllers. The RFC documents the full
+                            // inventory.
                             "autoattachGraphicsDevice": false,
                             "autoattachMemBalloon": false,
                             "autoattachInputDevice": false,
+                            "autoattachVSOCK": false,
                             "autoattachSerialConsole": true
                         }
                     },
@@ -476,23 +485,6 @@ pub fn render_virtual_machine(params: &KubeVirtSandboxParams<'_>) -> DynamicObje
 const KUBEVIRT_VM_LABEL: &str = "kubevirt.io/domain";
 const KUBEVIRT_VM_LABEL_VALUE: &str = "openshell";
 
-/// Provider names referenced by a sandbox's effective policy
-/// (`credential_binding.provider` in network policies), or None when the
-/// policy is absent. Used by the root-mode provider-files rejection.
-pub fn policy_provider_references(sandbox: &Sandbox) -> Option<Vec<String>> {
-    let spec = sandbox.spec.as_ref()?;
-    let policy = spec.policy.as_ref()?;
-    let mut providers = Vec::new();
-    for rule in policy.network_policies.values() {
-        for endpoint in &rule.endpoints {
-            if let Some(binding) = &endpoint.credential_binding {
-                providers.push(binding.provider.clone());
-            }
-        }
-    }
-    Some(providers)
-}
-
 /// The workload identity the `KubeVirt` guest's boundary runs as. The guest
 /// image provisions this uid/gid (the `sandbox` user in the Alpine guest).
 pub const KUBEVIRT_WORKLOAD_UID: u32 = 10001;
@@ -503,10 +495,14 @@ pub const KUBEVIRT_WORKLOAD_GID: u32 = 10001;
 /// provisioned sandbox uid/gid with the "sandboxed" claim.
 pub fn guest_workload_identity(config: &KubernetesComputeConfig) -> (u32, u32, &'static str) {
     match config.kubevirt.workload {
-        crate::config::KubeVirtWorkloadMode::Root => (0, 0, "root"),
-        crate::config::KubeVirtWorkloadMode::Sandboxed => {
-            (KUBEVIRT_WORKLOAD_UID, KUBEVIRT_WORKLOAD_GID, "sandboxed")
+        crate::config::KubeVirtWorkloadMode::Root => {
+            (0, 0, crate::config::KubeVirtWorkloadMode::Root.claim())
         }
+        crate::config::KubeVirtWorkloadMode::Sandboxed => (
+            KUBEVIRT_WORKLOAD_UID,
+            KUBEVIRT_WORKLOAD_GID,
+            crate::config::KubeVirtWorkloadMode::Sandboxed.claim(),
+        ),
     }
 }
 
@@ -2035,62 +2031,6 @@ mod kubevirt_review_tests {
         cfg.supervisor_topology = Some(crate::SupervisorTopology::Gateway);
         cfg.grpc_endpoint = String::new();
         assert!(cfg.validate_kubevirt_config().is_ok());
-    }
-
-    #[test]
-    fn root_mode_rejects_policy_provider_references() {
-        // The user's decision: provider files are UNSUPPORTED in root
-        // workload mode — nothing secret enters the guest. The helper
-        // walks the proto policy's network_policies for
-        // credential_binding.provider references.
-        use openshell_core::proto::sandbox::v1 as sandbox_proto;
-
-        fn sandbox_with_policy(policy: sandbox_proto::SandboxPolicy) -> Sandbox {
-            Sandbox {
-                spec: Some(openshell_core::proto::compute::v1::DriverSandboxSpec {
-                    policy: Some(policy),
-                    ..Default::default()
-                }),
-                ..review_sandbox()
-            }
-        }
-
-        let endpoint = sandbox_proto::NetworkEndpoint {
-            host: "example.com".to_string(),
-            port: 443,
-            credential_binding: Some(sandbox_proto::NetworkCredentialBinding {
-                provider: "my-secret-provider".to_string(),
-            }),
-            ..Default::default()
-        };
-        let rule = sandbox_proto::NetworkPolicyRule {
-            endpoints: vec![endpoint],
-            ..Default::default()
-        };
-        let policy = sandbox_proto::SandboxPolicy {
-            network_policies: std::collections::HashMap::from([("api".to_string(), rule)]),
-            ..Default::default()
-        };
-        let sandbox = sandbox_with_policy(policy);
-        let providers = policy_provider_references(&sandbox).expect("parsed");
-        assert_eq!(providers, vec!["my-secret-provider".to_string()]);
-
-        // A policy without provider references yields an empty list.
-        let plain_endpoint = sandbox_proto::NetworkEndpoint {
-            host: "example.com".to_string(),
-            port: 443,
-            ..Default::default()
-        };
-        let plain_rule = sandbox_proto::NetworkPolicyRule {
-            endpoints: vec![plain_endpoint],
-            ..Default::default()
-        };
-        let plain_policy = sandbox_proto::SandboxPolicy {
-            network_policies: std::collections::HashMap::from([("api".to_string(), plain_rule)]),
-            ..Default::default()
-        };
-        let plain = sandbox_with_policy(plain_policy);
-        assert_eq!(policy_provider_references(&plain), Some(Vec::new()));
     }
 
     #[test]

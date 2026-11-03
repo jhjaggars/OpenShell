@@ -625,6 +625,39 @@ mod tests {
     }
 
     #[test]
+    fn root_mode_bootstrap_renders_with_uid_zero_identity() {
+        // B1: the root workload class must render a bootstrap end to end.
+        // The standard ResolvedWorkloadIdentity::new refuses UID/GID zero,
+        // so the privileged constructor is used; the identity and the mode
+        // claim are checked.
+        let auth = payload_tests::test_launch_authentication();
+        let target = shared_target();
+        let bootstrap = render_kubevirt_bootstrap(
+            &auth,
+            "sbx-1",
+            "sandbox-1",
+            "vm-uid-1",
+            "kvpoc/openshell-sandbox-vm:dev",
+            "np-uid-1",
+            "1945",
+            serde_json::json!({}),
+            &target,
+            0,
+            0,
+            "root",
+        )
+        .expect("root-mode bootstrap renders");
+        // The descriptor carries the mode claim and the uid-0 identity.
+        assert_eq!(
+            bootstrap.runtime_descriptor.resource_claims[CLAIM_WORKLOAD_MODE],
+            "root"
+        );
+        let identity = &bootstrap.runtime_descriptor.workload_identity;
+        assert_eq!(identity.uid, 0, "root mode runs as uid 0");
+        assert_eq!(identity.gid, 0, "root mode runs as gid 0");
+    }
+
+    #[test]
     fn workload_mode_claim_is_in_both_config_and_descriptor() {
         // The mode claim binds the sandbox class into the confirmed
         // evidence: the supervisor's descriptor check refuses a mode
@@ -1418,7 +1451,7 @@ mod payload_tests {
         }
     }
 
-    fn test_launch_authentication() -> SandboxLaunchAuthentication {
+    pub(super) fn test_launch_authentication() -> SandboxLaunchAuthentication {
         use openshell_core::jwt::{
             CredentialEpoch, SecretJwt, SessionRotation, SessionVerificationKey,
             SupervisorAuthBundle,
@@ -1627,13 +1660,24 @@ pub fn render_kubevirt_bootstrap(
     let launch_inputs = boundary_launch_inputs(launch_authentication)
         .map_err(|error| format!("boundary launch inputs: {error}"))?;
 
-    let workload_identity = ResolvedWorkloadIdentity::new(
-        workload_uid,
-        workload_gid,
-        Vec::new(),
-        "kubevirt-config".to_string(),
-        format!("sandbox:{vm_uid}"),
-    )
+    let workload_identity = if workload_mode == "root" {
+        // The privileged VM class runs the workload as root by design
+        // (kernel separation is the boundary); the standard constructor
+        // refuses UID/GID zero, which is the right invariant for every
+        // other workload.
+        ResolvedWorkloadIdentity::new_privileged(
+            "kubevirt-config".to_string(),
+            format!("sandbox:{vm_uid}"),
+        )
+    } else {
+        ResolvedWorkloadIdentity::new(
+            workload_uid,
+            workload_gid,
+            Vec::new(),
+            "kubevirt-config".to_string(),
+            format!("sandbox:{vm_uid}"),
+        )
+    }
     .map_err(|error| format!("workload identity: {error}"))?;
 
     let spec = KubeVirtBoundarySpec {

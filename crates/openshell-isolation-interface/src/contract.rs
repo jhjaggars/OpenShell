@@ -185,6 +185,33 @@ impl ResolvedWorkloadIdentity {
             resource_digest,
         })
     }
+
+    /// Construct the identity for a privileged (root-workload) sandbox.
+    ///
+    /// The standard [`Self::new`] refuses UID or GID zero, which is the
+    /// right invariant for container and sandboxed-VM workloads: a UID-0
+    /// process defeats in-guest enforcement. The privileged VM class
+    /// deliberately runs the workload as root (kernel separation is the
+    /// boundary; see the root-workload VM plan), so this constructor
+    /// accepts zero. It is only for that class: callers must gate it on
+    /// the workload mode.
+    pub fn new_privileged(
+        source: String,
+        resource_digest: String,
+    ) -> Result<Self, BackendError> {
+        if source.trim().is_empty() || resource_digest.trim().is_empty() {
+            return Err(BackendError::Descriptor(
+                "workload identity source and resource digest are required".to_string(),
+            ));
+        }
+        Ok(Self {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+            source,
+            resource_digest,
+        })
+    }
 }
 
 /// The trusted sandbox context, constructed by trusted common code after the

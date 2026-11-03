@@ -1212,6 +1212,14 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # runtime                      = "kubevirt"
 
 # Settings used only when runtime = "kubevirt".
+# workload selects how the guest workload runs: "sandboxed" (the default —
+# unprivileged, Landlock + seccomp enforced by the in-guest boundary) or
+# "root" (the privileged VM class — the workload runs as root, in-guest
+# enforcement is removed, the security boundary is the fence + the
+# supervisor's policy + per-boot trusted code; requires the dedicated
+# supervisor topology; provider files and provider env vars are
+# unsupported — nothing secret enters the guest).
+# workload                   = "root"
 # guest_image is the containerDisk providing the bootable guest filesystem
 # (Alpine + supervisor + kernel, built by `e2e/kubevirt/build-guest-image.sh`);
 # it is NOT an arbitrary sandbox OCI image. cpu_cores and memory size the
