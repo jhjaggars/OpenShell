@@ -1747,8 +1747,8 @@ struct KubeVirtGeneration<'a> {
     /// the provisioned sandbox uid in sandboxed mode).
     workload_uid: u32,
     workload_gid: u32,
-    /// The workload mode claim ("root" | "sandboxed").
-    workload_mode: &'static str,
+    /// The workload mode, carried into the boundary claim.
+    workload_mode: crate::config::KubeVirtWorkloadMode,
 }
 
 impl KubernetesComputeDriver {

@@ -38,6 +38,7 @@ const CAPABILITY_PROBE_LAUNCH_SUBCOMMAND: &str = "capability-probe-launch";
 const CAPABILITY_SOCKET_CHILD_SUBCOMMAND: &str = "capability-socket-child";
 const CAPABILITY_LANDLOCK_CHILD_SUBCOMMAND: &str = "capability-landlock-child";
 const CAPABILITY_FREE_LAUNCH_SUBCOMMAND: &str = "launch-capability-free";
+const PRIVILEGED_LAUNCH_SUBCOMMAND: &str = "launch-privileged";
 #[cfg(target_os = "linux")]
 const PROBE_DENIED_TCP_PEER: &str = "203.0.113.1:9";
 #[cfg(target_os = "linux")]
@@ -1449,6 +1450,40 @@ fn launch_capability_free(_args: &[String]) -> Result<()> {
     ))
 }
 
+/// Launch the boundary for a privileged (root-workload) sandbox: the same
+/// authenticated tunnel, claims, exec/PTY/SSH relay, and network relay as
+/// the capability-free launch, but the workload runs as root and the
+/// in-guest enforcement (capability drop, `no_new_privs`, Landlock, seccomp)
+/// is removed — it is meaningless against root. The security boundary is
+/// everything outside the guest: the fence, the supervisor's policy, and
+/// the per-boot trusted code (initramfs + dm-verity).
+#[cfg(target_os = "linux")]
+fn launch_privileged(args: &[String]) -> Result<()> {
+    let [bootstrap, workspace @ ..] = args else {
+        return Err(miette::miette!(
+            "usage: openshell-sandbox {PRIVILEGED_LAUNCH_SUBCOMMAND} <BOOTSTRAP> [WORKSPACE]"
+        ));
+    };
+    if workspace.len() > 1 {
+        return Err(miette::miette!(
+            "usage: openshell-sandbox {PRIVILEGED_LAUNCH_SUBCOMMAND} <BOOTSTRAP> [WORKSPACE]"
+        ));
+    }
+    // No identity transition: the workload IS root. No capability drop,
+    // no no_new_privs, no Landlock, no seccomp — the guest is the
+    // attacker's by design; the boundary is outside.
+    let log_level = std::env::var(openshell_core::sandbox_env::LOG_LEVEL)
+        .unwrap_or_else(|_| "warn".to_string());
+    run_boundary(Path::new(bootstrap), &log_level)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn launch_privileged(_args: &[String]) -> Result<()> {
+    Err(miette::miette!(
+        "privileged launch is only supported on Linux"
+    ))
+}
+
 #[cfg(not(target_os = "linux"))]
 fn run_capability_probe() -> Result<()> {
     Err(miette::miette!(
@@ -1817,6 +1852,9 @@ fn main() -> Result<()> {
     }
     if raw_args.get(1).map(String::as_str) == Some(CAPABILITY_FREE_LAUNCH_SUBCOMMAND) {
         return launch_capability_free(&raw_args[2..]);
+    }
+    if raw_args.get(1).map(String::as_str) == Some(PRIVILEGED_LAUNCH_SUBCOMMAND) {
+        return launch_privileged(&raw_args[2..]);
     }
 
     let args = BoundaryArgs::parse();

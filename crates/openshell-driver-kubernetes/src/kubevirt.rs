@@ -493,15 +493,17 @@ pub const KUBEVIRT_WORKLOAD_GID: u32 = 10001;
 /// The workload identity and mode claim for a config: root mode runs as
 /// uid/gid 0 with the "root" mode claim; the sandboxed default keeps the
 /// provisioned sandbox uid/gid with the "sandboxed" claim.
-pub fn guest_workload_identity(config: &KubernetesComputeConfig) -> (u32, u32, &'static str) {
+pub fn guest_workload_identity(
+    config: &KubernetesComputeConfig,
+) -> (u32, u32, crate::config::KubeVirtWorkloadMode) {
     match config.kubevirt.workload {
         crate::config::KubeVirtWorkloadMode::Root => {
-            (0, 0, crate::config::KubeVirtWorkloadMode::Root.claim())
+            (0, 0, crate::config::KubeVirtWorkloadMode::Root)
         }
         crate::config::KubeVirtWorkloadMode::Sandboxed => (
             KUBEVIRT_WORKLOAD_UID,
             KUBEVIRT_WORKLOAD_GID,
-            crate::config::KubeVirtWorkloadMode::Sandboxed.claim(),
+            crate::config::KubeVirtWorkloadMode::Sandboxed,
         ),
     }
 }

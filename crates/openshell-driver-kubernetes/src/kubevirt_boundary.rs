@@ -228,7 +228,7 @@ pub struct KubeVirtBoundarySpec {
     /// The workload identity (uid/gid) the boundary runs as.
     pub workload_identity: ResolvedWorkloadIdentity,
     /// The workload mode ("root" | "sandboxed") — claimed and confirmed.
-    pub workload_mode: &'static str,
+    pub workload_mode: crate::config::KubeVirtWorkloadMode,
     /// Environment the boundary passes to workload children.
     pub child_env: HashMap<String, String>,
 }
@@ -426,7 +426,7 @@ mod tests {
             }],
             vm_uid: "vm-uid-1".to_string(),
             image_identity: "kvpoc/openshell-sandbox-vm:dev".to_string(),
-            workload_mode: "sandboxed",
+            workload_mode: crate::config::KubeVirtWorkloadMode::Sandboxed,
             network_policy_uid: "np-uid-1".to_string(),
             network_policy_resource_version: "1945".to_string(),
             supervisor,
@@ -644,7 +644,7 @@ mod tests {
             &target,
             0,
             0,
-            "root",
+            crate::config::KubeVirtWorkloadMode::Root,
         )
         .expect("root-mode bootstrap renders");
         // The descriptor carries the mode claim and the uid-0 identity.
@@ -673,7 +673,7 @@ mod tests {
         );
         // A root-mode config never matches a sandboxed descriptor.
         let mut root_spec = spec_with(shared_target());
-        root_spec.workload_mode = "root";
+        root_spec.workload_mode = crate::config::KubeVirtWorkloadMode::Root;
         let root = root_spec.provision().expect("provision");
         assert_eq!(
             root.boundary_config.resource_claims[CLAIM_WORKLOAD_MODE],
@@ -1506,7 +1506,7 @@ mod payload_tests {
             &target,
             10001,
             10001,
-            "sandboxed",
+            crate::config::KubeVirtWorkloadMode::Sandboxed,
         )
         .expect("render");
         let decoded = bootstrap
@@ -1568,7 +1568,7 @@ mod payload_tests {
             &target,
             10001,
             10001,
-            "sandboxed",
+            crate::config::KubeVirtWorkloadMode::Sandboxed,
         )
         .expect("render");
 
@@ -1655,12 +1655,12 @@ pub fn render_kubevirt_bootstrap(
     target: &KubeVirtSupervisorTarget,
     workload_uid: u32,
     workload_gid: u32,
-    workload_mode: &'static str,
+    workload_mode: crate::config::KubeVirtWorkloadMode,
 ) -> Result<KubeVirtBootstrap, String> {
     let launch_inputs = boundary_launch_inputs(launch_authentication)
         .map_err(|error| format!("boundary launch inputs: {error}"))?;
 
-    let workload_identity = if workload_mode == "root" {
+    let workload_identity = if workload_mode == crate::config::KubeVirtWorkloadMode::Root {
         // The privileged VM class runs the workload as root by design
         // (kernel separation is the boundary); the standard constructor
         // refuses UID/GID zero, which is the right invariant for every
