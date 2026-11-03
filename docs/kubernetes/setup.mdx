@@ -421,7 +421,24 @@ supervisor Pod names for remaining Pods.
 | `""` | `pods` | create, delete, get, list, patch, watch |
 | `""` | `services` | create, get |
 | `""` | `secrets` | create, delete |
-| `networking.k8s.io` | `networkpolicies` | create, get |
+| `networking.k8s.io` | `networkpolicies` | create, get, list, watch, update |
+
+The gateway watches the NetworkPolicies it creates in sandbox namespaces and
+restores any that are deleted, edited, replaced, or stripped of their labels. It
+never deletes a NetworkPolicy. In managed mode, the chart instead ships a
+`<release>-netpol-guard-<namespace>` ClusterRole with `list`, `watch`, and
+`update` on NetworkPolicies, and the gateway binds it with a RoleBinding in each
+managed namespace. For that, the gateway ClusterRole adds `create` and `get` on
+`rolebindings` and `bind` on that one ClusterRole by name. No mode grants
+cluster-wide `list` or `watch` on NetworkPolicies. Restrict write access to these
+policies to cluster administrators and the gateway: that RBAC is the primary
+control, and the repair narrows the window to seconds.
+
+If a change to a policy's spec could have widened a running sandbox's egress,
+the gateway also stops that sandbox. `openshell sandbox get` shows it as
+`Stopped` with Ready reason `NetworkPolicyDrift` and the policy name. Run
+`openshell sandbox start` to continue; no `kubectl` step is needed. A change to
+labels only is restored without stopping anything.
 
 The ClusterRole grants node inspection and token validation:
 

@@ -110,6 +110,53 @@ them. The cluster CNI must enforce ingress and egress `NetworkPolicy` for every
 sandbox namespace. Kubernetes accepts policy objects without confirming
 enforcement, so operators must verify CNI support before running sandboxes.
 
+### NetworkPolicy guard
+
+The driver owns five NetworkPolicies: `openshell-sandbox-workloads`,
+`openshell-sandbox-supervisors`, `os-control-<id>`, `os-shared-control-<id>`,
+and, in managed mode with SSH ingress isolation, `openshell-sandbox-ssh`. None
+is user-serviceable, so the guard (`netpol_guard*.rs`) restores them.
+
+- **Watch.** One label-selected watch (`openshell.ai/managed-by=openshell`) runs
+  per sandbox namespace for each gateway sandbox watch stream: the gateway
+  namespace in shared mode, each allowlisted namespace in operator mode, and
+  each namespace this gateway owns in managed mode. Events only name a key;
+  the worker always GETs by name, so a label strip, which the watch reports as
+  `DELETED`, is still seen. `InitDone` and a 10-minute resync queue every
+  expected name. A forbidden watch logs one warning and leaves the periodic
+  pass in charge.
+- **Expected state** is rendered from driver configuration and the trusted
+  Sandbox list, never from the observed object. Per-sandbox names map to a
+  sandbox only through `SandboxRuntimeNames` of listed Sandboxes.
+- **Repair.** A missing namespace policy is created; a drifted one is replaced
+  with the observed `resourceVersion` as the precondition, keeping foreign
+  labels and annotations and dropping foreign owner references. A per-sandbox
+  policy is only ever replaced, never created, so a deleted sandbox's policy
+  can't come back; `sandbox start` re-creates a missing one. A bound
+  `os-shared-control-*` policy is not rewritten just because the live shared
+  supervisor Service changed. Writes carry the diagnostic
+  `openshell.ai/rendered-by` annotation, which no check reads. A budget of 5
+  repairs per policy per 10 minutes stops a fight with another controller.
+- **Fail closed.** After a repair, the shared per-sandbox reconcile
+  (`reconcile_one_sandbox_runtime`) runs for each affected sandbox. A generation
+  bound to the drifted workload fence or control policy no longer matches its
+  UID and generation and is suspended. Spec drift of the supervisor egress
+  policy suspends running generations explicitly. Label-only drift keeps the
+  generation and suspends nothing, in the guard and in the periodic pass. A
+  drift suspension records `openshell.ai/sandbox-runtime-suspension-reason` and
+  `-policy`, reported as Ready reason `NetworkPolicyDrift` until the next start.
+- **Signals.** Only the replica whose write succeeded emits platform events,
+  with source `openshell-driver-kubernetes`: `NetworkPolicyRestored` and
+  `NetworkPolicyDriftSuspended`. The gateway turns them into OCSF records.
+- **Render changes** use expand/contract: a release that changes a render adds
+  it to `ACCEPTED_RENDERS` while still writing the old one, and the next
+  release switches `WRITE_RENDER`. Create, start and the guard accept the same
+  set, so adjacent-release rolling upgrades never fight. The switching release
+  suspends each running sandbox once; say so in its release notes.
+- **RBAC** is namespace-scoped: `list, watch, update` on NetworkPolicies in the
+  sandbox namespace Roles, or, in managed mode, the chart's fixed guard
+  ClusterRole bound per namespace (`OPENSHELL_NETPOL_GUARD_CLUSTER_ROLE`).
+
 ### Control connection direction
 
 Every new runtime generation uses `runtime-initiated` control. The Sandbox

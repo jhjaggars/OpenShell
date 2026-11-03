@@ -1234,6 +1234,22 @@ kubectl -n <sandbox-namespace> get pod -l openshell.ai/sandbox-id=<sandbox-id>,o
 kubectl -n <sandbox-namespace> get networkpolicy -l openshell.ai/sandbox-id=<sandbox-id> -o yaml
 ```
 
+The gateway restores the NetworkPolicies it owns within seconds when they are
+deleted, edited, replaced, or stripped of their labels. A sandbox whose bound
+policy's spec changed is stopped with Ready reason `NetworkPolicyDrift`; it
+recovers with `openshell sandbox start`, never with `kubectl`. Gateway warnings
+to look for: `NetworkPolicy drift repaired`, `sandbox suspended after
+NetworkPolicy drift`, `NetworkPolicy drift watch forbidden; relying on periodic
+reconciliation` (the Role lacks `list`/`watch` on networkpolicies), and
+`NetworkPolicy repair budget exhausted` (another controller, such as a policy
+engine or GitOps tool, keeps rewriting the policy; stop it). In managed mode,
+check the guard binding in the sandbox namespace:
+
+```shell
+kubectl -n <sandbox-namespace> get rolebinding openshell-netpol-guard -o yaml
+kubectl -n <sandbox-namespace> get sandbox <sandbox-name> -o jsonpath='{.metadata.annotations.openshell\.ai/sandbox-runtime-suspension-reason}{" "}{.metadata.annotations.openshell\.ai/sandbox-runtime-suspension-policy}{"\n"}'
+```
+
 Creation and recovery fail closed. A missing Secret leaves both pods inert; a
 missing or unobserved workload fence must prevent the driver from releasing the
 Sandbox; and readiness requires both Agent Sandbox readiness and an Available
