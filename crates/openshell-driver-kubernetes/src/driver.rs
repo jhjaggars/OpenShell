@@ -111,6 +111,14 @@ const ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_SESSION: &str =
     "openshell.ai/sandbox-runtime-bootstrap-session";
 const ANNOTATION_SANDBOX_RUNTIME_GENERATION: &str = "openshell.ai/sandbox-runtime-generation";
 const ANNOTATION_SANDBOX_RUNTIME_READINESS: &str = "openshell.ai/sandbox-runtime-readiness";
+/// Why the driver suspended a generation, when it was `NetworkPolicy` drift.
+const ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_REASON: &str =
+    "openshell.ai/sandbox-runtime-suspension-reason";
+/// The drifted `NetworkPolicy` named by the suspension reason.
+const ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_POLICY: &str =
+    "openshell.ai/sandbox-runtime-suspension-policy";
+/// Ready condition reason for a sandbox suspended by `NetworkPolicy` drift.
+const SUSPENSION_REASON_NETWORK_POLICY_DRIFT: &str = "NetworkPolicyDrift";
 const ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: &str = "openshell.ai/sandbox-runtime-workload-uid";
 const ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: &str =
     "openshell.ai/sandbox-runtime-supervisor-uid";
@@ -3981,6 +3989,9 @@ impl KubernetesComputeDriver {
             KubernetesDriverError::Message("workload Pod has no name".to_string())
         })?;
         let mut annotations = serde_json::json!({
+            // A new generation binds repaired objects; any drift cause is over.
+            ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_REASON: serde_json::Value::Null,
+            ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_POLICY: serde_json::Value::Null,
             ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: workload_pod_uid.clone(),
             ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: fence_uid.clone(),
             ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: fence_generation.to_string(),
@@ -5210,13 +5221,15 @@ impl KubernetesComputeDriver {
         if let Err(error) = self.admit_stored_resources(&object).await {
             warn!(%sandbox_id, reason = %error.message(), "Sandbox resource admission revalidation failed");
             if error.code() == tonic::Code::FailedPrecondition {
+                let trigger = SuspendTrigger::AdmissionRevalidation;
                 let write = self
-                    .suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+                    .suspend_sandbox_runtime_after_dependency_failure(
+                        lookup_api,
+                        &object,
+                        trigger.network_policy(&sandbox_id),
+                    )
                     .await;
-                return ReconcileOutcome::Suspended {
-                    trigger: SuspendTrigger::AdmissionRevalidation,
-                    write,
-                };
+                return ReconcileOutcome::Suspended { trigger, write };
             }
             return ReconcileOutcome::Skipped(SkipReason::AdmissionRetry);
         }
@@ -5260,16 +5273,17 @@ impl KubernetesComputeDriver {
             Err(KubernetesDriverError::Precondition(error)) => {
                 if let Err(drifted) = self.restore_label_only_fence_drift(namespace).await {
                     warn!(sandbox_id, %error, "sandbox-runtime workload fence is altered; suspending workload");
-                    let write = self
-                        .suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
-                        .await;
-                    return ReconcileOutcome::Suspended {
-                        trigger: SuspendTrigger::FenceSpec {
-                            supervisor: drifted.as_deref()
-                                == Some(names.supervisor_policy.as_str()),
-                        },
-                        write,
+                    let trigger = SuspendTrigger::FenceSpec {
+                        supervisor: drifted.as_deref() == Some(names.supervisor_policy.as_str()),
                     };
+                    let write = self
+                        .suspend_sandbox_runtime_after_dependency_failure(
+                            lookup_api,
+                            &object,
+                            trigger.network_policy(&sandbox_id),
+                        )
+                        .await;
+                    return ReconcileOutcome::Suspended { trigger, write };
                 }
             }
             Err(error) => {
@@ -5290,13 +5304,15 @@ impl KubernetesComputeDriver {
                 sandbox_id,
                 "namespace workload fence generation changed; suspending stale boundary"
             );
+            let trigger = SuspendTrigger::FenceGeneration;
             let write = self
-                .suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+                .suspend_sandbox_runtime_after_dependency_failure(
+                    lookup_api,
+                    &object,
+                    trigger.network_policy(&sandbox_id),
+                )
                 .await;
-            return ReconcileOutcome::Suspended {
-                trigger: SuspendTrigger::FenceGeneration,
-                write,
-            };
+            return ReconcileOutcome::Suspended { trigger, write };
         }
         if workload_may_run {
             let require_service = !sandbox_runtime_bootstrap_in_progress(&object);
@@ -5312,9 +5328,6 @@ impl KubernetesComputeDriver {
                 Ok(()) => {}
                 Err(KubernetesDriverError::Precondition(error)) => {
                     warn!(sandbox_id, %error, "sandbox-runtime control path drifted; suspending workload");
-                    let write = self
-                        .suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
-                        .await;
                     // The control-path errors name the object that failed.
                     let trigger = if error.contains(&names.shared_control_policy) {
                         SuspendTrigger::ControlPolicy { shared: true }
@@ -5323,6 +5336,13 @@ impl KubernetesComputeDriver {
                     } else {
                         SuspendTrigger::ControlPath
                     };
+                    let write = self
+                        .suspend_sandbox_runtime_after_dependency_failure(
+                            lookup_api,
+                            &object,
+                            trigger.network_policy(&sandbox_id),
+                        )
+                        .await;
                     return ReconcileOutcome::Suspended { trigger, write };
                 }
                 Err(error) => {
@@ -5369,13 +5389,15 @@ impl KubernetesComputeDriver {
                         sandbox_id,
                         "sandbox-runtime workload generation changed; suspending stale boundary"
                     );
+                    let trigger = SuspendTrigger::WorkloadGeneration;
                     let write = self
-                        .suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+                        .suspend_sandbox_runtime_after_dependency_failure(
+                            lookup_api,
+                            &object,
+                            trigger.network_policy(&sandbox_id),
+                        )
                         .await;
-                    return ReconcileOutcome::Suspended {
-                        trigger: SuspendTrigger::WorkloadGeneration,
-                        write,
-                    };
+                    return ReconcileOutcome::Suspended { trigger, write };
                 }
                 SandboxRuntimeControlAvailability::Unknown => {
                     warn!(
@@ -5400,13 +5422,15 @@ impl KubernetesComputeDriver {
                         sandbox_id,
                         "sandbox-runtime supervisor generation changed; suspending stale boundary"
                     );
+                    let trigger = SuspendTrigger::SupervisorGeneration;
                     let write = self
-                        .suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+                        .suspend_sandbox_runtime_after_dependency_failure(
+                            lookup_api,
+                            &object,
+                            trigger.network_policy(&sandbox_id),
+                        )
                         .await;
-                    return ReconcileOutcome::Suspended {
-                        trigger: SuspendTrigger::SupervisorGeneration,
-                        write,
-                    };
+                    return ReconcileOutcome::Suspended { trigger, write };
                 }
                 SandboxRuntimeControlAvailability::Unknown => {
                     return ReconcileOutcome::Skipped(SkipReason::SupervisorGenerationUnknown);
@@ -5423,8 +5447,10 @@ impl KubernetesComputeDriver {
                 // Deliberately falls through: availability and readiness are
                 // still published after a companion suspension.
                 companion_suspended = Some(
-                    self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
-                        .await,
+                    self.suspend_sandbox_runtime_after_dependency_failure(
+                        lookup_api, &object, None,
+                    )
+                    .await,
                 );
             }
             Err(error) => {
@@ -5444,13 +5470,15 @@ impl KubernetesComputeDriver {
                 sandbox_id,
                 "sandbox-runtime supervisor is unavailable; suspending workload"
             );
+            let trigger = SuspendTrigger::SupervisorUnavailable;
             let write = self
-                .suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+                .suspend_sandbox_runtime_after_dependency_failure(
+                    lookup_api,
+                    &object,
+                    trigger.network_policy(&sandbox_id),
+                )
                 .await;
-            return ReconcileOutcome::Suspended {
-                trigger: SuspendTrigger::SupervisorUnavailable,
-                write,
-            };
+            return ReconcileOutcome::Suspended { trigger, write };
         }
         self.publish_sandbox_runtime_readiness_transition(lookup_api, &object, availability)
             .await;
@@ -5691,10 +5719,14 @@ impl KubernetesComputeDriver {
         }
     }
 
+    /// Suspend a generation whose enforcement dependency failed. When the
+    /// failure is drift of a driver-owned `NetworkPolicy`, `drifted_policy`
+    /// names it and is recorded as the suspension cause.
     async fn suspend_sandbox_runtime_after_dependency_failure(
         &self,
         lookup_api: &AgentSandboxApi,
         object: &DynamicObject,
+        drifted_policy: Option<String>,
     ) -> SuspendWrite {
         let Some(name) = object.metadata.name.as_deref() else {
             return SuspendWrite::Failed;
@@ -5706,13 +5738,20 @@ impl KubernetesComputeDriver {
             .unwrap_or(&self.config.namespace);
         let api =
             Self::agent_sandbox_api(self.client.clone(), &lookup_api.resource.version, namespace);
-        let patch = sandbox_runtime_suspension_patch(
-            &lookup_api.resource.version,
-            object
-                .metadata
-                .resource_version
-                .as_deref()
-                .unwrap_or_default(),
+        let resource_version = object
+            .metadata
+            .resource_version
+            .as_deref()
+            .unwrap_or_default();
+        let patch = drifted_policy.as_deref().map_or_else(
+            || sandbox_runtime_suspension_patch(&lookup_api.resource.version, resource_version),
+            |policy| {
+                sandbox_runtime_drift_suspension_patch(
+                    &lookup_api.resource.version,
+                    resource_version,
+                    policy,
+                )
+            },
         );
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
@@ -5755,7 +5794,7 @@ impl KubernetesComputeDriver {
                 sandbox = object.metadata.name.as_deref().unwrap_or("<unknown>"),
                 "suspending stale sandbox-runtime restart bootstrap"
             );
-            self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, object)
+            self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, object, None)
                 .await;
             return;
         }
@@ -7373,6 +7412,7 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
             mark_sandbox_runtime_control_unavailable(&mut sandbox);
         }
     }
+    mark_network_policy_drift_suspension(&obj, &mut sandbox);
     Ok((name, sandbox))
 }
 
@@ -7418,6 +7458,67 @@ fn clear_sandbox_runtime_operation_conditions(sandbox: &mut Sandbox) {
     if let Some(status) = sandbox.status.as_mut() {
         status.conditions.retain(|condition| {
             condition.r#type != SANDBOX_SUSPENDED_CONDITION && condition.r#type != "Bootstrapping"
+        });
+    }
+}
+
+/// Report a `NetworkPolicy` drift suspension as the Ready reason, with a
+/// message naming the policy, while the generation stays suspended. The
+/// gateway treats the reason as transient, so the sandbox shows as stopped
+/// and `sandbox start` stays allowed.
+fn mark_network_policy_drift_suspension(obj: &DynamicObject, sandbox: &mut Sandbox) {
+    let Some(annotations) = obj.metadata.annotations.as_ref() else {
+        return;
+    };
+    if annotations
+        .get(ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_REASON)
+        .map(String::as_str)
+        != Some(SUSPENSION_REASON_NETWORK_POLICY_DRIFT)
+        || sandbox_runtime_should_run(obj)
+    {
+        return;
+    }
+    let policy = annotations
+        .get(ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_POLICY)
+        .map_or("a sandbox NetworkPolicy", String::as_str);
+    let message = format!(
+        "NetworkPolicy {policy} was changed and has been restored; start the sandbox to continue"
+    );
+    let Some(status) = sandbox.status.as_mut() else {
+        return;
+    };
+    let ready = SandboxCondition {
+        r#type: "Ready".to_string(),
+        status: "False".to_string(),
+        reason: SUSPENSION_REASON_NETWORK_POLICY_DRIFT.to_string(),
+        message: message.clone(),
+        transition_time: None,
+    };
+    match status.conditions.iter_mut().find(|c| c.r#type == "Ready") {
+        Some(existing) => {
+            *existing = SandboxCondition {
+                transition_time: existing.transition_time.take(),
+                ..ready
+            }
+        }
+        None => status.conditions.push(ready),
+    }
+    // v1alpha1 has no usable Suspended condition; the gateway needs one to
+    // show a stopped sandbox rather than an error.
+    if !status
+        .conditions
+        .iter()
+        .any(|c| c.r#type == SANDBOX_SUSPENDED_CONDITION && c.status.eq_ignore_ascii_case("true"))
+    {
+        status
+            .conditions
+            .retain(|c| c.r#type != SANDBOX_SUSPENDED_CONDITION);
+        status.conditions.push(SandboxCondition {
+            r#type: SANDBOX_SUSPENDED_CONDITION.to_string(),
+            status: "True".to_string(),
+            reason: SUSPENSION_REASON_NETWORK_POLICY_DRIFT.to_string(),
+            message,
+            transition_time: None,
         });
     }
 }
@@ -9020,11 +9121,30 @@ fn sandbox_runtime_stop_begin_patch(resource_version: &str) -> serde_json::Value
                 ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "stop",
                 ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: SandboxRuntimeBootstrapPhase::Releasing.as_str(),
                 ANNOTATION_SANDBOX_RUNTIME_READINESS: "unavailable",
+                ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_REASON: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_POLICY: serde_json::Value::Null,
             },
         },
     })
 }
 
+/// A suspension caused by `NetworkPolicy` drift: the plain suspension plus
+/// the cause, which the Sandbox status reports until the next start or stop.
+fn sandbox_runtime_drift_suspension_patch(
+    api_version: &str,
+    resource_version: &str,
+    policy: &str,
+) -> serde_json::Value {
+    let mut patch = sandbox_runtime_suspension_patch(api_version, resource_version);
+    let annotations = &mut patch["metadata"]["annotations"];
+    annotations[ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_REASON] =
+        SUSPENSION_REASON_NETWORK_POLICY_DRIFT.into();
+    annotations[ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_POLICY] = policy.into();
+    patch
+}
+
+/// Suspend a generation. Any earlier suspension cause is cleared; a drift
+/// suspension sets it again with [`sandbox_runtime_drift_suspension_patch`].
 fn sandbox_runtime_suspension_patch(
     api_version: &str,
     resource_version: &str,
@@ -9043,6 +9163,8 @@ fn sandbox_runtime_suspension_patch(
                 ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "stop",
                 ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: SandboxRuntimeBootstrapPhase::Suspending.as_str(),
                 ANNOTATION_SANDBOX_RUNTIME_READINESS: "unavailable",
+                ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_REASON: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_POLICY: serde_json::Value::Null,
             },
         },
         "spec": desired_state,

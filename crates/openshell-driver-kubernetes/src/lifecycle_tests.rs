@@ -1380,3 +1380,131 @@ mod netpol_guard_bindings {
         assert!(world.requests().is_empty());
     }
 }
+
+/// The `NetworkPolicyDrift` suspension cause.
+mod network_policy_drift_cause {
+    use super::reconcile_request_sequences::*;
+    use super::*;
+
+    fn cause(body: &serde_json::Value) -> (serde_json::Value, serde_json::Value) {
+        let annotations = &body["metadata"]["annotations"];
+        (
+            annotations[ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_REASON].clone(),
+            annotations[ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_POLICY].clone(),
+        )
+    }
+
+    #[test]
+    fn drift_suspensions_record_the_cause_and_other_transitions_clear_it() {
+        for version in [SANDBOX_VERSION_V1BETA1, SANDBOX_VERSION_V1ALPHA1] {
+            let drift = sandbox_runtime_drift_suspension_patch(version, "7", "openshell-sandbox-workloads");
+            assert_eq!(
+                cause(&drift),
+                (serde_json::json!("NetworkPolicyDrift"), serde_json::json!("openshell-sandbox-workloads"))
+            );
+            // Same desired state as any other suspension.
+            assert_eq!(drift["spec"], sandbox_runtime_suspension_patch(version, "7")["spec"]);
+            for cleared in [
+                sandbox_runtime_suspension_patch(version, "7"),
+                sandbox_operating_state_patch(version, "7", false),
+                sandbox_runtime_stop_begin_patch("7"),
+            ] {
+                assert_eq!(cause(&cleared), (serde_json::Value::Null, serde_json::Value::Null));
+                let annotations = cleared["metadata"]["annotations"].as_object().unwrap();
+                assert!(annotations.contains_key(ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_REASON));
+            }
+        }
+        // Completion keeps whatever cause the suspension recorded.
+        let completion = sandbox_runtime_suspension_completion_patch("8");
+        assert!(
+            !completion["metadata"]["annotations"]
+                .as_object()
+                .unwrap()
+                .contains_key(ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_REASON)
+        );
+    }
+
+    #[tokio::test]
+    async fn fence_drift_records_the_cause_but_admission_does_not() {
+        let world = world_with(sandbox(true));
+        let (mut workload, _) = stored_fences();
+        workload.metadata.generation = Some(2);
+        world.forget(http::Method::GET, WORKLOAD_FENCE_PATH);
+        world
+            .on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(workload).unwrap())
+            .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        reconcile(&world).await;
+        let patch = &world.bodies(&http::Method::PATCH, CR_PATH)[0];
+        assert_eq!(
+            cause(patch),
+            (serde_json::json!("NetworkPolicyDrift"), serde_json::json!("openshell-sandbox-workloads"))
+        );
+
+        let mut object = sandbox(true);
+        object["metadata"]["annotations"]
+            .as_object_mut()
+            .unwrap()
+            .remove(crate::resource_admission::IDENTITIES);
+        let world = world_with(object);
+        world.on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        reconcile(&world).await;
+        let patch = &world.bodies(&http::Method::PATCH, CR_PATH)[0];
+        assert_eq!(cause(patch), (serde_json::Value::Null, serde_json::Value::Null));
+    }
+
+    fn drift_suspended(version: &str, suspended_condition: bool) -> DynamicObject {
+        let mut object = sandbox(false);
+        object["apiVersion"] = serde_json::json!(format!("{SANDBOX_GROUP}/{version}"));
+        if version == SANDBOX_VERSION_V1ALPHA1 {
+            object["spec"].as_object_mut().unwrap().remove("operatingMode");
+            object["spec"]["replicas"] = serde_json::json!(0);
+        }
+        object["metadata"]["labels"][LABEL_SANDBOX_NAME] = serde_json::json!("my-sandbox");
+        let annotations = &mut object["metadata"]["annotations"];
+        annotations[ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_REASON] = serde_json::json!("NetworkPolicyDrift");
+        annotations[ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_POLICY] =
+            serde_json::json!("openshell-sandbox-workloads");
+        let mut conditions = vec![serde_json::json!({"type": "Ready", "status": "False", "reason": "DependenciesNotReady"})];
+        if suspended_condition {
+            conditions.push(serde_json::json!({"type": SANDBOX_SUSPENDED_CONDITION, "status": "True", "reason": "Suspended"}));
+        }
+        object["status"] = serde_json::json!({"conditions": conditions});
+        serde_json::from_value(object).unwrap()
+    }
+
+    #[test]
+    fn a_drift_suspended_sandbox_reports_network_policy_drift_on_both_api_versions() {
+        for (version, has_suspended) in [(SANDBOX_VERSION_V1BETA1, true), (SANDBOX_VERSION_V1ALPHA1, false)] {
+            let object = drift_suspended(version, has_suspended);
+            let (_, mut sandbox) = sandbox_from_object(NS, object.clone()).unwrap();
+            mark_network_policy_drift_suspension(&object, &mut sandbox);
+            let conditions = &sandbox.status.unwrap().conditions;
+            let ready = conditions.iter().find(|c| c.r#type == "Ready").unwrap();
+            assert_eq!(ready.status, "False");
+            assert_eq!(ready.reason, "NetworkPolicyDrift");
+            assert!(ready.message.contains("openshell-sandbox-workloads"), "{}", ready.message);
+            assert!(
+                conditions
+                    .iter()
+                    .any(|c| c.r#type == SANDBOX_SUSPENDED_CONDITION && c.status == "True"),
+                "{version}: {conditions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_restarted_sandbox_no_longer_reports_the_old_cause() {
+        let mut object = drift_suspended(SANDBOX_VERSION_V1BETA1, true);
+        object.data["spec"]["operatingMode"] = serde_json::json!("Running");
+        let (_, mut sandbox) = sandbox_from_object(NS, object.clone()).unwrap();
+        mark_network_policy_drift_suspension(&object, &mut sandbox);
+        let ready = sandbox
+            .status
+            .unwrap()
+            .conditions
+            .into_iter()
+            .find(|c| c.r#type == "Ready")
+            .unwrap();
+        assert_eq!(ready.reason, "DependenciesNotReady");
+    }
+}
