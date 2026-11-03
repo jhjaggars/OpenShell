@@ -361,6 +361,26 @@ mod linux {
     /// Conversely, the root mode requires uid/gid zero — a nonzero
     /// identity under a root claim is a config error. Each entry point
     /// refuses the other mode's config.
+    /// Refuse provider material (files and environment variables) in the
+    /// privileged (root-workload) mode — the user's decision: nothing
+    /// secret enters the guest. This is the boundary-side defence in
+    /// depth; the supervisor-side refusal is the real guarantee (the
+    /// request maps are deserialized before this check runs, so a root
+    /// guest could theoretically observe them in that window).
+    fn validate_provider_material_privileged(
+        privileged: bool,
+        provider_files: &std::collections::HashMap<String, String>,
+        provider_env: &std::collections::HashMap<String, String>,
+    ) -> Result<(), String> {
+        if privileged && (!provider_files.is_empty() || !provider_env.is_empty()) {
+            return Err("provider files and provider environment variables are not \
+                 supported in privileged (root-workload) mode: the guest runs as \
+                 root and would be fully exposed to the credentials"
+                .to_string());
+        }
+        Ok(())
+    }
+
     fn validate_workload_mode_identity(
         resource_claims: &std::collections::BTreeMap<String, String>,
         uid: u32,
@@ -3931,16 +3951,12 @@ mod linux {
             // mode — nothing secret enters the guest. A root guest reads
             // boundary memory (/proc/<pid>/mem), so storing the maps even
             // without serving them is exposure.
-            if self.qualification.privileged
-                && (!provider_files.is_empty() || !provider_env.is_empty())
-            {
-                return guest_error(
-                    BoundaryErrorKind::Unsupported,
-                    "provider files and provider environment variables are not \
-                     supported in privileged (root-workload) mode: the guest runs as \
-                     root and would be fully exposed to the credentials"
-                        .to_string(),
-                );
+            if let Err(error) = validate_provider_material_privileged(
+                self.qualification.privileged,
+                &provider_files,
+                &provider_env,
+            ) {
+                return guest_error(BoundaryErrorKind::Unsupported, error);
             }
             let Some(policy) = lock(&self.attached_policy).clone() else {
                 return guest_error(
@@ -4069,16 +4085,12 @@ mod linux {
         ) -> Response {
             // Same refusal as start_agent: no provider material in
             // privileged mode, including on later updates.
-            if self.qualification.privileged
-                && (!provider_files.is_empty() || !provider_env.is_empty())
-            {
-                return guest_error(
-                    BoundaryErrorKind::Unsupported,
-                    "provider files and provider environment variables are not \
-                     supported in privileged (root-workload) mode: the guest runs as \
-                     root and would be fully exposed to the credentials"
-                        .to_string(),
-                );
+            if let Err(error) = validate_provider_material_privileged(
+                self.qualification.privileged,
+                &provider_files,
+                &provider_env,
+            ) {
+                return guest_error(BoundaryErrorKind::Unsupported, error);
             }
             let process = {
                 let state = lock(&self.state);
@@ -6488,6 +6500,59 @@ mod linux {
                 b"test-vm-fence",
             )
             .unwrap()
+        }
+
+        #[test]
+        fn provider_material_refused_in_privileged_mode() {
+            use std::collections::HashMap;
+
+            let files = || {
+                let mut map = HashMap::new();
+                map.insert("secret.txt".to_string(), "data".to_string());
+                map
+            };
+            let env = || {
+                let mut map = HashMap::new();
+                map.insert("API_KEY".to_string(), "value".to_string());
+                map
+            };
+            let empty = HashMap::new();
+
+            // Privileged + provider files: refused.
+            assert!(
+                validate_provider_material_privileged(true, &files(), &empty).is_err(),
+                "provider files must be refused in privileged mode"
+            );
+
+            // Privileged + provider env: refused.
+            assert!(
+                validate_provider_material_privileged(true, &empty, &env()).is_err(),
+                "provider env must be refused in privileged mode"
+            );
+
+            // Privileged + both: refused.
+            assert!(
+                validate_provider_material_privileged(true, &files(), &env()).is_err(),
+                "both provider maps must be refused in privileged mode"
+            );
+
+            // Privileged + neither: accepted.
+            assert!(
+                validate_provider_material_privileged(true, &empty, &empty).is_ok(),
+                "empty provider maps are fine in privileged mode"
+            );
+
+            // Sandboxed + provider files: accepted (the normal path).
+            assert!(
+                validate_provider_material_privileged(false, &files(), &empty).is_ok(),
+                "provider files are fine in sandboxed mode"
+            );
+
+            // Sandboxed + provider env: accepted.
+            assert!(
+                validate_provider_material_privileged(false, &empty, &env()).is_ok(),
+                "provider env is fine in sandboxed mode"
+            );
         }
 
         #[test]

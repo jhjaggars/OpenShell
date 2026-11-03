@@ -185,8 +185,8 @@ main() {
     if [ -n "${OPENSHELL_BOUNDARY_CONFIG_B64:-}" ]; then
         # L1: capture the workload identity from the payload BEFORE
         # staging unsets it; the same values drive both the chown in
-        # staging and the launch-capability-free arguments. They come from
-        # the same ResolvedWorkloadIdentity the boundary config carries
+        # staging and the launch arguments. They come from the same
+        # ResolvedWorkloadIdentity the boundary config carries
         # (render_guest_payload), so there is no second source of truth.
         local launch_uid launch_gid
         launch_uid="${OPENSHELL_WORKLOAD_UID}"
@@ -205,11 +205,19 @@ main() {
         fi
         ts "environment verified clean (no B64 or token vars)"
         # Run the boundary as a child (not exec) so PID 1 can power off on
-        # exit (see the wait + poweroff below).
-        # shellcheck disable=SC2086
-        /usr/local/bin/openshell-sandbox launch-capability-free \
-            "${launch_uid}" "${launch_gid}" \
-            /.openshell/state/bootstrap/boundary.json &
+        # exit (see the wait + poweroff below). Root mode (uid/gid 0)
+        # launches the privileged boundary; the sandboxed default uses
+        # the capability-free launch.
+        if [ "${launch_uid}" = "0" ] && [ "${launch_gid}" = "0" ]; then
+            ts "launching privileged (root-workload) boundary"
+            /usr/local/bin/openshell-sandbox launch-privileged \
+                /.openshell/state/bootstrap/boundary.json &
+        else
+            # shellcheck disable=SC2086
+            /usr/local/bin/openshell-sandbox launch-capability-free \
+                "${launch_uid}" "${launch_gid}" \
+                /.openshell/state/bootstrap/boundary.json &
+        fi
         SANDBOX_PID=$!
     else
         # No boundary payload: the gateway cannot have created this VM
