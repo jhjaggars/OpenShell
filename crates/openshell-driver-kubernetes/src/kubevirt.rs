@@ -127,16 +127,27 @@ pub enum GuestImageDigest {
 /// Read the guest image digest from the launcher Pod's init containers:
 /// `KubeVirt` runs the containerDisk as init containers (`volumerootdisk`,
 /// `volumekernel-boot-volume`), so `containerStatuses` holds the
-/// virt-launcher image instead. Both init containers reference the same
-/// guest image; the first observed imageID decides.
-pub fn guest_image_digest(launcher_pod: &k8s_openapi::api::core::v1::Pod) -> GuestImageDigest {
+/// virt-launcher image instead. The launcher also runs other init
+/// containers (`guest-console-log`) on the VIRT-LAUNCHER image, whose
+/// digest must never be pinned — so the status is matched by the image
+/// reference the VM spec currently names, not by position or name.
+pub fn guest_image_digest(
+    launcher_pod: &k8s_openapi::api::core::v1::Pod,
+    guest_image: &str,
+) -> GuestImageDigest {
     let Some(status) = launcher_pod.status.as_ref() else {
         return GuestImageDigest::Absent;
     };
     let Some(init_statuses) = status.init_container_statuses.as_ref() else {
         return GuestImageDigest::Absent;
     };
-    for container in init_statuses {
+    for container in init_statuses
+        .iter()
+        // Match the container running the VM's guest image reference
+        // (containerd may normalize the tag, so compare loosely: the
+        // repository and tag must match).
+        .filter(|container| image_ref_matches(&container.image, guest_image))
+    {
         let image_id = container.image_id.as_str();
         if image_id.is_empty() {
             continue;
@@ -152,7 +163,29 @@ pub fn guest_image_digest(launcher_pod: &k8s_openapi::api::core::v1::Pod) -> Gue
     GuestImageDigest::Absent
 }
 
-/// The VMI's not-ready-since time in Unix milliseconds, from its `Ready`
+/// Whether a container status `image` reference names the same image as the
+/// VM spec's guest image. Containerd normalizes references (adds
+/// `docker.io/` and `library/`), so the comparison is on the last path
+/// components (repository and tag).
+fn image_ref_matches(status_image: &str, guest_image: &str) -> bool {
+    fn tail(reference: &str) -> &str {
+        // Strip a registry host (contains a port, a dot, or is
+        // "localhost"; a repository path's first segment never does),
+        // then drop a leading "library/" for docker hub official images.
+        let no_host = match reference.split_once('/') {
+            Some((host, rest))
+                if host.contains(':') || host.contains('.') || host == "localhost" =>
+            {
+                rest
+            }
+            _ => reference,
+        };
+        no_host.strip_prefix("library/").unwrap_or(no_host)
+    }
+    tail(status_image) == tail(guest_image)
+}
+
+/// The VMI's not-ready-since time in Unix milliseconds, from its `Ready`/// The VMI's not-ready-since time in Unix milliseconds, from its `Ready`
 /// condition's `lastTransitionTime`. `None` when the VMI carries no such
 /// condition — the caller then keeps the pull-backoff state transient
 /// (timing fails open, isolation never does).
@@ -1557,37 +1590,96 @@ mod kubevirt_review_tests {
     #[test]
     fn guest_image_digest_classifies_launcher_init_containers() {
         use k8s_openapi::api::core::v1::{ContainerStatus, Pod, PodStatus};
-        let pod = |image_id: &str| {
-            let mut pod = Pod::default();
-            let mut status = PodStatus::default();
-            let container = ContainerStatus {
-                name: "volumerootdisk".to_string(),
-                image_id: image_id.to_string(),
-                ..ContainerStatus::default()
+        const GUEST: &str = "kvpoc/openshell-sandbox-vm:dev";
+        let pod = |statuses: &[(&str, &str, &str)]| {
+            let status = PodStatus {
+                init_container_statuses: Some(
+                    statuses
+                        .iter()
+                        .map(|(name, image, image_id)| ContainerStatus {
+                            name: name.to_string(),
+                            image: image.to_string(),
+                            image_id: image_id.to_string(),
+                            ..ContainerStatus::default()
+                        })
+                        .collect(),
+                ),
+                ..PodStatus::default()
             };
-            status.init_container_statuses = Some(vec![container]);
-            pod.status = Some(status);
-            pod
+            Pod {
+                status: Some(status),
+                ..Pod::default()
+            }
         };
-        // Registry-backed: repo@sha256:<manifest digest> — patchable.
+        // The launcher runs other init containers (guest-console-log) on
+        // the VIRT-LAUNCHER image whose digest must never be pinned: the
+        // status is matched by the VM's guest image reference.
+        let launcher_statuses = [
+            (
+                "guest-console-log",
+                "quay.io/kubevirt/virt-launcher:v1.9.1",
+                "quay.io/kubevirt/virt-launcher@sha256:53e6d121",
+            ),
+            (
+                "volumerootdisk",
+                "docker.io/kvpoc/openshell-sandbox-vm:dev",
+                "docker.io/kvpoc/openshell-sandbox-vm@sha256:5a58c279",
+            ),
+            (
+                "volumekernel-boot-volume",
+                "docker.io/kvpoc/openshell-sandbox-vm:dev",
+                "docker.io/kvpoc/openshell-sandbox-vm@sha256:5a58c279",
+            ),
+        ];
         assert_eq!(
-            guest_image_digest(&pod("docker.io/kvpoc/guest@sha256:5a58c2790000")),
-            GuestImageDigest::Patch("docker.io/kvpoc/guest@sha256:5a58c2790000".to_string())
+            guest_image_digest(&pod(&launcher_statuses), GUEST),
+            GuestImageDigest::Patch(
+                "docker.io/kvpoc/openshell-sandbox-vm@sha256:5a58c279".to_string()
+            )
         );
         // Side-loaded (k3d/ctr import): a bare config digest, no
         // repository — never patchable.
+        let side_loaded = [
+            (
+                "guest-console-log",
+                "quay.io/kubevirt/virt-launcher:v1.9.1",
+                "quay.io/kubevirt/virt-launcher@sha256:53e6d121",
+            ),
+            (
+                "volumerootdisk",
+                "docker.io/kvpoc/openshell-sandbox-vm:dev",
+                "sha256:5a58c279",
+            ),
+        ];
         assert_eq!(
-            guest_image_digest(&pod("sha256:5a58c2790000")),
+            guest_image_digest(&pod(&side_loaded), GUEST),
             GuestImageDigest::SideLoaded
         );
-        // Nothing observed yet.
+        // Nothing observed yet (no statuses, or none matching the guest
+        // image).
         assert_eq!(
-            guest_image_digest(&Pod::default()),
+            guest_image_digest(&Pod::default(), GUEST),
             GuestImageDigest::Absent
         );
-        let mut pod = pod("sha256:x");
-        pod.status.as_mut().unwrap().init_container_statuses = Some(vec![]);
-        assert_eq!(guest_image_digest(&pod), GuestImageDigest::Absent);
+        let empty = [(
+            "volumerootdisk",
+            "docker.io/kvpoc/openshell-sandbox-vm:dev",
+            "",
+        )];
+        assert_eq!(
+            guest_image_digest(&pod(&empty), GUEST),
+            GuestImageDigest::Absent
+        );
+        // Reference normalization: containerd's docker.io/library form
+        // matches a bare short reference.
+        assert!(image_ref_matches(
+            "docker.io/library/busybox:1.36",
+            "busybox:1.36"
+        ));
+        assert!(!image_ref_matches(
+            "quay.io/kubevirt/virt-launcher:v1.9.1",
+            GUEST
+        ));
     }
 
     #[test]

@@ -1579,7 +1579,7 @@ async fn reconcile_kubevirt_image_pins(client: &Client, namespace: &str) {
         let Some(launcher) = pod_list.items.into_iter().next() else {
             continue;
         };
-        match crate::kubevirt::guest_image_digest(&launcher) {
+        match crate::kubevirt::guest_image_digest(&launcher, &boot_image) {
             crate::kubevirt::GuestImageDigest::Patch(pinned_ref) => {
                 info!(
                     sandbox_id = %sandbox_id,
