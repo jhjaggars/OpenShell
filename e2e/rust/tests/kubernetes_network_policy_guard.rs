@@ -691,6 +691,42 @@ async fn each_repair_is_signalled_once_across_gateway_replicas() {
     sandbox.cleanup().await;
 }
 
+/// The harness's sandbox guard doesn't pass a workspace to its follow-up
+/// commands, so managed cases drive the CLI directly.
+async fn create_managed_sandbox(workspace: &str, name: &str) {
+    let (output, code) = run_cli(&[
+        "sandbox",
+        "create",
+        "--detach",
+        "--workspace",
+        workspace,
+        "--name",
+        name,
+        "--",
+        "sh",
+        "-c",
+        "exec sleep infinity",
+    ])
+    .await;
+    assert_eq!(code, 0, "sandbox create: {output}");
+    wait_managed_ready(workspace, name).await;
+}
+
+async fn wait_managed_ready(workspace: &str, name: &str) {
+    let deadline = Instant::now() + Duration::from_mins(3);
+    loop {
+        let sandbox = sandbox_json(name, Some(workspace)).await;
+        if sandbox["phase"] == "Ready" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "managed sandbox {name} not Ready: {sandbox}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 /// Shared supervisor topology: the per-sandbox allowance to the shared
 /// supervisor is replaced after drift and never re-created by the guard.
 #[tokio::test]
@@ -757,13 +793,7 @@ async fn managed_namespaces_get_the_guard_binding_and_watch() {
     let (output, code) = run_cli(&["workspace", "create", "--name", &workspace]).await;
     assert_eq!(code, 0, "workspace create: {output}");
     let name = format!("ng-sb-{}", std::process::id() % 100_000);
-    SandboxGuard::create_keep_with_args(
-        &["--workspace", &workspace, "--name", &name],
-        &["sh", "-c", "echo netpol-ready; exec sleep infinity"],
-        "netpol-ready",
-    )
-    .await
-    .expect("create managed sandbox");
+    create_managed_sandbox(&workspace, &name).await;
     let ns = format!("openshell-openshell-{workspace}");
 
     let binding: serde_json::Value = serde_json::from_str(
@@ -824,6 +854,7 @@ async fn managed_namespaces_get_the_guard_binding_and_watch() {
                 let (output, code) =
                     run_cli(&["sandbox", "start", &name, "--workspace", &workspace]).await;
                 assert_eq!(code, 0, "{case}: start: {output}");
+                wait_managed_ready(&workspace, &name).await;
             } else {
                 // SSH ingress isn't bound into evidence: nothing is suspended.
                 let phase = sandbox_json(&name, Some(&workspace)).await["phase"].clone();
@@ -836,9 +867,10 @@ async fn managed_namespaces_get_the_guard_binding_and_watch() {
 }
 
 /// Managed mode: a namespace created before the gateway started gets the
-/// binding and a watch when the gateway restarts.
+/// binding and a watch when the gateway restarts. The restart ends the CLI's
+/// port-forward, so this sorts after the other managed case and uses kubectl.
 #[tokio::test]
-async fn an_existing_managed_namespace_is_guarded_after_a_gateway_restart() {
+async fn restarted_gateway_guards_existing_managed_namespaces() {
     if !selected("managed") {
         return;
     }
@@ -846,40 +878,25 @@ async fn an_existing_managed_namespace_is_guarded_after_a_gateway_restart() {
     let (output, code) = run_cli(&["workspace", "create", "--name", &workspace]).await;
     assert_eq!(code, 0, "workspace create: {output}");
     let name = format!("nr-sb-{}", std::process::id() % 100_000);
-    SandboxGuard::create_keep_with_args(
-        &["--workspace", &workspace, "--name", &name],
-        &["sh", "-c", "echo netpol-ready; exec sleep infinity"],
-        "netpol-ready",
-    )
-    .await
-    .expect("create managed sandbox");
+    create_managed_sandbox(&workspace, &name).await;
     let ns = format!("openshell-openshell-{workspace}");
     kubectl(&["-n", &ns, "delete", "rolebinding", "openshell-netpol-guard"]).await;
     let gateway_ns =
         std::env::var("OPENSHELL_E2E_GATEWAY_NAMESPACE").unwrap_or_else(|_| "openshell".into());
-    let workload = kubectl(&[
+    kubectl(&[
         "-n",
         &gateway_ns,
-        "get",
-        "statefulset,deployment",
-        "-l",
-        "app.kubernetes.io/name=openshell",
-        "-o",
-        "name",
+        "rollout",
+        "restart",
+        "statefulset/openshell",
     ])
     .await;
-    let workload = workload
-        .lines()
-        .find(|line| !line.contains("supervisor"))
-        .expect("gateway workload")
-        .to_string();
-    kubectl(&["-n", &gateway_ns, "rollout", "restart", &workload]).await;
     kubectl(&[
         "-n",
         &gateway_ns,
         "rollout",
         "status",
-        &workload,
+        "statefulset/openshell",
         "--timeout=300s",
     ])
     .await;
@@ -897,13 +914,11 @@ async fn an_existing_managed_namespace_is_guarded_after_a_gateway_restart() {
         );
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    // Let the CLI reach the restarted gateway.
-    openshell_e2e::harness::cli::wait_for_healthy(Duration::from_mins(2))
-        .await
-        .expect("gateway healthy");
+    println!("NETPOL_BINDING_AFTER_RESTART namespace={ns}");
+    // Give the new watch its first list.
+    tokio::time::sleep(Duration::from_secs(5)).await;
     let expected = baseline(&ns, SSH).await;
     let since = mutate(&ns, SSH, Mutation::Delete).await;
     wait_restored(&ns, SSH, &expected, since, "managed-existing-ssh/delete").await;
-    let _ = run_cli(&["sandbox", "delete", &name, "--workspace", &workspace]).await;
-    let _ = run_cli(&["workspace", "delete", &workspace]).await;
+    kubectl(&["delete", "namespace", &ns, "--wait=false"]).await;
 }
