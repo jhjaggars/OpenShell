@@ -279,8 +279,25 @@ mod linux {
             | BoundaryListenerConfig::RuntimeInitiatedUnix { .. }
             | BoundaryListenerConfig::RuntimeInitiatedVsock { .. } => None,
         };
-        let network_broker = NetworkBroker::start(listener, protected_control_port)
-            .map_err(|error| format!("start sandbox network broker: {error}"))?;
+        let network_broker = if qualification.privileged {
+            // B3c: the privileged (root-workload) mode has NO seccomp-based
+            // network broker — root defeats seccomp interception, and the
+            // nftables transparent relay (commit 5) is the replacement.
+            // Until it lands, network mediation is explicitly unavailable:
+            // the boundary serves the authenticated tunnel and exec, and
+            // workload network requests fail with a clear error rather
+            // than silently bypassing policy.
+            tracing::warn!(
+                "privileged (root-workload) boundary: network mediation is unavailable \
+                 (the seccomp broker is not installed in this mode; the nftables relay \
+                 is pending); workload network requests will be refused"
+            );
+            NetworkBroker::unavailable()
+                .map_err(|error| format!("create unavailable network broker: {error}"))?
+        } else {
+            NetworkBroker::start(listener, protected_control_port)
+                .map_err(|error| format!("start sandbox network broker: {error}"))?
+        };
         let process_runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -328,6 +345,38 @@ mod linux {
             // lifetime of the boundary process.
             unsafe { nix::sys::signal::sigaction(signal, &action) }
                 .map_err(|error| format!("install boundary {signal:?} handler: {error}"))?;
+        }
+        Ok(())
+    }
+
+    /// Mode-gated workload identity validation (pure, testable): uid 0 is
+    /// allowed ONLY when the  claim says "root" (the
+    /// privileged VM class, entered only through launch-privileged); the
+    /// sandboxed default and any unknown mode refuse it (fail closed).
+    /// Conversely, the root mode requires uid/gid zero — a nonzero
+    /// identity under a root claim is a config error. Each entry point
+    /// refuses the other mode's config.
+    fn validate_workload_mode_identity(
+        resource_claims: &std::collections::BTreeMap<String, String>,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), String> {
+        let workload_mode = resource_claims
+            .get(crate::WORKLOAD_MODE_CLAIM)
+            .map(String::as_str);
+        match workload_mode {
+            Some(crate::PRIVILEGED_WORKLOAD_MODE) => {
+                if uid != 0 || gid != 0 {
+                    return Err(
+                        "privileged (root-mode) boundary requires UID and GID zero".to_string()
+                    );
+                }
+            }
+            _ => {
+                if uid == 0 || gid == 0 {
+                    return Err("sandbox workload UID and GID must be nonzero".to_string());
+                }
+            }
         }
         Ok(())
     }
@@ -415,30 +464,11 @@ mod linux {
             | BoundaryListenerConfig::TlsTcp { .. }
             | BoundaryListenerConfig::Vsock { .. } => {}
         }
-        let workload_mode = config
-            .resource_claims
-            .get(crate::WORKLOAD_MODE_CLAIM)
-            .map(String::as_str);
-        match workload_mode {
-            Some(crate::PRIVILEGED_WORKLOAD_MODE) => {
-                // The privileged (root-workload) class: uid 0 is the
-                // designed identity, entered only through
-                // launch-privileged. A nonzero uid here is a config
-                // error, not a security event.
-                if config.workload_identity.uid != 0 || config.workload_identity.gid != 0 {
-                    return Err(
-                        "privileged (root-mode) boundary requires UID and GID zero".to_string()
-                    );
-                }
-            }
-            _ => {
-                // The sandboxed default (and any unknown mode, failing
-                // closed): uid 0 is refused.
-                if config.workload_identity.uid == 0 || config.workload_identity.gid == 0 {
-                    return Err("sandbox workload UID and GID must be nonzero".to_string());
-                }
-            }
-        }
+        validate_workload_mode_identity(
+            &config.resource_claims,
+            config.workload_identity.uid,
+            config.workload_identity.gid,
+        )?;
         Ok(())
     }
 
@@ -6420,6 +6450,42 @@ mod linux {
                 b"test-vm-fence",
             )
             .unwrap()
+        }
+
+        #[test]
+        fn workload_mode_identity_allows_root_only_with_root_claim() {
+            use std::collections::BTreeMap;
+
+            let claims = |mode: Option<&str>| {
+                let mut map = BTreeMap::new();
+                if let Some(mode) = mode {
+                    map.insert(crate::WORKLOAD_MODE_CLAIM.to_string(), mode.to_string());
+                }
+                map
+            };
+
+            // Root claim + uid 0: passes.
+            assert!(validate_workload_mode_identity(&claims(Some("root")), 0, 0).is_ok());
+
+            // Root claim + nonzero uid: fails (config error).
+            assert!(validate_workload_mode_identity(&claims(Some("root")), 1000, 1000).is_err());
+
+            // Sandboxed claim + uid 0: fails (security invariant).
+            assert!(validate_workload_mode_identity(&claims(Some("sandboxed")), 0, 0).is_err());
+
+            // Sandboxed claim + nonzero uid: passes.
+            assert!(
+                validate_workload_mode_identity(&claims(Some("sandboxed")), 1000, 1000).is_ok()
+            );
+
+            // No claim (the default) + uid 0: fails (fail closed).
+            assert!(validate_workload_mode_identity(&claims(None), 0, 0).is_err());
+
+            // Unknown claim + uid 0: fails (fail closed).
+            assert!(validate_workload_mode_identity(&claims(Some("unknown")), 0, 0).is_err());
+
+            // No claim + nonzero uid: passes (the sandboxed default).
+            assert!(validate_workload_mode_identity(&claims(None), 1000, 1000).is_ok());
         }
 
         fn test_runtime_qualification() -> crate::RuntimeQualification {

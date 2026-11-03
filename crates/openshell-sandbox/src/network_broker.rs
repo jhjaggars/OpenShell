@@ -236,6 +236,28 @@ impl NetworkBroker {
         Self::start_with_dns_address(listener, DNS_RELAY_ADDRESS, protected_control_port)
     }
 
+    /// A broker for the privileged (root-workload) mode, where the
+    /// seccomp-notify interception is not installed: no pending channels,
+    /// no DNS relay, marked unhealthy so network requests are refused with
+    /// a clear error instead of silently bypassing policy. The nftables
+    /// transparent relay (commit 5) is the replacement mediation path.
+    pub(crate) fn unavailable() -> io::Result<Self> {
+        let (_pending_tx, pending_rx) = mpsc::channel(1);
+        let (_dns_tx, dns_rx) = mpsc::channel(1);
+        let healthy = Arc::new(AtomicBool::new(false));
+        let broker = Self {
+            provider_files: crate::provider_files::ProviderFiles::default(),
+            workload_frozen: Arc::new(AtomicBool::new(false)),
+            pending: Arc::new(tokio::sync::Mutex::new(pending_rx)),
+            pending_dns: Arc::new(tokio::sync::Mutex::new(dns_rx)),
+            registry: Arc::new(Mutex::new(SocketRegistry::new(1, 1)?)),
+            descriptor_soft_limit: 0,
+            dns_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            healthy,
+        };
+        Ok(broker)
+    }
+
     #[cfg(any(test, feature = "perf-harness"))]
     pub(crate) fn start_for_test(listener: NotificationListener) -> io::Result<Self> {
         Self::start_with_dns_address(
