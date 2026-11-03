@@ -195,6 +195,11 @@ path = "tests/kubernetes_runtime_reconcile.rs"
 required-features = ["e2e-kubernetes"]
 
 [[test]]
+name = "kubernetes_network_policy_guard"
+path = "tests/kubernetes_network_policy_guard.rs"
+required-features = ["e2e-kubernetes"]
+
+[[test]]
 name = "credential_drivers"
 path = "tests/credential_drivers.rs"
 required-features = ["e2e-kubernetes-credential-drivers"]
