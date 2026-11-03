@@ -474,6 +474,8 @@ pub(crate) enum SuspendWrite {
 
 #[path = "netpol_guard.rs"]
 mod netpol_guard;
+#[path = "netpol_guard_rbac.rs"]
+mod netpol_guard_rbac;
 #[path = "netpol_guard_shell.rs"]
 mod netpol_guard_shell;
 #[path = "netpol_guard_watch.rs"]
@@ -1195,6 +1197,8 @@ pub struct KubernetesComputeDriver {
     netpol_guard: Arc<netpol_guard_shell::GuardState>,
     /// Gateway shutdown, so background guards stop before other drains.
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Managed mode: the role the guard binds in each managed namespace.
+    netpol_guard_binding: Option<netpol_guard_rbac::GuardBinding>,
 }
 
 impl std::fmt::Debug for KubernetesComputeDriver {
@@ -1246,6 +1250,7 @@ impl KubernetesComputeDriver {
             shared_supervisor: None,
             netpol_guard: Arc::default(),
             shutdown: None,
+            netpol_guard_binding: None,
         }
     }
 
@@ -1385,6 +1390,11 @@ impl KubernetesComputeDriver {
                 "the gateway supervisor topology does not export supervisor OTLP traces or OCSF events or relay workload traces; shared sandbox instances keep console logs and gateway log push"
             );
         }
+        let netpol_guard_binding = if config.workspace_mode == WorkspaceMode::Managed {
+            netpol_guard_rbac::GuardBinding::from_env()
+        } else {
+            None
+        };
         let driver = Self {
             client,
             watch_client,
@@ -1396,6 +1406,7 @@ impl KubernetesComputeDriver {
             shared_supervisor,
             netpol_guard: Arc::default(),
             shutdown: Some(shutdown_rx),
+            netpol_guard_binding,
         };
 
         if driver.workspace_mode() == WorkspaceMode::Shared {
@@ -1754,6 +1765,7 @@ impl KubernetesComputeDriver {
 
         self.ensure_service_account(&ns_name).await?;
         self.ensure_managed_ssh_network_policy(&ns_name).await?;
+        self.ensure_netpol_guard_role_binding(&ns_name).await;
 
         Ok(ns_name)
     }

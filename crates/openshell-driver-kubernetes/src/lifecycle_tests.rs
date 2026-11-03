@@ -1309,3 +1309,74 @@ mod netpol_guard_repairs {
         assert_eq!(outcome, GuardOutcome::Skipped("no-sandboxes"));
     }
 }
+
+/// Managed-mode guard `RoleBinding`s against the fake API world.
+mod netpol_guard_bindings {
+    use super::reconcile_request_sequences::World;
+    use super::*;
+    use crate::driver::netpol_guard_rbac::{GUARD_ROLE_BINDING_NAME, GuardBinding};
+
+    const NS: &str = "openshell-gw-team-a";
+    const PATH: &str =
+        "/apis/rbac.authorization.k8s.io/v1/namespaces/openshell-gw-team-a/rolebindings/openshell-netpol-guard";
+    const COLLECTION: &str =
+        "/apis/rbac.authorization.k8s.io/v1/namespaces/openshell-gw-team-a/rolebindings";
+
+    fn binding() -> GuardBinding {
+        GuardBinding {
+            cluster_role: "openshell-netpol-guard-openshell".into(),
+            service_account: "openshell".into(),
+            service_account_namespace: "openshell".into(),
+        }
+    }
+
+    fn driver(world: &World) -> KubernetesComputeDriver {
+        let mut driver = world.driver(KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Managed,
+            gateway_id: "gw".into(),
+            ..Default::default()
+        });
+        driver.netpol_guard_binding = Some(binding());
+        driver
+    }
+
+    #[tokio::test]
+    async fn a_new_managed_namespace_gets_the_guard_binding() {
+        let world = World::default();
+        world.on(
+            http::Method::POST,
+            COLLECTION,
+            201,
+            serde_json::to_value(binding().role_binding(NS)).unwrap(),
+        );
+        assert!(driver(&world).ensure_netpol_guard_role_binding(NS).await);
+        let body = &world.bodies(&http::Method::POST, COLLECTION)[0];
+        assert_eq!(body["metadata"]["name"], GUARD_ROLE_BINDING_NAME);
+        assert_eq!(body["roleRef"]["kind"], "ClusterRole");
+        assert_eq!(body["roleRef"]["name"], "openshell-netpol-guard-openshell");
+        assert_eq!(body["subjects"][0]["kind"], "ServiceAccount");
+        assert_eq!(body["subjects"][0]["namespace"], "openshell");
+    }
+
+    #[tokio::test]
+    async fn an_existing_binding_is_adopted_and_a_foreign_one_is_left_alone() {
+        let world = World::default();
+        world.on(http::Method::GET, PATH, 200, serde_json::to_value(binding().role_binding(NS)).unwrap());
+        assert!(driver(&world).ensure_netpol_guard_role_binding(NS).await);
+        let mut foreign = binding().role_binding(NS);
+        foreign.role_ref.name = "cluster-admin".into();
+        let world = World::default();
+        world.on(http::Method::GET, PATH, 200, serde_json::to_value(foreign).unwrap());
+        assert!(!driver(&world).ensure_netpol_guard_role_binding(NS).await);
+        assert!(world.requests().iter().all(|r| r.starts_with("GET")));
+    }
+
+    #[tokio::test]
+    async fn without_chart_rbac_no_binding_is_attempted() {
+        let world = World::default();
+        let mut driver = driver(&world);
+        driver.netpol_guard_binding = None;
+        assert!(!driver.ensure_netpol_guard_role_binding(NS).await);
+        assert!(world.requests().is_empty());
+    }
+}

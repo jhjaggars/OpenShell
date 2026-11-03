@@ -209,15 +209,6 @@ impl Drop for NamespaceWatches {
 }
 
 impl KubernetesComputeDriver {
-    /// Managed mode's namespace set, discovered from the namespaces this
-    /// gateway owns. Added with managed-mode RBAC binding.
-    #[allow(clippy::unused_self)]
-    const fn managed_namespace_events(
-        &self,
-    ) -> Option<mpsc::Receiver<std::collections::BTreeSet<String>>> {
-        None
-    }
-
     /// Namespaces whose guarded policies this replica watches, when the
     /// set is static or polled. Managed mode discovers its own namespaces.
     fn polled_guard_namespaces(&self) -> std::collections::BTreeSet<String> {
