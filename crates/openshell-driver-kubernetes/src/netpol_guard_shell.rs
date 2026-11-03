@@ -233,6 +233,15 @@ impl TrustedSandbox {
         BoundState {
             may_run: sandbox_runtime_should_run(&self.object)
                 || sandbox_runtime_bootstrap_in_progress(&self.object),
+            bound_uid: self
+                .object
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| {
+                    annotations.get(super::ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_UID)
+                })
+                .cloned(),
             bound_generation: self
                 .object
                 .metadata

@@ -360,10 +360,12 @@ pub fn classify(observed: Option<&NetworkPolicy>, expected: &ExpectedPolicy) -> 
 }
 
 /// Facts about the Sandbox that owns a per-sandbox policy.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct BoundState {
     /// The generation may run (running or bootstrapping).
     pub may_run: bool,
+    /// The policy UID bound into the running generation's evidence.
+    pub bound_uid: Option<String>,
     /// The policy generation bound into the running generation's evidence.
     pub bound_generation: Option<i64>,
 }
@@ -415,6 +417,8 @@ pub fn plan_repair(
                 && bound.may_run
                 && bound.bound_generation.is_some()
                 && bound.bound_generation == observed.metadata.generation
+                && bound.bound_uid.is_some()
+                && bound.bound_uid == observed.metadata.uid
             {
                 return RepairAction::None(NoAction::BoundSharedTarget);
             }
@@ -757,33 +761,27 @@ mod tests {
             Some(vec![NetworkPolicyPeer::default()]);
         let drift = classify(Some(&observed), &expected);
         assert_eq!(drift, Drift::Spec);
-        let running = BoundState {
+        let bound = |uid: &str, generation| BoundState {
             may_run: true,
-            bound_generation: Some(1),
+            bound_uid: Some(uid.into()),
+            bound_generation: Some(generation),
         };
         assert_eq!(
-            plan_repair(drift, Some(&observed), &expected, running, "1"),
+            plan_repair(drift, Some(&observed), &expected, bound("uid-1", 1), "1"),
             RepairAction::None(NoAction::BoundSharedTarget)
         );
-        // Edited after binding, or not running: repair to the live render.
-        let edited = BoundState {
-            may_run: true,
-            bound_generation: Some(0),
-        };
-        assert!(matches!(
-            plan_repair(drift, Some(&observed), &expected, edited, "1"),
-            RepairAction::Replace { .. }
-        ));
-        assert!(matches!(
-            plan_repair(
-                drift,
-                Some(&observed),
-                &expected,
-                BoundState::default(),
-                "1"
-            ),
-            RepairAction::Replace { .. }
-        ));
+        // Edited after binding, replaced by a new object that happens to have
+        // the bound generation, or not running: repair to the live render.
+        for state in [
+            bound("uid-1", 0),
+            bound("other-uid", 1),
+            BoundState::default(),
+        ] {
+            assert!(matches!(
+                plan_repair(drift, Some(&observed), &expected, state, "1"),
+                RepairAction::Replace { .. }
+            ));
+        }
     }
 
     #[test]
