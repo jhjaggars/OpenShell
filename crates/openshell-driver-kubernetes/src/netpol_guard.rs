@@ -421,8 +421,15 @@ pub fn plan_repair(
             let Some(resource_version) = observed.metadata.resource_version.clone() else {
                 return RepairAction::None(NoAction::NoResourceVersion);
             };
+            let mut body = write_body(expected, Some(observed), release);
+            if drift == Drift::Metadata {
+                // Enforcement is unchanged: keep the stored spec exactly, so
+                // the API server sees no spec change and keeps the generation
+                // that running sandboxes bound.
+                body.spec.clone_from(&observed.spec);
+            }
             RepairAction::Replace {
-                body: write_body(expected, Some(observed), release),
+                body,
                 resource_version,
             }
         }
@@ -712,6 +719,28 @@ mod tests {
                 assert_eq!(body.metadata.resource_version.as_deref(), Some("100"));
             }
         }
+    }
+
+    #[test]
+    fn a_metadata_repair_keeps_the_stored_spec_byte_for_byte() {
+        let expected = workload();
+        let mut observed = stored(&expected);
+        observed.metadata.labels = None;
+        // The API server stored an accepted render with a different, but
+        // equivalent, encoding: here an explicit empty egress list.
+        observed.spec.as_mut().unwrap().egress = Some(Vec::new());
+        assert_eq!(classify(Some(&observed), &expected), Drift::Metadata);
+        let RepairAction::Replace { body, .. } = plan_repair(
+            Drift::Metadata,
+            Some(&observed),
+            &expected,
+            BoundState::default(),
+            "1",
+        ) else {
+            panic!("expected a replace");
+        };
+        assert_eq!(body.spec, observed.spec);
+        assert!(metadata_matches(&body, expected.write_render()));
     }
 
     #[test]
