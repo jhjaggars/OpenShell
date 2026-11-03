@@ -49,6 +49,17 @@ pub struct ChildHardeningProgram {
 }
 
 impl ChildHardeningProgram {
+    /// An empty program that installs nothing: used for the privileged
+    /// (root-workload) mode, where no seccomp filter applies to workload
+    /// children. `install` on an empty program sets only
+    /// `no_new_privs` and the close-on-exec marks — the sandbox
+    /// invariants that are still meaningful for root.
+    pub fn noop() -> Self {
+        Self {
+            instructions: Vec::new(),
+        }
+    }
+
     /// Install this filter on the calling thread only.
     ///
     /// The caller must invoke this from the post-fork child after all

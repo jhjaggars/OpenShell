@@ -266,8 +266,7 @@ mod linux {
         }
         crate::managed_children::start_orphan_reaper()
             .map_err(|error| format!("start sandbox orphan reaper: {error}"))?;
-        let (launcher, listener) = crate::linux::workload_launcher::start()
-            .map_err(|error| format!("start sandbox workload launcher: {error}"))?;
+
         let protected_control_port = match &config.listener {
             BoundaryListenerConfig::TlsTcp { address, .. } => Some(address.port()),
             // Validation requires every supervisor address to share one port.
@@ -279,24 +278,30 @@ mod linux {
             | BoundaryListenerConfig::RuntimeInitiatedUnix { .. }
             | BoundaryListenerConfig::RuntimeInitiatedVsock { .. } => None,
         };
-        let network_broker = if qualification.privileged {
-            // B3c: the privileged (root-workload) mode has NO seccomp-based
-            // network broker — root defeats seccomp interception, and the
-            // nftables transparent relay (commit 5) is the replacement.
-            // Until it lands, network mediation is explicitly unavailable:
-            // the boundary serves the authenticated tunnel and exec, and
-            // workload network requests fail with a clear error rather
-            // than silently bypassing policy.
+        let (launcher, network_broker) = if qualification.privileged {
+            // B3c: the privileged (root-workload) mode launches workload
+            // children WITHOUT the seccomp-notify filter (socket calls go
+            // straight to the kernel, where the network fence is the
+            // enforcement point) and installs no network broker. Until the
+            // nftables transparent relay (commit 5), network mediation is
+            // explicitly unavailable: workload sockets reach the fence and
+            // are blocked there (a fast kernel-level refusal, not a hang).
             tracing::warn!(
                 "privileged (root-workload) boundary: network mediation is unavailable \
                  (the seccomp broker is not installed in this mode; the nftables relay \
-                 is pending); workload network requests will be refused"
+                 is pending); workload network requests are blocked by the fence"
             );
-            NetworkBroker::unavailable()
-                .map_err(|error| format!("create unavailable network broker: {error}"))?
+            let launcher = crate::linux::workload_launcher::start_privileged()
+                .map_err(|error| format!("start privileged workload launcher: {error}"))?;
+            let broker = NetworkBroker::unavailable()
+                .map_err(|error| format!("create unavailable network broker: {error}"))?;
+            (launcher, broker)
         } else {
-            NetworkBroker::start(listener, protected_control_port)
-                .map_err(|error| format!("start sandbox network broker: {error}"))?
+            let (launcher, listener) = crate::linux::workload_launcher::start()
+                .map_err(|error| format!("start sandbox workload launcher: {error}"))?;
+            let broker = NetworkBroker::start(listener, protected_control_port)
+                .map_err(|error| format!("start sandbox network broker: {error}"))?;
+            (launcher, broker)
         };
         let process_runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -3921,6 +3926,22 @@ mod linux {
             provider_env: std::collections::HashMap<String, String>,
             provider_files: std::collections::HashMap<String, String>,
         ) -> Response {
+            // The user's decision: provider files and provider environment
+            // variables are unsupported in the privileged (root-workload)
+            // mode — nothing secret enters the guest. A root guest reads
+            // boundary memory (/proc/<pid>/mem), so storing the maps even
+            // without serving them is exposure.
+            if self.qualification.privileged
+                && (!provider_files.is_empty() || !provider_env.is_empty())
+            {
+                return guest_error(
+                    BoundaryErrorKind::Unsupported,
+                    "provider files and provider environment variables are not \
+                     supported in privileged (root-workload) mode: the guest runs as \
+                     root and would be fully exposed to the credentials"
+                        .to_string(),
+                );
+            }
             let Some(policy) = lock(&self.attached_policy).clone() else {
                 return guest_error(
                     BoundaryErrorKind::Invalid,
@@ -4045,6 +4066,19 @@ mod linux {
             provider_env: std::collections::HashMap<String, String>,
             provider_files: std::collections::HashMap<String, String>,
         ) -> Response {
+            // Same refusal as start_agent: no provider material in
+            // privileged mode, including on later updates.
+            if self.qualification.privileged
+                && (!provider_files.is_empty() || !provider_env.is_empty())
+            {
+                return guest_error(
+                    BoundaryErrorKind::Unsupported,
+                    "provider files and provider environment variables are not \
+                     supported in privileged (root-workload) mode: the guest runs as \
+                     root and would be fully exposed to the credentials"
+                        .to_string(),
+                );
+            }
             let process = {
                 let state = lock(&self.state);
                 let RuntimeState::Running(process) = &*state else {

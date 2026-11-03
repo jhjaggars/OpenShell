@@ -86,6 +86,10 @@ pub async fn spawn_workload(
             boundary_runtime.clone(),
             otlp_relay_active,
             launcher.clone(),
+            // The boundary process is root only in privileged (root-
+            // workload) mode: the sandboxed launch explicitly transitions
+            // to the non-root workload identity before the boundary runs.
+            nix::unistd::geteuid().as_raw() == 0,
         ));
 
     // The delegated workload runs behind OpenShell's mediated network path,
