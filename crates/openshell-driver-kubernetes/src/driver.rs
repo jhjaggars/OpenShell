@@ -383,6 +383,47 @@ fn sandbox_runtime_control_connection(
     Ok(mode)
 }
 
+/// Why one sandbox's runtime reconcile stopped without acting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkipReason {
+    NoSandboxId,
+    GateBusy,
+    NoName,
+    RefreshNotFound,
+    RefreshFailed,
+    Replaced,
+    AdmissionRetry,
+    FenceUnverified,
+    FenceUnreadable,
+    ControlPathUnverified,
+    WorkloadGenerationUnknown,
+    SupervisorGenerationUnknown,
+}
+
+/// The check that suspended a sandbox-runtime generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuspendTrigger {
+    AdmissionRevalidation,
+    FenceSpec,
+    FenceGeneration,
+    ControlPath,
+    WorkloadGeneration,
+    SupervisorGeneration,
+    CompanionMissing,
+    SupervisorUnavailable,
+}
+
+/// Outcome of reconciling one Sandbox's runtime resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconcileOutcome {
+    Skipped(SkipReason),
+    Released,
+    SuspensionAdvanced,
+    Bootstrap,
+    Suspended(SuspendTrigger),
+    Reconciled,
+}
+
 /// Operator-provided bootstrap bytes read once per runtime generation.
 struct StagedBootstrapMaterial {
     upstream_proxy_ca_bundle: Option<Vec<u8>>,
@@ -5020,254 +5061,272 @@ impl KubernetesComputeDriver {
             self.recover_shared_instances(baseline, &list.items).await;
         }
 
-        for object in list.items {
-            let Ok(sandbox_id) = sandbox_id_from_object(&object) else {
-                continue;
-            };
-            // Lifecycle RPCs can replace the stable supervisor Pod name while
-            // this LIST snapshot still describes the previous stopped state.
-            // Skip in-flight mutations, then refresh under the shared gate so
-            // a snapshot taken before a completed restart cannot delete it.
-            let Ok(_guard) = self.lifecycle_gates.gate_for(&sandbox_id).try_lock_owned() else {
-                continue;
-            };
-            let Some(name) = object.metadata.name.as_deref() else {
-                continue;
-            };
-            let namespace = object
-                .metadata
-                .namespace
-                .as_deref()
-                .unwrap_or(&self.config.namespace);
-            let api = Self::agent_sandbox_api(
-                self.client.clone(),
-                &lookup_api.resource.version,
-                namespace,
-            );
-            let refreshed = match tokio::time::timeout(KUBE_API_TIMEOUT, api.api.get(name)).await {
-                Ok(Ok(refreshed)) => refreshed,
-                Ok(Err(KubeError::Api(error))) if error.code == 404 => continue,
-                Ok(Err(error)) => {
-                    debug!(%sandbox_id, %error, "could not refresh Sandbox for runtime reconciliation");
-                    continue;
-                }
-                Err(_) => {
-                    warn!(%sandbox_id, "timed out refreshing Sandbox for runtime reconciliation");
-                    continue;
-                }
-            };
-            if refreshed.metadata.uid != object.metadata.uid
-                || sandbox_id_from_object(&refreshed).as_deref() != Ok(sandbox_id.as_str())
-            {
-                continue;
-            }
-            let object = refreshed;
-            if let Err(error) = self.admit_stored_resources(&object).await {
-                warn!(%sandbox_id, reason = %error.message(), "Sandbox resource admission revalidation failed");
-                if error.code() == tonic::Code::FailedPrecondition {
-                    self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
-                        .await;
-                }
-                continue;
-            }
-            let namespace = object
-                .metadata
-                .namespace
-                .as_deref()
-                .unwrap_or(&self.config.namespace);
-            let cr_name = object.metadata.name.as_deref().unwrap_or_default();
-            if sandbox_runtime_bootstrap_phase(&object)
-                == Some(SandboxRuntimeBootstrapPhase::Releasing)
-            {
-                self.reconcile_sandbox_runtime_control_release(
-                    &lookup_api,
-                    &object,
-                    &sandbox_id,
-                    namespace,
-                    cr_name,
-                )
+        for object in &list.items {
+            self.reconcile_one_sandbox_runtime(&lookup_api, object)
                 .await;
-                continue;
+        }
+    }
+
+    /// Reconcile one listed Sandbox: refresh it under its lifecycle gate,
+    /// revalidate admission, advance a pending release or suspension, verify
+    /// the namespace fence and control path, and publish readiness. The
+    /// periodic pass and the `NetworkPolicy` guard share this decision path.
+    /// It takes the lifecycle gate itself; callers must not hold it.
+    async fn reconcile_one_sandbox_runtime(
+        &self,
+        lookup_api: &AgentSandboxApi,
+        object: &DynamicObject,
+    ) -> ReconcileOutcome {
+        let Ok(sandbox_id) = sandbox_id_from_object(object) else {
+            return ReconcileOutcome::Skipped(SkipReason::NoSandboxId);
+        };
+        // Lifecycle RPCs can replace the stable supervisor Pod name while
+        // this LIST snapshot still describes the previous stopped state.
+        // Skip in-flight mutations, then refresh under the shared gate so
+        // a snapshot taken before a completed restart cannot delete it.
+        let Ok(_guard) = self.lifecycle_gates.gate_for(&sandbox_id).try_lock_owned() else {
+            return ReconcileOutcome::Skipped(SkipReason::GateBusy);
+        };
+        let Some(name) = object.metadata.name.as_deref() else {
+            return ReconcileOutcome::Skipped(SkipReason::NoName);
+        };
+        let namespace = object
+            .metadata
+            .namespace
+            .as_deref()
+            .unwrap_or(&self.config.namespace);
+        let api =
+            Self::agent_sandbox_api(self.client.clone(), &lookup_api.resource.version, namespace);
+        let refreshed = match tokio::time::timeout(KUBE_API_TIMEOUT, api.api.get(name)).await {
+            Ok(Ok(refreshed)) => refreshed,
+            Ok(Err(KubeError::Api(error))) if error.code == 404 => {
+                return ReconcileOutcome::Skipped(SkipReason::RefreshNotFound);
             }
-            if sandbox_runtime_bootstrap_phase(&object)
-                == Some(SandboxRuntimeBootstrapPhase::Suspending)
-            {
-                self.reconcile_sandbox_runtime_suspending(
-                    &lookup_api,
-                    &object,
-                    &sandbox_id,
-                    namespace,
-                    cr_name,
-                )
-                .await;
-                continue;
+            Ok(Err(error)) => {
+                debug!(%sandbox_id, %error, "could not refresh Sandbox for runtime reconciliation");
+                return ReconcileOutcome::Skipped(SkipReason::RefreshFailed);
             }
-            let names = SandboxRuntimeNames::new(&sandbox_id);
-            let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), namespace);
-            match self.create_sandbox_runtime_fence(namespace, &names).await {
-                Ok(()) => {}
-                Err(KubernetesDriverError::Precondition(error)) => {
-                    warn!(sandbox_id, %error, "sandbox-runtime workload fence is altered; suspending workload");
-                    self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
-                        .await;
-                    continue;
-                }
-                Err(error) => {
-                    warn!(sandbox_id, %error, "could not verify sandbox-runtime workload fence; reconciliation will retry");
-                    continue;
-                }
+            Err(_) => {
+                warn!(%sandbox_id, "timed out refreshing Sandbox for runtime reconciliation");
+                return ReconcileOutcome::Skipped(SkipReason::RefreshFailed);
             }
-            let Ok(Ok(fence)) =
-                tokio::time::timeout(KUBE_API_TIMEOUT, policies.get(&names.workload_policy)).await
-            else {
-                continue;
-            };
-            let workload_may_run = sandbox_runtime_should_run(&object)
-                || sandbox_runtime_bootstrap_in_progress(&object);
-            if workload_may_run
-                && !sandbox_runtime_namespace_fence_generation_matches(&fence, &object)
-            {
-                warn!(
-                    sandbox_id,
-                    "namespace workload fence generation changed; suspending stale boundary"
-                );
-                self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
+        };
+        if refreshed.metadata.uid != object.metadata.uid
+            || sandbox_id_from_object(&refreshed).as_deref() != Ok(sandbox_id.as_str())
+        {
+            return ReconcileOutcome::Skipped(SkipReason::Replaced);
+        }
+        let object = refreshed;
+        if let Err(error) = self.admit_stored_resources(&object).await {
+            warn!(%sandbox_id, reason = %error.message(), "Sandbox resource admission revalidation failed");
+            if error.code() == tonic::Code::FailedPrecondition {
+                self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
                     .await;
-                continue;
+                return ReconcileOutcome::Suspended(SuspendTrigger::AdmissionRevalidation);
             }
-            if workload_may_run {
-                let require_service = !sandbox_runtime_bootstrap_in_progress(&object);
-                match self
-                    .verify_sandbox_runtime_control_path(
-                        &object,
-                        &sandbox_id,
-                        namespace,
-                        require_service,
-                    )
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(KubernetesDriverError::Precondition(error)) => {
-                        warn!(sandbox_id, %error, "sandbox-runtime control path drifted; suspending workload");
-                        self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
-                            .await;
-                        continue;
-                    }
-                    Err(error) => {
-                        warn!(sandbox_id, %error, "could not verify sandbox-runtime control path; reconciliation will retry");
-                        continue;
-                    }
-                }
+            return ReconcileOutcome::Skipped(SkipReason::AdmissionRetry);
+        }
+        let namespace = object
+            .metadata
+            .namespace
+            .as_deref()
+            .unwrap_or(&self.config.namespace);
+        let cr_name = object.metadata.name.as_deref().unwrap_or_default();
+        if sandbox_runtime_bootstrap_phase(&object) == Some(SandboxRuntimeBootstrapPhase::Releasing)
+        {
+            self.reconcile_sandbox_runtime_control_release(
+                lookup_api,
+                &object,
+                &sandbox_id,
+                namespace,
+                cr_name,
+            )
+            .await;
+            return ReconcileOutcome::Released;
+        }
+        if sandbox_runtime_bootstrap_phase(&object)
+            == Some(SandboxRuntimeBootstrapPhase::Suspending)
+        {
+            self.reconcile_sandbox_runtime_suspending(
+                lookup_api,
+                &object,
+                &sandbox_id,
+                namespace,
+                cr_name,
+            )
+            .await;
+            return ReconcileOutcome::SuspensionAdvanced;
+        }
+        let names = SandboxRuntimeNames::new(&sandbox_id);
+        let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), namespace);
+        match self.create_sandbox_runtime_fence(namespace, &names).await {
+            Ok(()) => {}
+            Err(KubernetesDriverError::Precondition(error)) => {
+                warn!(sandbox_id, %error, "sandbox-runtime workload fence is altered; suspending workload");
+                self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+                    .await;
+                return ReconcileOutcome::Suspended(SuspendTrigger::FenceSpec);
             }
-            if sandbox_runtime_bootstrap_in_progress(&object) {
-                if generation_control_availability(
-                    &self.client,
-                    self.shared_supervisor.as_ref(),
-                    namespace,
-                    &sandbox_id,
-                    &object,
-                )
-                .await
-                    == SandboxRuntimeControlAvailability::Available
-                    && sandbox_runtime_bootstrap_is_ready_to_complete(&object)
-                {
-                    self.complete_sandbox_runtime_bootstrap(&lookup_api, &object)
-                        .await;
-                } else {
-                    self.reap_stale_sandbox_runtime_bootstrap(&lookup_api, &object)
-                        .await;
-                }
-                continue;
+            Err(error) => {
+                warn!(sandbox_id, %error, "could not verify sandbox-runtime workload fence; reconciliation will retry");
+                return ReconcileOutcome::Skipped(SkipReason::FenceUnverified);
             }
-            let desired_running = sandbox_runtime_should_run(&object);
-            if desired_running {
-                match sandbox_runtime_workload_generation_matches(
-                    &self.client,
-                    namespace,
-                    cr_name,
-                    &object,
-                )
-                .await
-                {
-                    SandboxRuntimeControlAvailability::Available
-                    | SandboxRuntimeControlAvailability::Degraded => {}
-                    SandboxRuntimeControlAvailability::Unavailable => {
-                        warn!(
-                            sandbox_id,
-                            "sandbox-runtime workload generation changed; suspending stale boundary"
-                        );
-                        self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
-                            .await;
-                        continue;
-                    }
-                    SandboxRuntimeControlAvailability::Unknown => {
-                        warn!(
-                            sandbox_id,
-                            "could not verify sandbox-runtime workload generation; reconciliation will retry"
-                        );
-                        continue;
-                    }
-                }
-                match sandbox_runtime_supervisor_generation_matches(
-                    &self.client,
-                    namespace,
-                    &sandbox_id,
-                    &object,
-                )
-                .await
-                {
-                    SandboxRuntimeControlAvailability::Available
-                    | SandboxRuntimeControlAvailability::Degraded => {}
-                    SandboxRuntimeControlAvailability::Unavailable => {
-                        warn!(
-                            sandbox_id,
-                            "sandbox-runtime supervisor generation changed; suspending stale boundary"
-                        );
-                        self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
-                            .await;
-                        continue;
-                    }
-                    SandboxRuntimeControlAvailability::Unknown => continue,
-                }
-            }
+        }
+        let Ok(Ok(fence)) =
+            tokio::time::timeout(KUBE_API_TIMEOUT, policies.get(&names.workload_policy)).await
+        else {
+            return ReconcileOutcome::Skipped(SkipReason::FenceUnreadable);
+        };
+        let workload_may_run =
+            sandbox_runtime_should_run(&object) || sandbox_runtime_bootstrap_in_progress(&object);
+        if workload_may_run && !sandbox_runtime_namespace_fence_generation_matches(&fence, &object)
+        {
+            warn!(
+                sandbox_id,
+                "namespace workload fence generation changed; suspending stale boundary"
+            );
+            self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+                .await;
+            return ReconcileOutcome::Suspended(SuspendTrigger::FenceGeneration);
+        }
+        if workload_may_run {
+            let require_service = !sandbox_runtime_bootstrap_in_progress(&object);
             match self
-                .reconcile_sandbox_runtime_supervisor(
+                .verify_sandbox_runtime_control_path(
+                    &object,
                     &sandbox_id,
                     namespace,
-                    desired_running,
-                    &object,
+                    require_service,
                 )
                 .await
             {
                 Ok(()) => {}
                 Err(KubernetesDriverError::Precondition(error)) => {
-                    warn!(sandbox_id, %error, "sandbox-runtime companion is missing; suspending workload");
-                    self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
+                    warn!(sandbox_id, %error, "sandbox-runtime control path drifted; suspending workload");
+                    self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
                         .await;
+                    return ReconcileOutcome::Suspended(SuspendTrigger::ControlPath);
                 }
                 Err(error) => {
-                    warn!(sandbox_id, %error, "failed to reconcile sandbox-runtime supervisor Pod");
+                    warn!(sandbox_id, %error, "could not verify sandbox-runtime control path; reconciliation will retry");
+                    return ReconcileOutcome::Skipped(SkipReason::ControlPathUnverified);
                 }
             }
-            let availability = generation_control_availability(
+        }
+        if sandbox_runtime_bootstrap_in_progress(&object) {
+            if generation_control_availability(
                 &self.client,
                 self.shared_supervisor.as_ref(),
                 namespace,
                 &sandbox_id,
                 &object,
             )
-            .await;
-            if desired_running && availability == SandboxRuntimeControlAvailability::Unavailable {
-                warn!(
-                    sandbox_id,
-                    "sandbox-runtime supervisor is unavailable; suspending workload"
-                );
-                self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
+            .await
+                == SandboxRuntimeControlAvailability::Available
+                && sandbox_runtime_bootstrap_is_ready_to_complete(&object)
+            {
+                self.complete_sandbox_runtime_bootstrap(lookup_api, &object)
                     .await;
-                continue;
+            } else {
+                self.reap_stale_sandbox_runtime_bootstrap(lookup_api, &object)
+                    .await;
             }
-            self.publish_sandbox_runtime_readiness_transition(&lookup_api, &object, availability)
+            return ReconcileOutcome::Bootstrap;
+        }
+        let desired_running = sandbox_runtime_should_run(&object);
+        let mut companion_suspended = false;
+        if desired_running {
+            match sandbox_runtime_workload_generation_matches(
+                &self.client,
+                namespace,
+                cr_name,
+                &object,
+            )
+            .await
+            {
+                SandboxRuntimeControlAvailability::Available
+                | SandboxRuntimeControlAvailability::Degraded => {}
+                SandboxRuntimeControlAvailability::Unavailable => {
+                    warn!(
+                        sandbox_id,
+                        "sandbox-runtime workload generation changed; suspending stale boundary"
+                    );
+                    self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+                        .await;
+                    return ReconcileOutcome::Suspended(SuspendTrigger::WorkloadGeneration);
+                }
+                SandboxRuntimeControlAvailability::Unknown => {
+                    warn!(
+                        sandbox_id,
+                        "could not verify sandbox-runtime workload generation; reconciliation will retry"
+                    );
+                    return ReconcileOutcome::Skipped(SkipReason::WorkloadGenerationUnknown);
+                }
+            }
+            match sandbox_runtime_supervisor_generation_matches(
+                &self.client,
+                namespace,
+                &sandbox_id,
+                &object,
+            )
+            .await
+            {
+                SandboxRuntimeControlAvailability::Available
+                | SandboxRuntimeControlAvailability::Degraded => {}
+                SandboxRuntimeControlAvailability::Unavailable => {
+                    warn!(
+                        sandbox_id,
+                        "sandbox-runtime supervisor generation changed; suspending stale boundary"
+                    );
+                    self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+                        .await;
+                    return ReconcileOutcome::Suspended(SuspendTrigger::SupervisorGeneration);
+                }
+                SandboxRuntimeControlAvailability::Unknown => {
+                    return ReconcileOutcome::Skipped(SkipReason::SupervisorGenerationUnknown);
+                }
+            }
+        }
+        match self
+            .reconcile_sandbox_runtime_supervisor(&sandbox_id, namespace, desired_running, &object)
+            .await
+        {
+            Ok(()) => {}
+            Err(KubernetesDriverError::Precondition(error)) => {
+                warn!(sandbox_id, %error, "sandbox-runtime companion is missing; suspending workload");
+                self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+                    .await;
+                // Deliberately falls through: availability and readiness are
+                // still published after a companion suspension.
+                companion_suspended = true;
+            }
+            Err(error) => {
+                warn!(sandbox_id, %error, "failed to reconcile sandbox-runtime supervisor Pod");
+            }
+        }
+        let availability = generation_control_availability(
+            &self.client,
+            self.shared_supervisor.as_ref(),
+            namespace,
+            &sandbox_id,
+            &object,
+        )
+        .await;
+        if desired_running && availability == SandboxRuntimeControlAvailability::Unavailable {
+            warn!(
+                sandbox_id,
+                "sandbox-runtime supervisor is unavailable; suspending workload"
+            );
+            self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
                 .await;
+            return ReconcileOutcome::Suspended(SuspendTrigger::SupervisorUnavailable);
+        }
+        self.publish_sandbox_runtime_readiness_transition(lookup_api, &object, availability)
+            .await;
+        if companion_suspended {
+            ReconcileOutcome::Suspended(SuspendTrigger::CompanionMissing)
+        } else {
+            ReconcileOutcome::Reconciled
         }
     }
 
