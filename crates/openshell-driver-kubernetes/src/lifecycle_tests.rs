@@ -428,6 +428,13 @@ mod reconcile_request_sequences {
         })
     }
 
+    pub(super) fn conflict_status() -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1", "kind": "Status", "status": "Failure",
+            "message": "the object has been modified", "reason": "Conflict", "code": 409
+        })
+    }
+
     /// A sandbox CR whose stored generation binds the namespace fence with
     /// UID `fence-uid` at generation 1.
     pub(super) fn sandbox(running: bool) -> serde_json::Value {
@@ -517,6 +524,20 @@ mod reconcile_request_sequences {
         })
     }
 
+    /// Run one pass over the single listed sandbox and return its outcome.
+    pub(super) async fn reconcile(world: &World) -> ReconcileOutcome {
+        let outcomes = world
+            .driver(KubernetesComputeConfig::default())
+            .reconcile_sandbox_runtime_resources()
+            .await;
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        outcomes[0].1
+    }
+
+    fn suspended_by(trigger: SuspendTrigger) -> ReconcileOutcome {
+        ReconcileOutcome::Suspended { trigger, write: SuspendWrite::Written }
+    }
+
     fn get(path: &str) -> String {
         format!("GET {path}")
     }
@@ -529,7 +550,8 @@ mod reconcile_request_sequences {
         let world = world_with(sandbox(true));
         world.on(http::Method::GET, CR_PATH, 404, not_found_status());
         world.routes.lock().unwrap().get_mut(&(http::Method::GET, CR_PATH.to_string())).unwrap().pop_front();
-        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        let outcome = reconcile(&world).await;
+        assert_eq!(outcome, ReconcileOutcome::Skipped(SkipReason::RefreshNotFound));
         assert_eq!(world.requests(), [get(LIST_PATH), get(CR_PATH)]);
     }
 
@@ -542,7 +564,8 @@ mod reconcile_request_sequences {
             .remove(crate::resource_admission::IDENTITIES);
         let world = world_with(object);
         world.on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
-        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        let outcome = reconcile(&world).await;
+        assert_eq!(outcome, suspended_by(SuspendTrigger::AdmissionRevalidation));
         assert_eq!(world.requests(), [get(LIST_PATH), get(CR_PATH), patch(CR_PATH)]);
         assert!(suspended(&world));
     }
@@ -556,7 +579,8 @@ mod reconcile_request_sequences {
         world
             .on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(workload).unwrap())
             .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
-        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        let outcome = reconcile(&world).await;
+        assert_eq!(outcome, suspended_by(SuspendTrigger::FenceSpec));
         assert_eq!(
             world.requests(),
             [get(LIST_PATH), get(CR_PATH), get(WORKLOAD_FENCE_PATH), patch(CR_PATH)]
@@ -573,7 +597,8 @@ mod reconcile_request_sequences {
         world
             .on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(workload).unwrap())
             .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
-        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        let outcome = reconcile(&world).await;
+        assert_eq!(outcome, suspended_by(SuspendTrigger::FenceSpec));
         assert_eq!(
             world.requests(),
             [get(LIST_PATH), get(CR_PATH), get(WORKLOAD_FENCE_PATH), patch(CR_PATH)]
@@ -592,7 +617,8 @@ mod reconcile_request_sequences {
             .on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(&workload).unwrap())
             .on(http::Method::POST, POLICIES_PATH, 201, serde_json::to_value(&workload).unwrap())
             .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
-        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        let outcome = reconcile(&world).await;
+        assert_eq!(outcome, suspended_by(SuspendTrigger::FenceGeneration));
         assert_eq!(
             world.requests(),
             [
@@ -617,7 +643,8 @@ mod reconcile_request_sequences {
         world
             .on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(workload).unwrap())
             .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
-        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        let outcome = reconcile(&world).await;
+        assert_eq!(outcome, suspended_by(SuspendTrigger::FenceGeneration));
         assert_eq!(
             world.requests(),
             [
@@ -639,7 +666,8 @@ mod reconcile_request_sequences {
         workload.metadata.generation = Some(2);
         world.routes.lock().unwrap().remove(&(http::Method::GET, WORKLOAD_FENCE_PATH.to_string()));
         world.on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(workload).unwrap());
-        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        let outcome = reconcile(&world).await;
+        assert_eq!(outcome, ReconcileOutcome::Reconciled);
         assert!(!suspended(&world), "{:#?}", world.requests());
     }
 
@@ -647,7 +675,8 @@ mod reconcile_request_sequences {
     async fn missing_boundary_service_suspends_a_running_generation() {
         let world = world_with(sandbox(true));
         world.on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
-        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        let outcome = reconcile(&world).await;
+        assert_eq!(outcome, suspended_by(SuspendTrigger::ControlPath));
         assert_eq!(
             world.requests(),
             [
@@ -667,7 +696,8 @@ mod reconcile_request_sequences {
     async fn healthy_running_generation_is_only_read() {
         let world = world_with(sandbox(true));
         running_pods(&world);
-        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        let outcome = reconcile(&world).await;
+        assert_eq!(outcome, ReconcileOutcome::Reconciled);
         let boundary = "/api/v1/namespaces/openshell/services/os-boundary-sandbox-1";
         let supervisor = "/api/v1/namespaces/openshell/pods/os-supervisor-sandbox-1";
         assert_eq!(
@@ -706,7 +736,8 @@ mod reconcile_request_sequences {
                     "publishNotReadyAddresses": true}
             }))
             .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
-        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        let outcome = reconcile(&world).await;
+        assert_eq!(outcome, suspended_by(SuspendTrigger::ControlPath));
         assert_eq!(
             world.requests()[5..],
             [
@@ -728,7 +759,8 @@ mod reconcile_request_sequences {
             serde_json::json!(SandboxRuntimeBootstrapPhase::Releasing.as_str());
         let world = world_with(object);
         world.on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
-        world.driver(KubernetesComputeConfig::default()).reconcile_sandbox_runtime_resources().await;
+        let outcome = reconcile(&world).await;
+        assert_eq!(outcome, ReconcileOutcome::Released);
         let requests = world.requests();
         assert!(!requests.iter().any(|r| r.contains("networkpolicies")), "{requests:#?}");
         assert_eq!(requests.last().unwrap(), &patch(CR_PATH));
@@ -736,11 +768,31 @@ mod reconcile_request_sequences {
     }
 
     #[tokio::test]
+    async fn suspension_conflict_is_reported_as_raced() {
+        let world = world_with(sandbox(true));
+        let (mut workload, _) = stored_fences();
+        workload.metadata.generation = Some(2);
+        world.routes.lock().unwrap().remove(&(http::Method::GET, WORKLOAD_FENCE_PATH.to_string()));
+        world
+            .on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(workload).unwrap())
+            .on(http::Method::PATCH, CR_PATH, 409, conflict_status());
+        let outcome = reconcile(&world).await;
+        assert_eq!(
+            outcome,
+            ReconcileOutcome::Suspended {
+                trigger: SuspendTrigger::FenceGeneration,
+                write: SuspendWrite::Raced
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn busy_gate_skips_the_sandbox_after_listing() {
         let world = world_with(sandbox(true));
         let driver = world.driver(KubernetesComputeConfig::default());
         let _held = driver.lifecycle_gates.gate_for("sandbox-1").lock_owned().await;
-        driver.reconcile_sandbox_runtime_resources().await;
+        let outcomes = driver.reconcile_sandbox_runtime_resources().await;
+        assert_eq!(outcomes[0].1, ReconcileOutcome::Skipped(SkipReason::GateBusy));
         assert_eq!(world.requests(), [get(LIST_PATH)]);
     }
 }

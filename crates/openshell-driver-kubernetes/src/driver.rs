@@ -420,8 +420,20 @@ pub(crate) enum ReconcileOutcome {
     Released,
     SuspensionAdvanced,
     Bootstrap,
-    Suspended(SuspendTrigger),
+    Suspended {
+        trigger: SuspendTrigger,
+        write: SuspendWrite,
+    },
     Reconciled,
+}
+
+/// Whether a suspension patch was stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuspendWrite {
+    Written,
+    /// The resourceVersion precondition failed: another writer got there first.
+    Raced,
+    Failed,
 }
 
 /// Operator-provided bootstrap bytes read once per runtime generation.
@@ -5018,7 +5030,7 @@ impl KubernetesComputeDriver {
     /// gateway's sandbox watch is alive. Bootstrap material is immutable and
     /// intentionally not read by the gateway, so this pass only repairs state
     /// that can be proven from the Sandbox CR and named companion objects.
-    async fn reconcile_sandbox_runtime_resources(&self) {
+    async fn reconcile_sandbox_runtime_resources(&self) -> Vec<(String, ReconcileOutcome)> {
         let lookup_api = match self
             .supported_sandbox_api_for_lookup(self.client.clone())
             .await
@@ -5026,7 +5038,7 @@ impl KubernetesComputeDriver {
             Ok(api) => api,
             Err(error) => {
                 warn!(%error, "skipping sandbox-runtime reconciliation: Sandbox API unavailable");
-                return;
+                return Vec::new();
             }
         };
         // Begin the recovery before the list so a lifecycle edit that lands
@@ -5046,11 +5058,11 @@ impl KubernetesComputeDriver {
             Ok(Ok(list)) => list,
             Ok(Err(error)) => {
                 warn!(%error, "skipping sandbox-runtime reconciliation: Sandbox list failed");
-                return;
+                return Vec::new();
             }
             Err(_) => {
                 warn!("skipping sandbox-runtime reconciliation: Sandbox list timed out");
-                return;
+                return Vec::new();
             }
         };
 
@@ -5061,17 +5073,16 @@ impl KubernetesComputeDriver {
             self.recover_shared_instances(baseline, &list.items).await;
         }
 
+        let mut outcomes = Vec::with_capacity(list.items.len());
         for object in &list.items {
-            self.reconcile_one_sandbox_runtime(&lookup_api, object)
+            let outcome = self
+                .reconcile_one_sandbox_runtime(&lookup_api, object)
                 .await;
+            outcomes.push((object.metadata.name.clone().unwrap_or_default(), outcome));
         }
+        outcomes
     }
 
-    /// Reconcile one listed Sandbox: refresh it under its lifecycle gate,
-    /// revalidate admission, advance a pending release or suspension, verify
-    /// the namespace fence and control path, and publish readiness. The
-    /// periodic pass and the `NetworkPolicy` guard share this decision path.
-    /// It takes the lifecycle gate itself; callers must not hold it.
     async fn reconcile_one_sandbox_runtime(
         &self,
         lookup_api: &AgentSandboxApi,
@@ -5120,9 +5131,13 @@ impl KubernetesComputeDriver {
         if let Err(error) = self.admit_stored_resources(&object).await {
             warn!(%sandbox_id, reason = %error.message(), "Sandbox resource admission revalidation failed");
             if error.code() == tonic::Code::FailedPrecondition {
-                self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+                let write = self
+                    .suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
                     .await;
-                return ReconcileOutcome::Suspended(SuspendTrigger::AdmissionRevalidation);
+                return ReconcileOutcome::Suspended {
+                    trigger: SuspendTrigger::AdmissionRevalidation,
+                    write,
+                };
             }
             return ReconcileOutcome::Skipped(SkipReason::AdmissionRetry);
         }
@@ -5163,9 +5178,13 @@ impl KubernetesComputeDriver {
             Ok(()) => {}
             Err(KubernetesDriverError::Precondition(error)) => {
                 warn!(sandbox_id, %error, "sandbox-runtime workload fence is altered; suspending workload");
-                self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+                let write = self
+                    .suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
                     .await;
-                return ReconcileOutcome::Suspended(SuspendTrigger::FenceSpec);
+                return ReconcileOutcome::Suspended {
+                    trigger: SuspendTrigger::FenceSpec,
+                    write,
+                };
             }
             Err(error) => {
                 warn!(sandbox_id, %error, "could not verify sandbox-runtime workload fence; reconciliation will retry");
@@ -5185,9 +5204,13 @@ impl KubernetesComputeDriver {
                 sandbox_id,
                 "namespace workload fence generation changed; suspending stale boundary"
             );
-            self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+            let write = self
+                .suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
                 .await;
-            return ReconcileOutcome::Suspended(SuspendTrigger::FenceGeneration);
+            return ReconcileOutcome::Suspended {
+                trigger: SuspendTrigger::FenceGeneration,
+                write,
+            };
         }
         if workload_may_run {
             let require_service = !sandbox_runtime_bootstrap_in_progress(&object);
@@ -5203,9 +5226,13 @@ impl KubernetesComputeDriver {
                 Ok(()) => {}
                 Err(KubernetesDriverError::Precondition(error)) => {
                     warn!(sandbox_id, %error, "sandbox-runtime control path drifted; suspending workload");
-                    self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+                    let write = self
+                        .suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
                         .await;
-                    return ReconcileOutcome::Suspended(SuspendTrigger::ControlPath);
+                    return ReconcileOutcome::Suspended {
+                        trigger: SuspendTrigger::ControlPath,
+                        write,
+                    };
                 }
                 Err(error) => {
                     warn!(sandbox_id, %error, "could not verify sandbox-runtime control path; reconciliation will retry");
@@ -5234,7 +5261,7 @@ impl KubernetesComputeDriver {
             return ReconcileOutcome::Bootstrap;
         }
         let desired_running = sandbox_runtime_should_run(&object);
-        let mut companion_suspended = false;
+        let mut companion_suspended = None;
         if desired_running {
             match sandbox_runtime_workload_generation_matches(
                 &self.client,
@@ -5251,9 +5278,13 @@ impl KubernetesComputeDriver {
                         sandbox_id,
                         "sandbox-runtime workload generation changed; suspending stale boundary"
                     );
-                    self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+                    let write = self
+                        .suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
                         .await;
-                    return ReconcileOutcome::Suspended(SuspendTrigger::WorkloadGeneration);
+                    return ReconcileOutcome::Suspended {
+                        trigger: SuspendTrigger::WorkloadGeneration,
+                        write,
+                    };
                 }
                 SandboxRuntimeControlAvailability::Unknown => {
                     warn!(
@@ -5278,9 +5309,13 @@ impl KubernetesComputeDriver {
                         sandbox_id,
                         "sandbox-runtime supervisor generation changed; suspending stale boundary"
                     );
-                    self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+                    let write = self
+                        .suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
                         .await;
-                    return ReconcileOutcome::Suspended(SuspendTrigger::SupervisorGeneration);
+                    return ReconcileOutcome::Suspended {
+                        trigger: SuspendTrigger::SupervisorGeneration,
+                        write,
+                    };
                 }
                 SandboxRuntimeControlAvailability::Unknown => {
                     return ReconcileOutcome::Skipped(SkipReason::SupervisorGenerationUnknown);
@@ -5294,11 +5329,12 @@ impl KubernetesComputeDriver {
             Ok(()) => {}
             Err(KubernetesDriverError::Precondition(error)) => {
                 warn!(sandbox_id, %error, "sandbox-runtime companion is missing; suspending workload");
-                self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
-                    .await;
                 // Deliberately falls through: availability and readiness are
                 // still published after a companion suspension.
-                companion_suspended = true;
+                companion_suspended = Some(
+                    self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+                        .await,
+                );
             }
             Err(error) => {
                 warn!(sandbox_id, %error, "failed to reconcile sandbox-runtime supervisor Pod");
@@ -5317,17 +5353,22 @@ impl KubernetesComputeDriver {
                 sandbox_id,
                 "sandbox-runtime supervisor is unavailable; suspending workload"
             );
-            self.suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+            let write = self
+                .suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
                 .await;
-            return ReconcileOutcome::Suspended(SuspendTrigger::SupervisorUnavailable);
+            return ReconcileOutcome::Suspended {
+                trigger: SuspendTrigger::SupervisorUnavailable,
+                write,
+            };
         }
         self.publish_sandbox_runtime_readiness_transition(lookup_api, &object, availability)
             .await;
-        if companion_suspended {
-            ReconcileOutcome::Suspended(SuspendTrigger::CompanionMissing)
-        } else {
-            ReconcileOutcome::Reconciled
-        }
+        companion_suspended.map_or(ReconcileOutcome::Reconciled, |write| {
+            ReconcileOutcome::Suspended {
+                trigger: SuspendTrigger::CompanionMissing,
+                write,
+            }
+        })
     }
 
     /// Complete a recovery of the shared supervisor's desired set from the
@@ -5563,9 +5604,9 @@ impl KubernetesComputeDriver {
         &self,
         lookup_api: &AgentSandboxApi,
         object: &DynamicObject,
-    ) {
+    ) -> SuspendWrite {
         let Some(name) = object.metadata.name.as_deref() else {
-            return;
+            return SuspendWrite::Failed;
         };
         let namespace = object
             .metadata
@@ -5589,12 +5630,19 @@ impl KubernetesComputeDriver {
         )
         .await
         {
-            Ok(Ok(_)) => {}
+            Ok(Ok(_)) => SuspendWrite::Written,
+            // Another replica or lifecycle call changed the Sandbox first.
+            Ok(Err(KubeError::Api(error))) if error.code == 409 => {
+                debug!(sandbox = name, %error, "sandbox-runtime suspension raced another writer");
+                SuspendWrite::Raced
+            }
             Ok(Err(error)) => {
                 warn!(sandbox = name, %error, "failed to suspend sandbox-runtime after fence failure");
+                SuspendWrite::Failed
             }
             Err(error) => {
                 warn!(sandbox = name, %error, "timed out suspending sandbox-runtime after fence failure");
+                SuspendWrite::Failed
             }
         }
     }
