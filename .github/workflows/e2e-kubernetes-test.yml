@@ -83,7 +83,7 @@ on:
         type: string
         default: "gateway sandbox supervisor"
       enforce-network-policy:
-        description: "Install a policy-enforcing CNI for listener isolation checks"
+        description: "Install a policy-enforcing CNI for listener and NetworkPolicy guard checks"
         required: false
         type: boolean
         default: false
