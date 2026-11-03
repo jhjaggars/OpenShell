@@ -684,6 +684,9 @@ async fn each_repair_is_signalled_once_across_gateway_replicas() {
             .count();
     }
     println!("NETPOL_SIGNALS replicas={replicas} restored_events={count}");
+    if lane().as_deref() == Some("ha") {
+        assert!(replicas >= 2, "the ha lane must run two gateway replicas");
+    }
     assert_eq!(
         count, 1,
         "one repair must produce exactly one audit record across {replicas} replicas"
