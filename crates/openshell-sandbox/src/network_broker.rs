@@ -231,6 +231,10 @@ pub struct NetworkBroker {
     /// succeeds (the state is designed, not a failure); network requests
     /// are still refused because there are no pending channels.
     designed_unavailable: bool,
+    /// The held-alive channel senders for the designed-unavailable mode:
+    /// keeping them alive keeps the supervisor's Mediate streams open and
+    /// idle (no hot retry loop). Unused in the sandboxed mode.
+    _designed_unavailable_senders: (mpsc::Sender<PendingTcpOpen>, mpsc::Sender<PendingDnsQuery>),
 }
 
 impl NetworkBroker {
@@ -257,8 +261,6 @@ impl NetworkBroker {
         let (pending_tx, pending_rx) = mpsc::channel(1);
         let (dns_tx, dns_rx) = mpsc::channel(1);
         // Leak the senders so they stay alive for the broker's lifetime.
-        std::mem::forget(pending_tx);
-        std::mem::forget(dns_tx);
         let healthy = Arc::new(AtomicBool::new(false));
         let broker = Self {
             provider_files: crate::provider_files::ProviderFiles::default(),
@@ -270,6 +272,7 @@ impl NetworkBroker {
             dns_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             healthy,
             designed_unavailable: true,
+            _designed_unavailable_senders: (pending_tx, dns_tx),
         };
         Ok(broker)
     }
@@ -397,6 +400,7 @@ impl NetworkBroker {
             dns_address,
             healthy,
             designed_unavailable: false,
+            _designed_unavailable_senders: (mpsc::channel(1).0, mpsc::channel(1).0),
         })
     }
 

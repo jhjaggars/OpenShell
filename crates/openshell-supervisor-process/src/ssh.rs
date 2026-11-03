@@ -714,7 +714,7 @@ impl russh::server::Handler for SshHandler {
         {
             Ok(()) => session.channel_success(channel)?,
             Err(error) => {
-                warn!(%error, ?channel, "failed to start boundary exec");
+                warn!(%error, ?channel, "failed to start boundary exec: {error}");
                 session.channel_failure(channel)?;
             }
         }
