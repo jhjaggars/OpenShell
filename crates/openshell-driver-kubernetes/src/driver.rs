@@ -1613,17 +1613,34 @@ async fn reconcile_kubevirt_image_pins(client: &Client, namespace: &str) {
                 // VM's guest image has reported an imageID yet. Transient
                 // while the image pulls; if it persists (the pod spec and
                 // the VM disagree, or the pull never completes), the VM
-                // simply keeps the configured tag — surfaced at debug so
-                // operators can see why a pin did not happen.
-                debug!(
-                    sandbox_id = %sandbox_id,
-                    vm = %kube_name,
-                    "KubeVirt guest image digest not observed yet; the VirtualMachine keeps \
-                     the configured tag"
-                );
+                // simply keeps the configured tag. Logged at warn ONCE per
+                // VM: the reconciler runs every 30 seconds and an
+                // unresolved digest never self-heals, so repeating would
+                // only add noise.
+                if kubevirt_absent_pin_warned(&kube_name) {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        vm = %kube_name,
+                        "KubeVirt guest image digest not observed; the VirtualMachine keeps \
+                         the configured tag (the pin is skipped)"
+                    );
+                }
             }
         }
     }
+}
+
+/// VMs already warned about an unresolved guest-image digest (once per VM;
+/// see the Absent arm of the pin reconciler).
+static KUBEVIRT_ABSENT_PIN_WARNED: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+/// Whether this VM's unresolved-digest warning has not been emitted yet,
+/// claiming it if so.
+fn kubevirt_absent_pin_warned(kube_name: &str) -> bool {
+    let warned = KUBEVIRT_ABSENT_PIN_WARNED.get_or_init(Default::default);
+    let mut warned = warned.lock().unwrap();
+    warned.insert(kube_name.to_string())
 }
 
 /// Patch one VM's containerDisk and kernelBoot images to the pinned
