@@ -18,8 +18,9 @@
 //! catches a change whose event was missed.
 
 use super::netpol_guard::{PolicyKey, guarded_name};
-use super::netpol_guard_shell::{GuardOutcome, REQUEUE_DELAY};
+use super::netpol_guard_shell::{GuardOutcome, REQUEUE_DELAY, guard_signals};
 use super::{KubernetesComputeDriver, WorkspaceMode};
+use super::{KubernetesDriverError, WatchSandboxesEvent};
 use futures::StreamExt;
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kube::api::Api;
@@ -235,7 +236,10 @@ impl KubernetesComputeDriver {
     /// stream. It stops when the gateway closes that stream or shuts down;
     /// shutdown is checked first so a terminating replica makes no repairs
     /// during its grace period.
-    pub(crate) fn spawn_netpol_guard<T: Send + 'static>(&self, tx: mpsc::Sender<T>) {
+    pub(crate) fn spawn_netpol_guard(
+        &self,
+        tx: mpsc::Sender<Result<WatchSandboxesEvent, KubernetesDriverError>>,
+    ) {
         let driver = self.clone();
         tokio::spawn(async move {
             let (work, mut inbox) = mpsc::unbounded_channel();
@@ -281,6 +285,11 @@ impl KubernetesComputeDriver {
                         for key in queue.pop_due(Instant::now()) {
                             let outcome = driver.guard_policy_key(&key).await;
                             log_guard_outcome(&key, &outcome);
+                            for event in guard_signals(&key, &outcome) {
+                                if tx.send(Ok(event)).await.is_err() {
+                                    return;
+                                }
+                            }
                             if outcome.needs_requeue() {
                                 queue.push(key, Instant::now() + REQUEUE_DELAY);
                             }

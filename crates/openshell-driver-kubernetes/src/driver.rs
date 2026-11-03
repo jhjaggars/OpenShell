@@ -406,13 +406,39 @@ pub(crate) enum SkipReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SuspendTrigger {
     AdmissionRevalidation,
-    FenceSpec,
+    /// A namespace fence's spec no longer matches.
+    FenceSpec {
+        /// `openshell-sandbox-supervisors` rather than the workload fence.
+        supervisor: bool,
+    },
+    /// The workload fence was replaced or its spec changed after binding.
     FenceGeneration,
+    /// The boundary Service no longer matches the recorded mode.
     ControlPath,
+    /// The generation's control `NetworkPolicy` is missing or changed.
+    ControlPolicy {
+        shared: bool,
+    },
     WorkloadGeneration,
     SupervisorGeneration,
     CompanionMissing,
     SupervisorUnavailable,
+}
+
+impl SuspendTrigger {
+    /// The driver-owned `NetworkPolicy` whose drift caused this suspension.
+    pub(crate) fn network_policy(self, sandbox_id: &str) -> Option<String> {
+        let names = SandboxRuntimeNames::new(sandbox_id);
+        match self {
+            Self::FenceSpec { supervisor: true } => Some(names.supervisor_policy),
+            Self::FenceSpec { supervisor: false } | Self::FenceGeneration => {
+                Some(names.workload_policy)
+            }
+            Self::ControlPolicy { shared: false } => Some(names.control_policy),
+            Self::ControlPolicy { shared: true } => Some(names.shared_control_policy),
+            _ => None,
+        }
+    }
 }
 
 /// Outcome of reconciling one Sandbox's runtime resources.
@@ -427,6 +453,14 @@ pub(crate) enum ReconcileOutcome {
         write: SuspendWrite,
     },
     Reconciled,
+}
+
+/// One sandbox's result from a periodic reconcile pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReconciledSandbox {
+    pub sandbox_id: String,
+    pub namespace: String,
+    pub outcome: ReconcileOutcome,
 }
 
 /// Whether a suspension patch was stored.
@@ -5055,7 +5089,7 @@ impl KubernetesComputeDriver {
     /// gateway's sandbox watch is alive. Bootstrap material is immutable and
     /// intentionally not read by the gateway, so this pass only repairs state
     /// that can be proven from the Sandbox CR and named companion objects.
-    async fn reconcile_sandbox_runtime_resources(&self) -> Vec<(String, ReconcileOutcome)> {
+    async fn reconcile_sandbox_runtime_resources(&self) -> Vec<ReconciledSandbox> {
         let lookup_api = match self
             .supported_sandbox_api_for_lookup(self.client.clone())
             .await
@@ -5103,7 +5137,15 @@ impl KubernetesComputeDriver {
             let outcome = self
                 .reconcile_one_sandbox_runtime(&lookup_api, object)
                 .await;
-            outcomes.push((object.metadata.name.clone().unwrap_or_default(), outcome));
+            outcomes.push(ReconciledSandbox {
+                sandbox_id: sandbox_id_from_object(object).unwrap_or_default(),
+                namespace: object
+                    .metadata
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| self.config.namespace.clone()),
+                outcome,
+            });
         }
         outcomes
     }
@@ -5203,17 +5245,20 @@ impl KubernetesComputeDriver {
             Ok(()) => {}
             // Labels alone don't change enforcement: restore them and let the
             // generation check below decide.
-            Err(KubernetesDriverError::Precondition(_))
-                if self.restore_label_only_fence_drift(namespace).await => {}
             Err(KubernetesDriverError::Precondition(error)) => {
-                warn!(sandbox_id, %error, "sandbox-runtime workload fence is altered; suspending workload");
-                let write = self
-                    .suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
-                    .await;
-                return ReconcileOutcome::Suspended {
-                    trigger: SuspendTrigger::FenceSpec,
-                    write,
-                };
+                if let Err(drifted) = self.restore_label_only_fence_drift(namespace).await {
+                    warn!(sandbox_id, %error, "sandbox-runtime workload fence is altered; suspending workload");
+                    let write = self
+                        .suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
+                        .await;
+                    return ReconcileOutcome::Suspended {
+                        trigger: SuspendTrigger::FenceSpec {
+                            supervisor: drifted.as_deref()
+                                == Some(names.supervisor_policy.as_str()),
+                        },
+                        write,
+                    };
+                }
             }
             Err(error) => {
                 warn!(sandbox_id, %error, "could not verify sandbox-runtime workload fence; reconciliation will retry");
@@ -5258,10 +5303,15 @@ impl KubernetesComputeDriver {
                     let write = self
                         .suspend_sandbox_runtime_after_dependency_failure(lookup_api, &object)
                         .await;
-                    return ReconcileOutcome::Suspended {
-                        trigger: SuspendTrigger::ControlPath,
-                        write,
+                    // The control-path errors name the object that failed.
+                    let trigger = if error.contains(&names.shared_control_policy) {
+                        SuspendTrigger::ControlPolicy { shared: true }
+                    } else if error.contains(&names.control_policy) {
+                        SuspendTrigger::ControlPolicy { shared: false }
+                    } else {
+                        SuspendTrigger::ControlPath
                     };
+                    return ReconcileOutcome::Suspended { trigger, write };
                 }
                 Err(error) => {
                     warn!(sandbox_id, %error, "could not verify sandbox-runtime control path; reconciliation will retry");
@@ -5825,7 +5875,15 @@ impl KubernetesComputeDriver {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        driver.reconcile_sandbox_runtime_resources().await;
+                        let reconciled = driver.reconcile_sandbox_runtime_resources().await;
+                        for event in netpol_guard_shell::periodic_pass_signals(
+                            &reconciled,
+                            driver.netpol_guard.take_restores(),
+                        ) {
+                            if tx.send(Ok(event)).await.is_err() {
+                                return;
+                            }
+                        }
                         if let Ok(sandboxes) = driver.list_sandboxes().await {
                             for sandbox in sandboxes {
                                 if tx.send(Ok(WatchSandboxesEvent {

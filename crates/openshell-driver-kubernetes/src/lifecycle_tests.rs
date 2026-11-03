@@ -529,7 +529,7 @@ mod reconcile_request_sequences {
             .reconcile_sandbox_runtime_resources()
             .await;
         assert_eq!(outcomes.len(), 1, "{outcomes:?}");
-        outcomes[0].1
+        outcomes[0].outcome
     }
 
     fn suspended_by(trigger: SuspendTrigger) -> ReconcileOutcome {
@@ -578,7 +578,7 @@ mod reconcile_request_sequences {
             .on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(workload).unwrap())
             .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
         let outcome = reconcile(&world).await;
-        assert_eq!(outcome, suspended_by(SuspendTrigger::FenceSpec));
+        assert_eq!(outcome, suspended_by(SuspendTrigger::FenceSpec { supervisor: false }));
         assert_eq!(
             world.requests(),
             [
@@ -637,7 +637,7 @@ mod reconcile_request_sequences {
             .on(http::Method::GET, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(workload).unwrap())
             .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
         let outcome = reconcile(&world).await;
-        assert_eq!(outcome, suspended_by(SuspendTrigger::FenceSpec));
+        assert_eq!(outcome, suspended_by(SuspendTrigger::FenceSpec { supervisor: false }));
         assert!(!world.requests().iter().any(|r| r.starts_with("PUT")));
     }
 
@@ -772,7 +772,7 @@ mod reconcile_request_sequences {
             }))
             .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
         let outcome = reconcile(&world).await;
-        assert_eq!(outcome, suspended_by(SuspendTrigger::ControlPath));
+        assert_eq!(outcome, suspended_by(SuspendTrigger::ControlPolicy { shared: false }));
         assert_eq!(
             world.requests()[5..],
             [
@@ -827,7 +827,7 @@ mod reconcile_request_sequences {
         let driver = world.driver(KubernetesComputeConfig::default());
         let _held = driver.lifecycle_gates.gate_for("sandbox-1").lock_owned().await;
         let outcomes = driver.reconcile_sandbox_runtime_resources().await;
-        assert_eq!(outcomes[0].1, ReconcileOutcome::Skipped(SkipReason::GateBusy));
+        assert_eq!(outcomes[0].outcome, ReconcileOutcome::Skipped(SkipReason::GateBusy));
         assert_eq!(world.requests(), [get(LIST_PATH)]);
     }
 }
@@ -981,7 +981,7 @@ mod netpol_guard_repairs {
         assert_eq!(write_of(&outcome), (Drift::Missing, RepairWrite::None(NoAction::PerSandboxMissing)));
         assert_eq!(
             reconciled(&outcome),
-            [ReconcileOutcome::Suspended { trigger: SuspendTrigger::ControlPath, write: SuspendWrite::Written }]
+            [ReconcileOutcome::Suspended { trigger: SuspendTrigger::ControlPolicy { shared: false }, write: SuspendWrite::Written }]
         );
         assert!(!world.requests().iter().any(|r| r.starts_with("POST")), "{:#?}", world.requests());
     }
@@ -1213,6 +1213,91 @@ mod netpol_guard_repairs {
         for (key, outcome) in &outcomes[2..] {
             assert!(reconciled(outcome).is_empty(), "{key:?} {outcome:?}");
         }
+    }
+
+    fn reasons(events: &[WatchSandboxesEvent]) -> Vec<(String, String, String)> {
+        events
+            .iter()
+            .map(|event| {
+                let Some(watch_sandboxes_event::Payload::PlatformEvent(platform)) = &event.payload
+                else {
+                    panic!("not a platform event: {event:?}");
+                };
+                let inner = platform.event.as_ref().unwrap();
+                assert_eq!(inner.source, netpol_guard_shell::PLATFORM_EVENT_SOURCE);
+                assert_ne!(inner.source, "kubernetes");
+                (platform.sandbox_id.clone(), inner.reason.clone(), inner.metadata["policy"].clone())
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_successful_repair_signals_once_per_sandbox_and_a_conflict_signals_nothing() {
+        use crate::driver::netpol_guard_shell::guard_signals;
+        let world = guarded_world(sandbox(true));
+        let (fence, _) = stored_fences();
+        reads(&world, WORKLOAD_FENCE_PATH, &widened(&fence), &repaired(&fence, 3));
+        world
+            .on(http::Method::PUT, WORKLOAD_FENCE_PATH, 409, conflict_status())
+            .on(http::Method::PUT, WORKLOAD_FENCE_PATH, 200, serde_json::to_value(repaired(&fence, 3)).unwrap())
+            .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        let driver = world.driver(KubernetesComputeConfig::default());
+        let raced = driver.guard_policy_key(&workload_key()).await;
+        assert!(guard_signals(&workload_key(), &raced).is_empty());
+        reads(&world, WORKLOAD_FENCE_PATH, &widened(&fence), &repaired(&fence, 3));
+        let repaired_outcome = driver.guard_policy_key(&workload_key()).await;
+        assert_eq!(
+            reasons(&guard_signals(&workload_key(), &repaired_outcome)),
+            [
+                ("sandbox-1".into(), "NetworkPolicyRestored".into(), "openshell-sandbox-workloads".into()),
+                ("sandbox-1".into(), "NetworkPolicyDriftSuspended".into(), "openshell-sandbox-workloads".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn signals_fan_out_per_sandbox_and_only_for_written_suspensions() {
+        use crate::driver::netpol_guard_shell::{periodic_pass_signals, restore_signals};
+        let restored = restore_signals(
+            NS,
+            "openshell-sandbox-supervisors",
+            Drift::Missing,
+            &RepairWrite::Created,
+            ["a".to_string(), "b".to_string(), "c".to_string()],
+        );
+        assert_eq!(reasons(&restored).len(), 3);
+        assert!(restore_signals(NS, "x", Drift::Spec, &RepairWrite::Raced, ["a".to_string()]).is_empty());
+        let pass = |write| ReconciledSandbox {
+            sandbox_id: "sandbox-1".into(),
+            namespace: NS.into(),
+            outcome: ReconcileOutcome::Suspended {
+                trigger: SuspendTrigger::ControlPolicy { shared: false },
+                write,
+            },
+        };
+        assert_eq!(
+            reasons(&periodic_pass_signals(&[pass(SuspendWrite::Written)], Vec::new())),
+            [("sandbox-1".into(), "NetworkPolicyDriftSuspended".into(), "os-control-sandbox-1".into())]
+        );
+        assert!(periodic_pass_signals(&[pass(SuspendWrite::Raced)], Vec::new()).is_empty());
+        // Suspensions that aren't NetworkPolicy drift don't signal drift.
+        let unrelated = ReconciledSandbox {
+            outcome: ReconcileOutcome::Suspended {
+                trigger: SuspendTrigger::SupervisorUnavailable,
+                write: SuspendWrite::Written,
+            },
+            ..pass(SuspendWrite::Written)
+        };
+        assert!(periodic_pass_signals(&[unrelated], Vec::new()).is_empty());
+        // A label restore by the pass signals each sandbox in its namespace.
+        let healthy = ReconciledSandbox {
+            outcome: ReconcileOutcome::Reconciled,
+            ..pass(SuspendWrite::Written)
+        };
+        assert_eq!(
+            reasons(&periodic_pass_signals(&[healthy], vec![workload_key()])),
+            [("sandbox-1".into(), "NetworkPolicyRestored".into(), "openshell-sandbox-workloads".into())]
+        );
     }
 
     #[tokio::test]

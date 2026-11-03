@@ -12,9 +12,10 @@ use super::netpol_guard::{
 };
 use super::{
     ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_GENERATION, KUBE_API_TIMEOUT,
-    KubernetesComputeDriver, ReconcileOutcome, SkipReason, sandbox_id_from_object,
+    KubernetesComputeDriver, PlatformEvent, ReconcileOutcome, ReconciledSandbox, SkipReason,
+    SuspendWrite, WatchSandboxesEvent, WatchSandboxesPlatformEvent, sandbox_id_from_object,
     sandbox_runtime_bootstrap_in_progress, sandbox_runtime_sandbox_owner_reference,
-    sandbox_runtime_should_run,
+    sandbox_runtime_should_run, watch_sandboxes_event,
 };
 use k8s_openapi::api::core::v1::Namespace;
 use k8s_openapi::api::networking::v1::NetworkPolicy;
@@ -44,6 +45,8 @@ pub struct GuardState {
     namespace_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Recent repair times per key, for the repair budget.
     repairs: Mutex<HashMap<PolicyKey, VecDeque<Instant>>>,
+    /// Label-only repairs made by the periodic pass, signalled after it.
+    restored: Mutex<Vec<PolicyKey>>,
 }
 
 impl GuardState {
@@ -84,6 +87,23 @@ impl GuardState {
             );
         }
         false
+    }
+
+    fn record_restore(&self, namespace: &str, name: &str) {
+        self.restored
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(PolicyKey::new(namespace, name));
+    }
+
+    /// Label-only repairs the periodic pass made since the last call.
+    pub fn take_restores(&self) -> Vec<PolicyKey> {
+        std::mem::take(
+            &mut *self
+                .restored
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     fn record_repair(&self, key: &PolicyKey, now: Instant) {
@@ -138,6 +158,8 @@ pub enum GuardOutcome {
         kind: GuardedKind,
         drift: Drift,
         write: RepairWrite,
+        /// Sandboxes whose isolation depends on the policy.
+        affected: Vec<String>,
         /// Per-sandbox reconcile outcomes, keyed by sandbox ID.
         reconciled: Vec<(String, ReconcileOutcome)>,
     },
@@ -352,6 +374,18 @@ impl KubernetesComputeDriver {
             return GuardOutcome::Skipped("policy-unreadable");
         };
 
+        let affected: Vec<&TrustedSandbox> = match &kind {
+            GuardedKind::WorkloadFence
+            | GuardedKind::SupervisorEgress
+            | GuardedKind::ManagedSsh => sandboxes.iter().collect(),
+            GuardedKind::Control { .. } | GuardedKind::SharedControl { .. } => {
+                owner_sandbox.into_iter().collect()
+            }
+        };
+        let affected_ids: Vec<String> = affected
+            .iter()
+            .map(|sandbox| sandbox.sandbox_id.clone())
+            .collect();
         // A per-sandbox policy that was never bound (a supervisor-initiated
         // or stopped generation) is legitimately absent.
         let unbound_absent = write == RepairWrite::None(NoAction::PerSandboxMissing)
@@ -368,23 +402,21 @@ impl KubernetesComputeDriver {
                 kind,
                 drift,
                 write,
+                affected: affected_ids,
                 reconciled: Vec::new(),
             };
         }
         // The repaired object has a new UID or generation, so any generation
         // that ran across the drift no longer matches what it bound. The
         // shared reconcile decides suspension exactly as the periodic pass.
-        let affected: Vec<&TrustedSandbox> = match &kind {
-            GuardedKind::ManagedSsh => Vec::new(),
-            GuardedKind::WorkloadFence | GuardedKind::SupervisorEgress => {
-                sandboxes.iter().collect()
-            }
-            GuardedKind::Control { .. } | GuardedKind::SharedControl { .. } => {
-                owner_sandbox.into_iter().collect()
-            }
-        };
         let mut reconciled = Vec::with_capacity(affected.len());
-        for sandbox in affected {
+        // The SSH policy is not bound into any boundary evidence.
+        let reconcile = if matches!(kind, GuardedKind::ManagedSsh) {
+            Vec::new()
+        } else {
+            affected
+        };
+        for sandbox in reconcile {
             let outcome =
                 Box::pin(self.reconcile_one_sandbox_runtime(&lookup_api, &sandbox.object)).await;
             reconciled.push((sandbox.sandbox_id.clone(), outcome));
@@ -393,6 +425,7 @@ impl KubernetesComputeDriver {
             kind,
             drift,
             write,
+            affected: affected_ids,
             reconciled,
         }
     }
@@ -442,11 +475,14 @@ impl KubernetesComputeDriver {
     }
 
     /// Restore namespace fences whose spec is intact but whose labels or
-    /// annotations were changed. Returns `true` when both fences now match,
-    /// so the caller can continue with the generation check, which stays
-    /// authoritative. Spec drift, a missing fence or a failed repair returns
-    /// `false` and the caller fails closed as before.
-    pub(crate) async fn restore_label_only_fence_drift(&self, namespace: &str) -> bool {
+    /// annotations were changed. `Ok` means both fences now match, so the
+    /// caller continues with the generation check, which stays
+    /// authoritative. Otherwise the error names the fence that drifted, when
+    /// known, and the caller fails closed as before.
+    pub(crate) async fn restore_label_only_fence_drift(
+        &self,
+        namespace: &str,
+    ) -> Result<(), Option<String>> {
         let lock = self.netpol_guard.namespace_lock(namespace);
         let _namespace = lock.lock().await;
         for (name, kind) in [
@@ -459,7 +495,7 @@ impl KubernetesComputeDriver {
                 GuardedKind::SupervisorEgress,
             ),
         ] {
-            let Some(expected) = ExpectedPolicy::build(
+            let expected = ExpectedPolicy::build(
                 PolicyKey::new(namespace, name),
                 kind,
                 &RenderInputs {
@@ -468,9 +504,8 @@ impl KubernetesComputeDriver {
                     owner: None,
                     shared_target: None,
                 },
-            ) else {
-                return false;
-            };
+            )
+            .ok_or(None)?;
             match self.repair_policy(&expected, None, true).await {
                 Some((Drift::InSync, _)) => {}
                 Some((Drift::Metadata, RepairWrite::Replaced)) => {
@@ -478,13 +513,16 @@ impl KubernetesComputeDriver {
                         namespace,
                         policy = name,
                         drift = Drift::Metadata.as_str(),
-                        "restored NetworkPolicy labels; enforcement was unchanged"
+                        action = RepairWrite::Replaced.as_str(),
+                        "NetworkPolicy drift repaired; enforcement was unchanged"
                     );
+                    self.netpol_guard.record_restore(namespace, name);
                 }
-                _ => return false,
+                Some((Drift::Spec | Drift::Missing, _)) => return Err(Some(name.to_string())),
+                _ => return Err(None),
             }
         }
-        true
+        Ok(())
     }
 
     /// Every key the driver expects in `namespace`: the namespace fences and
@@ -541,4 +579,164 @@ impl KubernetesComputeDriver {
     const fn guards_managed_ssh(&self) -> bool {
         false
     }
+}
+
+/// `source` of every platform event the driver itself emits. Kubernetes
+/// Events reach the gateway with source `kubernetes`, so anyone who can
+/// create an Event in a sandbox namespace can forge a reason, but not this
+/// source. The gateway keys its audit records on it.
+pub const PLATFORM_EVENT_SOURCE: &str = "openshell-driver-kubernetes";
+pub const REASON_RESTORED: &str = "NetworkPolicyRestored";
+pub const REASON_DRIFT_SUSPENDED: &str = "NetworkPolicyDriftSuspended";
+
+fn platform_event(
+    sandbox_id: &str,
+    reason: &str,
+    message: String,
+    metadata: [(&str, String); 4],
+) -> WatchSandboxesEvent {
+    WatchSandboxesEvent {
+        payload: Some(watch_sandboxes_event::Payload::PlatformEvent(
+            WatchSandboxesPlatformEvent {
+                sandbox_id: sandbox_id.to_string(),
+                event: Some(PlatformEvent {
+                    event_time: openshell_core::time::timestamp_from_millis(
+                        openshell_core::time::now_ms(),
+                    )
+                    .ok(),
+                    source: PLATFORM_EVENT_SOURCE.to_string(),
+                    r#type: "Warning".to_string(),
+                    reason: reason.to_string(),
+                    message,
+                    metadata: metadata
+                        .into_iter()
+                        .map(|(key, value)| (key.to_string(), value))
+                        .collect(),
+                }),
+            },
+        )),
+    }
+}
+
+/// One `NetworkPolicyRestored` event per affected sandbox, after this
+/// replica's own repair write succeeded.
+pub fn restore_signals(
+    namespace: &str,
+    policy: &str,
+    drift: Drift,
+    write: &RepairWrite,
+    sandbox_ids: impl IntoIterator<Item = String>,
+) -> Vec<WatchSandboxesEvent> {
+    if !write.written() {
+        return Vec::new();
+    }
+    let sandbox_ids: Vec<String> = sandbox_ids.into_iter().collect();
+    warn!(
+        namespace,
+        policy,
+        drift = drift.as_str(),
+        action = write.as_str(),
+        sandbox_count = sandbox_ids.len(),
+        "NetworkPolicy drift repaired"
+    );
+    sandbox_ids
+        .iter()
+        .map(|sandbox_id| {
+            platform_event(
+                sandbox_id,
+                REASON_RESTORED,
+                format!(
+                    "NetworkPolicy {policy} was changed ({}) and has been restored",
+                    drift.as_str()
+                ),
+                [
+                    ("namespace", namespace.to_string()),
+                    ("policy", policy.to_string()),
+                    ("drift", drift.as_str().to_string()),
+                    ("action", write.as_str().to_string()),
+                ],
+            )
+        })
+        .collect()
+}
+
+/// A `NetworkPolicyDriftSuspended` event when this replica's suspension
+/// write for a `NetworkPolicy` drift succeeded. A raced write means another
+/// replica or path suspended it, and that one signals instead.
+pub fn suspension_signal(
+    sandbox_id: &str,
+    namespace: &str,
+    outcome: ReconcileOutcome,
+) -> Option<WatchSandboxesEvent> {
+    let ReconcileOutcome::Suspended {
+        trigger,
+        write: SuspendWrite::Written,
+    } = outcome
+    else {
+        return None;
+    };
+    let policy = trigger.network_policy(sandbox_id)?;
+    warn!(
+        sandbox_id,
+        namespace, policy, "sandbox suspended after NetworkPolicy drift"
+    );
+    Some(platform_event(
+        sandbox_id,
+        REASON_DRIFT_SUSPENDED,
+        format!(
+            "NetworkPolicy {policy} was changed and has been restored; start the sandbox to continue"
+        ),
+        [
+            ("namespace", namespace.to_string()),
+            ("policy", policy),
+            ("drift", Drift::Spec.as_str().to_string()),
+            ("action", "suspended".to_string()),
+        ],
+    ))
+}
+
+/// Signals for one guard check: restores for this replica's successful
+/// repair, then drift suspensions from the shared reconcile.
+pub fn guard_signals(key: &PolicyKey, outcome: &GuardOutcome) -> Vec<WatchSandboxesEvent> {
+    let GuardOutcome::Checked {
+        drift,
+        write,
+        affected,
+        reconciled,
+        ..
+    } = outcome
+    else {
+        return Vec::new();
+    };
+    let mut events = restore_signals(&key.namespace, &key.name, *drift, write, affected.clone());
+    events.extend(reconciled.iter().filter_map(|(sandbox_id, outcome)| {
+        suspension_signal(sandbox_id, &key.namespace, *outcome)
+    }));
+    events
+}
+
+/// Signals for one periodic pass: the label-only repairs it made and the
+/// drift suspensions it wrote. Every replica runs the pass; only the one
+/// whose write succeeded signals.
+pub fn periodic_pass_signals(
+    reconciled: &[ReconciledSandbox],
+    restored: Vec<PolicyKey>,
+) -> Vec<WatchSandboxesEvent> {
+    let mut events = Vec::new();
+    for key in restored {
+        events.extend(restore_signals(
+            &key.namespace,
+            &key.name,
+            Drift::Metadata,
+            &RepairWrite::Replaced,
+            reconciled
+                .iter()
+                .filter(|sandbox| sandbox.namespace == key.namespace)
+                .map(|sandbox| sandbox.sandbox_id.clone()),
+        ));
+    }
+    events.extend(reconciled.iter().filter_map(|sandbox| {
+        suspension_signal(&sandbox.sandbox_id, &sandbox.namespace, sandbox.outcome)
+    }));
+    events
 }
