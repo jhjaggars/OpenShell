@@ -159,6 +159,26 @@ impl NativeLinuxSandboxAuditEvidence {
             ))
         }
     }
+
+    /// Validate the privileged (root-workload) evidence: only what is
+    /// still meaningful for a root workload. The boundary honestly
+    /// reports no seccomp/Landlock/`no_new_privs` evidence because none
+    /// are enforced in that mode — the security boundary is outside the
+    /// guest. The kernel release and architecture must still be present
+    /// (the boundary measured them from the host kernel). Everything
+    /// the guest reports after start is advisory.
+    pub fn validate_privileged(&self) -> Result<(), BackendError> {
+        let present = !self.native_architecture.is_empty() && !self.kernel_release.is_empty();
+        if present {
+            Ok(())
+        } else {
+            Err(BackendError::Confirm(
+                "privileged audit evidence is incomplete: kernel release and \
+                 architecture are required"
+                    .to_string(),
+            ))
+        }
+    }
 }
 
 /// Ephemeral identity of the supervisor process that owns one sandbox runtime.

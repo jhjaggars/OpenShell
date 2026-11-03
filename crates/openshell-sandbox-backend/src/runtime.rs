@@ -780,7 +780,19 @@ impl BoundBoundary {
             ));
         }
         if self.client.backend_name == crate::BACKEND_NAME {
-            crate::audit::validate_native_linux_audit(&confirmation.backend_audit)?;
+            // The per-mode evidence check (item 3): the workload mode comes
+            // from the trusted launch descriptor's resource_claims, never
+            // from the boundary's own report. The sandboxed path requires
+            // the full capability-free posture; the privileged (root) path
+            // requires only what is still meaningful (kernel release and
+            // architecture), because the boundary honestly reports no
+            // seccomp/Landlock evidence in that mode.
+            let privileged = self
+                .resource_claims
+                .get("kubevirt.workload_mode")
+                .map(String::as_str)
+                == Some("root");
+            crate::audit::validate_native_linux_audit(&confirmation.backend_audit, privileged)?;
         }
         let client = self.client.clone();
         // Adopt from a snapshot taken after the promotion: the replaced owner
