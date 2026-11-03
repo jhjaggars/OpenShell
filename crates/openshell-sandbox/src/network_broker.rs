@@ -226,6 +226,11 @@ pub struct NetworkBroker {
     descriptor_soft_limit: usize,
     dns_address: SocketAddr,
     healthy: Arc<AtomicBool>,
+    /// True when this broker was explicitly constructed as unavailable for
+    /// the privileged (root-workload) mode — not a crash. confirm_healthy
+    /// succeeds (the state is designed, not a failure); network requests
+    /// are still refused because there are no pending channels.
+    designed_unavailable: bool,
 }
 
 impl NetworkBroker {
@@ -254,6 +259,7 @@ impl NetworkBroker {
             descriptor_soft_limit: 0,
             dns_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             healthy,
+            designed_unavailable: true,
         };
         Ok(broker)
     }
@@ -380,6 +386,7 @@ impl NetworkBroker {
             descriptor_soft_limit,
             dns_address,
             healthy,
+            designed_unavailable: false,
         })
     }
 
@@ -423,6 +430,13 @@ impl NetworkBroker {
     }
 
     pub(crate) fn confirm_healthy(&self) -> io::Result<()> {
+        if self.designed_unavailable {
+            // The privileged (root-workload) mode explicitly constructed
+            // this broker as unavailable — it is the designed state, not
+            // a failure. Network requests are still refused (no pending
+            // channels); the nftables relay is the future mediation path.
+            return Ok(());
+        }
         if self.healthy.load(Ordering::Acquire) && self.dns_address.port() != 0 {
             Ok(())
         } else {
