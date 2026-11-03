@@ -715,7 +715,13 @@ impl russh::server::Handler for SshHandler {
             Ok(()) => session.channel_success(channel)?,
             Err(error) => {
                 warn!(%error, ?channel, "failed to start boundary exec: {error}");
+                // Close the channel, not just reject it: the gateway's exec
+                // relay waits for the channel to deliver output or an exit
+                // status, and a bare channel_failure leaves the channel open
+                // (the exec never started, so neither ever arrives — the
+                // relay hangs). Closing the channel propagates the failure.
                 session.channel_failure(channel)?;
+                session.close(channel)?;
             }
         }
         Ok(())

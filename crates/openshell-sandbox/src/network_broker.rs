@@ -267,8 +267,8 @@ impl NetworkBroker {
             workload_frozen: Arc::new(AtomicBool::new(false)),
             pending: Arc::new(tokio::sync::Mutex::new(pending_rx)),
             pending_dns: Arc::new(tokio::sync::Mutex::new(dns_rx)),
-            registry: Arc::new(Mutex::new(SocketRegistry::new(1, 1)?)),
-            descriptor_soft_limit: 0,
+            registry: Arc::new(Mutex::new(SocketRegistry::new(1, SOCKET_CAPACITY)?)),
+            descriptor_soft_limit: descriptor_soft_limit()?,
             dns_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             healthy,
             designed_unavailable: true,
@@ -3405,5 +3405,32 @@ mod tests {
             client.join().expect("join client").expect("DNS client"),
             [0, 3, 4, 5, 6]
         );
+    }
+}
+
+#[cfg(test)]
+mod unavailable_broker_tests {
+    use super::NetworkBroker;
+
+    #[test]
+    fn unavailable_broker_has_real_descriptor_headroom() {
+        // The exec path calls ensure_descriptor_headroom before every spawn.
+        // The unavailable() stub must use the real soft limit (not 0), or
+        // every root-mode exec fails with EMFILE before any process is
+        // created (the B6 root cause).
+        let broker = NetworkBroker::unavailable().expect("create unavailable broker");
+        broker
+            .ensure_descriptor_headroom(16)
+            .expect("the unavailable broker must pass descriptor headroom checks");
+    }
+
+    #[test]
+    fn unavailable_broker_is_healthy_for_confirm() {
+        // The designed-unavailable state is not a crash: confirm_healthy
+        // must succeed.
+        let broker = NetworkBroker::unavailable().expect("create unavailable broker");
+        broker
+            .confirm_healthy()
+            .expect("designed-unavailable broker is healthy");
     }
 }
