@@ -416,9 +416,24 @@ impl KubernetesComputeDriver {
         } else {
             affected
         };
+        // The supervisor egress allowance isn't bound into evidence, so the
+        // reconcile below would pass once it is repaired. A spec change may
+        // have selected workloads and opened their egress, so fail closed
+        // explicitly for every generation that may be running.
+        let suspend_explicitly = matches!(kind, GuardedKind::SupervisorEgress)
+            && drift == Drift::Spec
+            && write.written();
         for sandbox in reconcile {
-            let outcome =
-                Box::pin(self.reconcile_one_sandbox_runtime(&lookup_api, &sandbox.object)).await;
+            let outcome = if suspend_explicitly && sandbox.bound_state().may_run {
+                self.suspend_after_policy_drift(
+                    &lookup_api,
+                    sandbox,
+                    super::SuspendTrigger::FenceSpec { supervisor: true },
+                )
+                .await
+            } else {
+                Box::pin(self.reconcile_one_sandbox_runtime(&lookup_api, &sandbox.object)).await
+            };
             reconciled.push((sandbox.sandbox_id.clone(), outcome));
         }
         GuardOutcome::Checked {
@@ -428,6 +443,66 @@ impl KubernetesComputeDriver {
             affected: affected_ids,
             reconciled,
         }
+    }
+
+    /// Suspend one sandbox for drift of a policy its running generation
+    /// depends on but didn't bind. Waits for its lifecycle gate and retries
+    /// on a resourceVersion conflict, because a requeued check would find the
+    /// repaired policy in sync and never suspend.
+    async fn suspend_after_policy_drift(
+        &self,
+        lookup_api: &super::AgentSandboxApi,
+        sandbox: &TrustedSandbox,
+        trigger: super::SuspendTrigger,
+    ) -> ReconcileOutcome {
+        let Ok(_gate) = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            self.lifecycle_gates
+                .gate_for(&sandbox.sandbox_id)
+                .lock_owned(),
+        )
+        .await
+        else {
+            return ReconcileOutcome::Skipped(SkipReason::GateBusy);
+        };
+        let (Some(name), Some(namespace)) = (
+            sandbox.object.metadata.name.as_deref(),
+            sandbox.object.metadata.namespace.as_deref(),
+        ) else {
+            return ReconcileOutcome::Skipped(SkipReason::NoName);
+        };
+        let api =
+            Self::agent_sandbox_api(self.client.clone(), &lookup_api.resource.version, namespace);
+        let mut write = SuspendWrite::Failed;
+        for _ in 0..3 {
+            let Ok(Ok(current)) = tokio::time::timeout(KUBE_API_TIMEOUT, api.api.get(name)).await
+            else {
+                return ReconcileOutcome::Skipped(SkipReason::RefreshFailed);
+            };
+            if current.metadata.uid != sandbox.object.metadata.uid {
+                return ReconcileOutcome::Skipped(SkipReason::Replaced);
+            }
+            if !(sandbox_runtime_should_run(&current)
+                || sandbox_runtime_bootstrap_in_progress(&current))
+            {
+                return ReconcileOutcome::Reconciled;
+            }
+            warn!(
+                sandbox_id = %sandbox.sandbox_id,
+                "NetworkPolicy the running generation depends on was changed; suspending workload"
+            );
+            write = self
+                .suspend_sandbox_runtime_after_dependency_failure(
+                    lookup_api,
+                    &current,
+                    trigger.network_policy(&sandbox.sandbox_id),
+                )
+                .await;
+            if write != SuspendWrite::Raced {
+                break;
+            }
+        }
+        ReconcileOutcome::Suspended { trigger, write }
     }
 
     /// GET by name (labels are ignored, so a label-stripped object is still

@@ -1301,6 +1301,53 @@ mod netpol_guard_repairs {
     }
 
     #[tokio::test]
+    async fn a_widened_supervisor_policy_suspends_running_sandboxes_after_repair() {
+        let world = guarded_world(sandbox(true));
+        let (_, supervisor) = stored_fences();
+        let mut edited = supervisor.clone();
+        // Selecting every Pod would give workloads the supervisors' egress.
+        edited.spec.as_mut().unwrap().pod_selector = LabelSelector::default();
+        edited.metadata.generation = Some(2);
+        edited.metadata.resource_version = Some("101".into());
+        reads(&world, SUPERVISOR_FENCE_PATH, &edited, &repaired(&supervisor, 3));
+        world
+            .on(http::Method::PUT, SUPERVISOR_FENCE_PATH, 200, serde_json::to_value(repaired(&supervisor, 3)).unwrap())
+            .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        let key = PolicyKey::new(NS, "openshell-sandbox-supervisors");
+        let outcome = world.driver(KubernetesComputeConfig::default()).guard_policy_key(&key).await;
+        assert_eq!(write_of(&outcome), (Drift::Spec, RepairWrite::Replaced));
+        assert_eq!(
+            reconciled(&outcome),
+            [ReconcileOutcome::Suspended {
+                trigger: SuspendTrigger::FenceSpec { supervisor: true },
+                write: SuspendWrite::Written
+            }]
+        );
+        let patch = &world.bodies(&http::Method::PATCH, CR_PATH)[0];
+        assert_eq!(
+            patch["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_POLICY],
+            "openshell-sandbox-supervisors"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_supervisor_policy_is_recreated_without_suspending() {
+        let world = guarded_world(sandbox(true));
+        let (_, supervisor) = stored_fences();
+        world.forget(http::Method::GET, SUPERVISOR_FENCE_PATH);
+        world
+            .on(http::Method::GET, SUPERVISOR_FENCE_PATH, 404, not_found_status())
+            .on(http::Method::GET, SUPERVISOR_FENCE_PATH, 200, serde_json::to_value(&supervisor).unwrap())
+            .on(http::Method::POST, POLICIES_PATH, 201, serde_json::to_value(&supervisor).unwrap());
+        world_running_pods(&world);
+        let key = PolicyKey::new(NS, "openshell-sandbox-supervisors");
+        let outcome = world.driver(KubernetesComputeConfig::default()).guard_policy_key(&key).await;
+        assert_eq!(write_of(&outcome), (Drift::Missing, RepairWrite::Created));
+        assert_eq!(reconciled(&outcome), [ReconcileOutcome::Reconciled]);
+        assert!(world.bodies(&http::Method::PATCH, CR_PATH).is_empty());
+    }
+
+    #[tokio::test]
     async fn no_sandboxes_means_no_repairs() {
         let world = guarded_world(sandbox(true));
         world.forget(http::Method::GET, LIST_PATH);
