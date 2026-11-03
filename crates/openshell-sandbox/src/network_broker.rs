@@ -3426,8 +3426,6 @@ mod unavailable_broker_tests {
 
     #[test]
     fn unavailable_broker_is_healthy_for_confirm() {
-        // The designed-unavailable state is not a crash: confirm_healthy
-        // must succeed.
         let broker = NetworkBroker::unavailable().expect("create unavailable broker");
         broker
             .confirm_healthy()

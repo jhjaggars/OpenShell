@@ -255,8 +255,15 @@ mod linux {
             format!("consume boundary config {}: {error}", config_path.display())
         })?;
         crate::process::install_boundary_user_environment(config.child_env.clone())?;
-        crate::sandbox::apply_supervisor_startup_hardening()
-            .map_err(|error| format!("install sandbox process prelude: {error}"))?;
+        // The supervisor prelude (no_new_privs + TSYNC seccomp blocking
+        // mount/umount/bpf/etc) is the sandboxed boundary's defense. In
+        // privileged mode it is skipped: the guest is the user's by design,
+        // and the inherited no_new_privs and filter would defeat setuid
+        // binaries, container runtimes, and package managers that mount.
+        if !qualification.privileged {
+            crate::sandbox::apply_supervisor_startup_hardening()
+                .map_err(|error| format!("install sandbox process prelude: {error}"))?;
+        }
         // Keep orphaned workload descendants in this process tree so
         // termination can find and kill them, then reap the adopted ones.
         // PID 1 already receives orphans; elsewhere become a child subreaper.
