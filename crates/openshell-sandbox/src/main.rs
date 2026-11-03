@@ -200,6 +200,7 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         tcp_deny_round_trip: true,
     };
     let qualification = openshell_sandbox::RuntimeQualification {
+        privileged: false,
         seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence {
             new_listener: notification.notification_round_trip(),
             notification_round_trip: notification.notification_round_trip(),
@@ -1459,22 +1460,74 @@ fn launch_capability_free(_args: &[String]) -> Result<()> {
 /// the per-boot trusted code (initramfs + dm-verity).
 #[cfg(target_os = "linux")]
 fn launch_privileged(args: &[String]) -> Result<()> {
-    let [bootstrap, workspace @ ..] = args else {
+    use miette::Context as _;
+
+    let [bootstrap, _workspace @ ..] = args else {
         return Err(miette::miette!(
             "usage: openshell-sandbox {PRIVILEGED_LAUNCH_SUBCOMMAND} <BOOTSTRAP> [WORKSPACE]"
         ));
     };
-    if workspace.len() > 1 {
+
+    // Privileged qualification (reviewer B3a): assert uid 0 and that the
+    // boundary config carries the root-mode claim. The capability-free
+    // probe (zero caps, no_new_privs) is NOT run — it is the sandboxed
+    // path's invariant.
+    let uid = nix::unistd::geteuid().as_raw();
+    let gid = nix::unistd::getegid().as_raw();
+    if uid != 0 || gid != 0 {
         return Err(miette::miette!(
-            "usage: openshell-sandbox {PRIVILEGED_LAUNCH_SUBCOMMAND} <BOOTSTRAP> [WORKSPACE]"
+            "privileged launch requires root UID and GID, got {uid}:{gid}"
         ));
     }
-    // No identity transition: the workload IS root. No capability drop,
-    // no no_new_privs, no Landlock, no seccomp — the guest is the
-    // attacker's by design; the boundary is outside.
+    let config_bytes = std::fs::read(bootstrap)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("read boundary config {bootstrap}"))?;
+    let config: openshell_sandbox_backend::boundary_protocol::BoundaryConfig =
+        serde_json::from_slice(&config_bytes)
+            .into_diagnostic()
+            .wrap_err("decode boundary config")?;
+    let mode = config
+        .resource_claims
+        .get(openshell_sandbox::WORKLOAD_MODE_CLAIM)
+        .map(String::as_str);
+    if mode != Some(openshell_sandbox::PRIVILEGED_WORKLOAD_MODE) {
+        return Err(miette::miette!(
+            "privileged launch requires the {:#?} claim to be {:?}, got {mode:?}",
+            openshell_sandbox::WORKLOAD_MODE_CLAIM,
+            openshell_sandbox::PRIVILEGED_WORKLOAD_MODE
+        ));
+    }
+
     let log_level = std::env::var(openshell_core::sandbox_env::LOG_LEVEL)
         .unwrap_or_else(|_| "warn".to_string());
-    run_boundary(Path::new(bootstrap), &log_level)
+    run_privileged_boundary(Path::new(bootstrap), &log_level)
+}
+
+/// Run the boundary in privileged (root-workload) mode: the same
+/// authenticated tunnel and Sandbox Protocol as the capability-free path,
+/// but without the in-guest enforcement. The network broker and provider
+/// files are seccomp-based today and are unavailable in this mode; the
+/// boundary reports that clearly rather than silently starting a workload
+/// with broken networking.
+#[cfg(target_os = "linux")]
+fn run_privileged_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
+    let console_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
+    let _ = tracing_subscriber::registry()
+        .with(
+            OcsfShorthandLayer::new(
+                openshell_sandbox::container_log::ContainerLog::process().launcher_writer(),
+            )
+            .with_non_ocsf(true)
+            .with_filter(console_filter),
+        )
+        .try_init();
+    // A placeholder qualification for the privileged path: the
+    // enforcement evidence fields are advisory in this mode (root can
+    // forge them), and the seccomp-based network broker is unavailable
+    // until the nftables relay (commit 5).
+    let qualification = openshell_sandbox::RuntimeQualification::privileged();
+    openshell_sandbox::run(bootstrap, qualification)
 }
 
 #[cfg(not(target_os = "linux"))]

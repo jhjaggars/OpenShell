@@ -415,8 +415,29 @@ mod linux {
             | BoundaryListenerConfig::TlsTcp { .. }
             | BoundaryListenerConfig::Vsock { .. } => {}
         }
-        if config.workload_identity.uid == 0 || config.workload_identity.gid == 0 {
-            return Err("sandbox workload UID and GID must be nonzero".to_string());
+        let workload_mode = config
+            .resource_claims
+            .get(crate::WORKLOAD_MODE_CLAIM)
+            .map(String::as_str);
+        match workload_mode {
+            Some(crate::PRIVILEGED_WORKLOAD_MODE) => {
+                // The privileged (root-workload) class: uid 0 is the
+                // designed identity, entered only through
+                // launch-privileged. A nonzero uid here is a config
+                // error, not a security event.
+                if config.workload_identity.uid != 0 || config.workload_identity.gid != 0 {
+                    return Err(
+                        "privileged (root-mode) boundary requires UID and GID zero".to_string()
+                    );
+                }
+            }
+            _ => {
+                // The sandboxed default (and any unknown mode, failing
+                // closed): uid 0 is refused.
+                if config.workload_identity.uid == 0 || config.workload_identity.gid == 0 {
+                    return Err("sandbox workload UID and GID must be nonzero".to_string());
+                }
+            }
         }
         Ok(())
     }
@@ -6403,6 +6424,7 @@ mod linux {
 
         fn test_runtime_qualification() -> crate::RuntimeQualification {
             crate::RuntimeQualification {
+                privileged: false,
                 seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence {
                     new_listener: true,
                     notification_round_trip: true,
