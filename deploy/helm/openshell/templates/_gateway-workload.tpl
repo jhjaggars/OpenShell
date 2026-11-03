@@ -88,6 +88,11 @@ spec:
         {{- end }}
         - name: OPENSHELL_SERVICE_ACCOUNT_NAME
           value: {{ include "openshell.serviceAccountName" . | quote }}
+        {{- $guardKubernetesConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml }}
+        {{- if and (include "openshell.clusterRbacCreate" .) (eq (get $guardKubernetesConfig "workspace_mode" | default "shared") "managed") }}
+        - name: OPENSHELL_NETPOL_GUARD_CLUSTER_ROLE
+          value: {{ include "openshell.netpolGuardClusterRoleName" . | quote }}
+        {{- end }}
         - name: OPENSHELL_PEER_SERVICE_NAME
           value: {{ include "openshell.peerServiceName" . | quote }}
         - name: OPENSHELL_PEER_TOKEN_AUDIENCE

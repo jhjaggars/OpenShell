@@ -53,9 +53,11 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["create", "get"]
+  # The NetworkPolicy guard watches and restores the policies the driver
+  # owns. Repairs only create and replace; there is deliberately no delete.
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
-    verbs: ["create", "get"]
+    verbs: ["create", "get", "list", "watch", "update"]
   # Generation-scoped sandbox bootstrap Secrets.
   - apiGroups:
       - ""

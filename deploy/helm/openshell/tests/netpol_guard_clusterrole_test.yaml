@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: NetworkPolicy guard ClusterRole
+templates:
+  - templates/netpol-guard-clusterrole.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: renders the guard role in managed mode
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.name
+          value: openshell-netpol-guard-my-namespace
+      - equal:
+          path: rules
+          value:
+            - apiGroups: ["networking.k8s.io"]
+              resources: ["networkpolicies"]
+              verbs: ["list", "watch", "update"]
+
+  - it: is not rendered in shared or operator mode
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: is not rendered without cluster RBAC
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      rbac.create: false
+    asserts:
+      - hasDocuments:
+          count: 0

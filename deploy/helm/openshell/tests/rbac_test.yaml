@@ -93,3 +93,19 @@ tests:
     asserts:
       - hasDocuments:
           count: 2
+
+  - it: lets the shared-mode NetworkPolicy guard watch and repair but never delete
+    template: templates/role.yaml
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+            verbs: ["create", "get", "list", "watch", "update"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+            verbs: ["create", "get", "list", "watch", "update", "delete"]

@@ -221,3 +221,49 @@ tests:
       - equal:
           path: metadata.name
           value: openshell-node-reader-my-namespace
+
+  - it: lets managed mode bind only the NetworkPolicy guard ClusterRole
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["rbac.authorization.k8s.io"]
+            resources: ["rolebindings"]
+            verbs: ["create", "get"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["rbac.authorization.k8s.io"]
+            resources: ["clusterroles"]
+            verbs: ["bind"]
+            resourceNames: ["openshell-netpol-guard-my-namespace"]
+
+  - it: never grants cluster-wide NetworkPolicy list or watch
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+            verbs: ["create", "get", "list", "watch", "update"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+            verbs: ["list", "watch", "update"]
+
+  - it: does not grant RoleBinding creation outside managed mode
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["rbac.authorization.k8s.io"]
+            resources: ["rolebindings"]
+            verbs: ["create", "get"]

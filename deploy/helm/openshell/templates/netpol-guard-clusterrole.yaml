@@ -1,0 +1,21 @@
+{{- $kubernetesConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
+{{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" -}}
+{{- if and (include "openshell.clusterRbacCreate" .) (eq $workspaceMode "managed") }}
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Lets the gateway watch and restore the NetworkPolicies it owns in managed
+# sandbox namespaces. The gateway binds this role with a RoleBinding in each
+# namespace it creates or adopts; nothing binds it cluster-wide. There is no
+# delete: repairs only create and replace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "openshell.netpolGuardClusterRoleName" . }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["list", "watch", "update"]
+{{- end }}

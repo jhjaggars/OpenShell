@@ -151,6 +151,15 @@ separately. Missing legacy values default to enabled.
 Name of the gateway ClusterRole. The release namespace is part of the default
 name so multiple releases on one cluster do not collide.
 */}}
+{{/*
+Fixed ClusterRole the gateway binds with a RoleBinding in each managed
+sandbox namespace so its NetworkPolicy guard can watch and repair the
+policies it owns there. It is never bound cluster-wide.
+*/}}
+{{- define "openshell.netpolGuardClusterRoleName" -}}
+{{- printf "%s-netpol-guard-%s" (include "openshell.fullname" .) .Release.Namespace | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
 {{- define "openshell.clusterRoleName" -}}
 {{- $clusterScoped := include "openshell.clusterScopedRbacValues" . | fromYaml -}}
 {{- $default := printf "%s-node-reader-%s" (include "openshell.fullname" .) .Release.Namespace -}}

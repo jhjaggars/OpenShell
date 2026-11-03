@@ -67,9 +67,11 @@ rules:
     # Bootstrap Secrets are generation-scoped. Recovery deletes them by exact
     # name.
     verbs: ["create", "delete"]
+  # The NetworkPolicy guard watches and restores the policies the driver
+  # owns. Repairs only create and replace; there is deliberately no delete.
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
-    verbs: ["create", "get"]
+    verbs: ["create", "get", "list", "watch", "update"]
   {{- end }}
   {{- if $additionalCaEnabled }}
   # Immutable, content-addressed destination-CA generations are verified by

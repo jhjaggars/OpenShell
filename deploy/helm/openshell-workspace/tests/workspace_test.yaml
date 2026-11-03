@@ -32,7 +32,7 @@ tests:
           content:
             apiGroups: ["networking.k8s.io"]
             resources: ["networkpolicies"]
-            verbs: ["create", "get"]
+            verbs: ["create", "get", "list", "watch", "update"]
 
   - it: creates the workspace role in the release namespace
     template: templates/role.yaml
