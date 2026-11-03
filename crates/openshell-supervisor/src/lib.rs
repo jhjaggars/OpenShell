@@ -1648,7 +1648,25 @@ pub async fn run_sandbox_instance(
         });
     }
 
-    let proxy_exited: Pin<Box<dyn Future<Output = ()> + Send>> = if let Some(rx) = networking
+    // Destructure the confirmed boundary first so the mode claim is
+    // available for the proxy-exit decision below.
+    let (confirmed, backend_name) = remote_ready;
+
+    // In the privileged (root-workload) mode the boundary has no mediation
+    // source by design (the seccomp broker is not installed; the nftables
+    // relay is the future path). The proxy accept loop would see its Mediate
+    // streams end immediately and exit, which the lifecycle treats as fatal.
+    // Skip the proxy-exit signal for that mode — the proxy stays running but
+    // has nothing to mediate until the relay lands.
+    let privileged_mode = confirmed
+        .confirmation()
+        .resource_claims
+        .get("kubevirt.workload_mode")
+        .map(String::as_str)
+        == Some("root");
+    let proxy_exited: Pin<Box<dyn Future<Output = ()> + Send>> = if privileged_mode {
+        Box::pin(std::future::pending())
+    } else if let Some(rx) = networking
         .as_mut()
         .and_then(|n| n.proxy.as_mut())
         .and_then(ProxyHandle::take_exit_receiver)
@@ -1660,8 +1678,6 @@ pub async fn run_sandbox_instance(
         Box::pin(std::future::pending())
     };
     tokio::pin!(proxy_exited);
-
-    let (confirmed, backend_name) = remote_ready;
     let exit_code = {
         let running = confirmed
             .into_boundary()
