@@ -14,13 +14,15 @@ use crate::isolation::{
     KubernetesSandboxRuntimeBoundarySpec, KubernetesSupervisorClaim,
 };
 use crate::lifecycle::LifecycleGates;
+#[cfg(test)]
+use crate::sandbox_runtime::workload_fence;
 use crate::sandbox_runtime::{
     BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH, ClientTlsMaterial,
     SHARED_INSTANCE_KEY, SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames,
     SupervisorClientTls, boundary_service, boundary_service_matches_mode, control_policy,
     generate_proxy_ca_material, image_pull_secret_copy, sandbox_bootstrap_secret,
     sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference, shared_control_policy,
-    shared_instance_secret, supervisor_bootstrap_secret, supervisor_pod, workload_fence,
+    shared_instance_secret, supervisor_bootstrap_secret, supervisor_pod,
 };
 use crate::shared_supervisor::{
     ANNOTATION_SUPERVISOR_SESSION, ANNOTATION_SUPERVISOR_TOPOLOGY, GATEWAY_TOPOLOGY,
@@ -435,6 +437,11 @@ pub(crate) enum SuspendWrite {
     Raced,
     Failed,
 }
+
+#[path = "netpol_guard.rs"]
+// The I/O shell that uses the rest of the core lands in the next commit.
+#[allow(dead_code)]
+mod netpol_guard;
 
 /// Operator-provided bootstrap bytes read once per runtime generation.
 struct StagedBootstrapMaterial {
@@ -3084,21 +3091,29 @@ impl KubernetesComputeDriver {
     async fn create_sandbox_runtime_fence(
         &self,
         namespace: &str,
-        names: &SandboxRuntimeNames,
+        _names: &SandboxRuntimeNames,
     ) -> Result<(), KubernetesDriverError> {
-        let fence = workload_fence(namespace, names, self.config.sandbox_runtime.boundary_port);
         let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
-        for (mut policy, component) in [
-            (fence.workload_policy, "sandbox-workload-fence"),
-            (fence.supervisor_policy, "sandbox-supervisor-egress"),
-        ] {
-            let labels = policy.metadata.labels.get_or_insert_default();
-            labels.insert(
-                LABEL_MANAGED_BY.to_string(),
-                LABEL_MANAGED_BY_VALUE.to_string(),
-            );
-            labels.insert("openshell.ai/component".to_string(), component.to_string());
-            create_or_validate_sandbox_runtime_fence(&policies, &policy).await?;
+        let port = self.config.sandbox_runtime.boundary_port;
+        let mut accepted: [Vec<NetworkPolicy>; 2] = [Vec::new(), Vec::new()];
+        // The write render first, then every other render this release
+        // accepts, so create and start agree with the guard during upgrades.
+        let generations = std::iter::once(netpol_guard::WRITE_RENDER).chain(
+            netpol_guard::ACCEPTED_RENDERS
+                .iter()
+                .copied()
+                .filter(|generation| *generation != netpol_guard::WRITE_RENDER),
+        );
+        for generation in generations {
+            for (slot, policy) in accepted
+                .iter_mut()
+                .zip(netpol_guard::namespace_fences(namespace, port, generation))
+            {
+                slot.push(policy);
+            }
+        }
+        for policy in &accepted {
+            create_or_validate_accepted_sandbox_runtime_policy(&policies, policy).await?;
         }
         Ok(())
     }
@@ -8658,10 +8673,21 @@ async fn create_or_validate_sandbox_runtime_fence(
     policies: &Api<NetworkPolicy>,
     expected: &NetworkPolicy,
 ) -> Result<(), KubernetesDriverError> {
+    create_or_validate_accepted_sandbox_runtime_policy(policies, std::slice::from_ref(expected))
+        .await
+}
+
+/// Create the first of `accepted` when the policy is missing, or validate
+/// the stored object against any of them.
+async fn create_or_validate_accepted_sandbox_runtime_policy(
+    policies: &Api<NetworkPolicy>,
+    accepted: &[NetworkPolicy],
+) -> Result<(), KubernetesDriverError> {
+    let expected = &accepted[0];
     let name = expected.metadata.name.as_deref().unwrap_or_default();
     match tokio::time::timeout(KUBE_API_TIMEOUT, policies.get_opt(name)).await {
         Ok(Ok(Some(existing))) => {
-            return validate_sandbox_runtime_fence(&existing, expected);
+            return validate_accepted_sandbox_runtime_policy(&existing, accepted);
         }
         Ok(Ok(None)) => {}
         Ok(Err(error)) => return Err(KubernetesDriverError::from_kube(error)),
@@ -8672,9 +8698,14 @@ async fn create_or_validate_sandbox_runtime_fence(
         }
     }
 
+    let mut body = expected.clone();
+    body.metadata.annotations.get_or_insert_default().insert(
+        netpol_guard::ANNOTATION_RENDERED_BY.to_string(),
+        format!("openshell {}", openshell_core::VERSION),
+    );
     match tokio::time::timeout(
         KUBE_API_TIMEOUT,
-        policies.create(&PostParams::default(), expected),
+        policies.create(&PostParams::default(), &body),
     )
     .await
     {
@@ -8688,7 +8719,7 @@ async fn create_or_validate_sandbox_runtime_fence(
                     )
                 })?
                 .map_err(KubernetesDriverError::from_kube)?;
-            validate_sandbox_runtime_fence(&existing, expected)
+            validate_accepted_sandbox_runtime_policy(&existing, accepted)
         }
         Ok(Err(error)) => Err(KubernetesDriverError::from_kube(error)),
         Err(_) => Err(KubernetesDriverError::Message(
@@ -8701,51 +8732,26 @@ fn validate_sandbox_runtime_fence(
     existing: &NetworkPolicy,
     expected: &NetworkPolicy,
 ) -> Result<(), KubernetesDriverError> {
-    if sandbox_runtime_fence_matches(existing, expected) {
+    validate_accepted_sandbox_runtime_policy(existing, std::slice::from_ref(expected))
+}
+
+fn validate_accepted_sandbox_runtime_policy(
+    existing: &NetworkPolicy,
+    accepted: &[NetworkPolicy],
+) -> Result<(), KubernetesDriverError> {
+    if netpol_guard::matches_any(existing, accepted) {
         Ok(())
     } else {
-        let name = expected.metadata.name.as_deref().unwrap_or_default();
+        let name = accepted[0].metadata.name.as_deref().unwrap_or_default();
         Err(KubernetesDriverError::Precondition(format!(
             "sandbox-runtime NetworkPolicy {name} exists but does not match the intended enforcement"
         )))
     }
 }
 
+#[cfg(test)]
 fn sandbox_runtime_fence_matches(existing: &NetworkPolicy, expected: &NetworkPolicy) -> bool {
-    fn normalized_spec(mut spec: Option<NetworkPolicySpec>) -> Option<NetworkPolicySpec> {
-        if let Some(spec) = spec.as_mut() {
-            // The Kubernetes API server omits explicitly empty rule arrays when it
-            // persists a NetworkPolicy. For a policy type named in `policyTypes`,
-            // an omitted rule array and an empty rule array both deny all traffic.
-            if spec.egress.as_ref().is_some_and(Vec::is_empty) {
-                spec.egress = None;
-            }
-            if spec.ingress.as_ref().is_some_and(Vec::is_empty) {
-                spec.ingress = None;
-            }
-        }
-        spec
-    }
-
-    fn contains_required_metadata(
-        actual: &Option<BTreeMap<String, String>>,
-        required: &Option<BTreeMap<String, String>>,
-    ) -> bool {
-        required.as_ref().is_none_or(|required| {
-            actual.as_ref().is_some_and(|actual| {
-                required
-                    .iter()
-                    .all(|(key, value)| actual.get(key) == Some(value))
-            })
-        })
-    }
-
-    normalized_spec(existing.spec.clone()) == normalized_spec(expected.spec.clone())
-        && contains_required_metadata(&existing.metadata.labels, &expected.metadata.labels)
-        && contains_required_metadata(
-            &existing.metadata.annotations,
-            &expected.metadata.annotations,
-        )
+    netpol_guard::matches_any(existing, std::slice::from_ref(expected))
 }
 
 fn sandbox_runtime_namespace_fence_generation_matches(
