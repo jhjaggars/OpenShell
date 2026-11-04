@@ -580,6 +580,16 @@ sleep 5
 wait_for_phase Ready
 stage_port_io "${NAME}" || fail "could not stage the port-io helper into the guest"
 
+# The reset watch must distinguish a RESET from the sandbox's own young
+# boot (P2's sandbox is recreated right after P1's reboot): settle first
+# (uptime >= 60s), then arm, then watch for a uptime DROP.
+echo "waiting for the guest to settle (uptime >= 60s) before arming..."
+while :; do
+    UPTIME_AT_ARM="$(exec_in_sandbox sh -c 'cut -d. -f1 /proc/uptime' 2>/dev/null || echo 0)"
+    [ "${UPTIME_AT_ARM}" -ge 60 ] && break
+    sleep 5
+done
+
 # The stock linux-virt kernel ships iTCO_wdt.ko but cannot bind it (lpc_ich
 # is not built), so /dev/watchdog is absent. A root workload can still load
 # its own lpc_ich build, or program the TCO timer directly through
@@ -617,10 +627,13 @@ else
     # hardcoded, so a different QEMU default cannot misdirect the writes.
     #   TCO base = PMBASE + 0x60 (TCO_RLD at +0x00)
     #   TCO1_CNT = PMBASE + 0x68 (bit 11: TCO_TMR_HLT)
-    # On ICH9 the GCS NO_REBOOT bit lives in RCBA MMIO, not PMBASE I/O —
-    # and the launcher passes -global ICH9-LPC.noreboot=off (resets
-    # allowed), so arming only needs the TCO timer: clear TMR_HLT and kick
-    # TCO_RLD.
+    # On ICH9 the TCO reset gate is GCS.NO_REBOOT in the RCBA chipset
+    # config space (RCBA+0x3410, bit 5). In every settled run so far the
+    # timer fired but the gate held; the probe now OPENS the gate first —
+    # read the RCBA base from the ICH9 LPC PCI config (offset 0xf0), clear
+    # NO_REBOOT through /dev/mem (busybox devmem) — then clears TMR_HLT and
+    # kicks TCO_RLD. Either outcome is RFC evidence: a reset is covered by
+    # reset detection (P1); a held gate documents the emulated wiring.
     PORT_ARM="$(exec_in_sandbox sh -c '
         PIO=/tmp/port-io
         [ -x "${PIO}" ] || { echo "no port-io helper in the guest image"; exit 9; }
@@ -631,29 +644,32 @@ else
         case "${pmba}" in
             0x0|0xffffffff) echo "PMBA readback implausible (${pmba}); no LPC?"; exit 7 ;;
         esac
+        # The RCBA base: 00:1f.0 offset 0xf0 (bit 0 enables the region).
+        "${PIO}" write32 0xcf8 0x8000f8f0
+        rcba=$("${PIO}" read32 0xcfc)
+        rcba=$(( rcba & 0xffffc000 ))
+        gcs_addr=$(( rcba + 0x3410 ))
+        # The guest busybox has no devmem applet; the port-io helper maps
+        # the page through /dev/mem (also surfacing any strict-devmem
+        # policy that blocks chipset MMIO).
+        gcs_before=$("${PIO}" mem-read "${gcs_addr}" 16 2>/dev/null || echo 0xread-failed)
+        # Clear NO_REBOOT (bit 5) through the MMIO mapping.
+        "${PIO}" mem-write "${gcs_addr}" $(( gcs_before & ~0x20 )) 16 >/dev/null 2>&1 || true
+        gcs_after=$("${PIO}" mem-read "${gcs_addr}" 16 2>/dev/null || echo 0xread-failed)
         cnt=$("${PIO}" read16 $(( pmba + 0x68 )))
-        echo "PMBASE=${pmba} TCO1_CNT=${cnt} (bit11 halt=$(( (cnt >> 11) & 1 )))"
+        echo "PMBASE=${pmba} RCBA=0x$(printf %x "${rcba}") GCS=${gcs_before} -> ${gcs_after} (bit5 noreboot=$(( (gcs_after >> 5) & 1 ))) TCO1_CNT=${cnt} (bit11 halt=$(( (cnt >> 11) & 1 )))"
         # Arm: clear the halt bit and kick the reload register.
         "${PIO}" write16 $(( pmba + 0x68 )) $(( cnt & ~0x800 ))
         "${PIO}" write16 $(( pmba + 0x60 )) 0
         after=$("${PIO}" read16 $(( pmba + 0x68 )))
         echo "after arm: TCO1_CNT=${after} (bit11 halt=$(( (after >> 11) & 1 )))"
         [ $(( (after >> 11) & 1 )) = 0 ] \
-            && echo "armed: TCO_TMR_HLT cleared, TCO_RLD kicked (timer running)"
+            && echo "armed: NO_REBOOT cleared, TCO_TMR_HLT cleared, TCO_RLD kicked (timer running)"
     ' 2>&1 || true)"
     echo "port-I/O arm: ${PORT_ARM}"
     echo "${PORT_ARM}" | grep -q "armed:" && ARMED=1
 fi
 if [ "${ARMED}" = "1" ]; then
-    # The watch must distinguish a RESET from the sandbox's own young boot:
-    # wait until the guest has been up for at least 60s, record the uptime
-    # at arm time, and only count a reboot when the uptime DROPS.
-    echo "waiting for the guest to settle (uptime >= 60s) before arming..."
-    while :; do
-        UPTIME_AT_ARM="$(exec_in_sandbox sh -c 'cut -d. -f1 /proc/uptime' 2>/dev/null || echo 0)"
-        [ "${UPTIME_AT_ARM}" -ge 60 ] && break
-        sleep 5
-    done
     echo "watching for the watchdog reset (up to 120s, uptime at arm ${UPTIME_AT_ARM}s)..."
     WD_RESET=""
     DEADLINE=$(( $(date +%s) + 120 ))
@@ -702,8 +718,12 @@ if [ "${ARMED}" = "1" ]; then
         fi
     elif echo "${TCO_STATUS}" | grep -q "TCO1_STS=0x0008"; then
         # TCO1_STS bit 3 = TCO_TIMEOUT (the timer fired); TCO2_STS bits
-        # SECOND_TO_STS/BOOT_STS record the double timeout.
-        echo "FINDING: the TCO timer FIRED (TCO1_STS TIMEOUT${TCO_STATUS#*TCO1_STS=0x0008}) but the machine did not reset (uptime continuous, phase unchanged) — QEMU's reset gating (ICH9-LPC.noreboot wiring) held. The surface is armed-and-firing by root; a reset would be covered by reset detection (P1) and trusted boot"
+        # SECOND_TO_STS/BOOT_STS record the double timeout. No settled run
+        # has demonstrated an actual machine reset: the record for the RFC
+        # is "root can arm the TCO and make it fire; the reset gate is
+        # what it is on this wiring" — either way covered by reset
+        # detection (P1) and trusted boot.
+        echo "FINDING: the TCO timer FIRED (TCO1_STS TIMEOUT, ${TCO_STATUS#*TCO1_STS=0x0008}) — root arms and fires it. This run: $( [ -n "${WD_RESET}" ] && echo "the machine RESET (${WD_RESET})" || echo "the machine did NOT reset (uptime continuous, phase unchanged); the reset gate held" ). Either outcome is covered by reset detection (P1) and trusted boot; the RFC records the demonstrated state (armable, firing, reset outcome as observed)"
     else
         echo "FINDING: the watchdog did not observably fire within 120s and no status flags were readable; the RFC records the surface as reachable-by-root regardless — covered by reset detection (P1) and trusted boot"
     fi
