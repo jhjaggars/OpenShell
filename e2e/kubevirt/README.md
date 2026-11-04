@@ -109,6 +109,7 @@ OCI sandbox images as VM disks (the guest image is purpose-built). See
 | File | Purpose |
 |---|---|
 | `build-guest-image.sh` | Builds the `kvpoc/openshell-sandbox-vm:dev` containerDisk (Alpine rootfs + static musl supervisor + guest init + kernel, repacked initramfs, KubeVirt's `container-disk` helper). |
+| `demo-policy-root.yaml` | Root-workload variant of the acceptance policy: same network semantics as `demo-policy.yaml` without the `filesystem_policy`, `landlock`, and `process` sections (rejected for root workloads — unenforceable in-guest) and without `binaries` lists (binary identity is not required in root mode). `run-demo.sh` selects it automatically for `OPENSHELL_KVPOC_WORKLOAD=root`. |
 | `guest-init.sh` | Guest PID-1 init (baked into the image). |
 | `demo.sh` | Starts a host gateway (TLS) against the `kvpoc` cluster and registers it as the CLI's mTLS gateway; `--demo` then runs `run-demo.sh` against it. Defaults to the dedicated supervisor topology; `OPENSHELL_KVPOC_TOPOLOGY=gateway` selects the shared one. |
 | `run-demo.sh` | The full acceptance demo (10 steps, no failure tolerance): create → Ready, fence check, exec, env scrub, L4/L7 policy, bypass blocked, stop/start with stable VM/fence UIDs (dedicated: a rotated and re-claimed supervisor Pod UID), fence drift verification, main-process exit → Error, delete with zero leftovers. Topology-aware via `OPENSHELL_KVPOC_TOPOLOGY`. |

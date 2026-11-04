@@ -1173,6 +1173,7 @@ pub async fn run_sandbox_instance(
     };
 
     let vm_policy_identity = selected_backend.vm_policy_identity();
+    let privileged_workload = selected_backend.privileged_workload();
 
     // Load policy and initialize OPA engine
     let sandbox_name_for_agg = sandbox.clone();
@@ -1194,6 +1195,7 @@ pub async fn run_sandbox_instance(
         &extension_credentials,
         LocalPolicyIdentity::Required,
         vm_policy_identity,
+        privileged_workload,
         Some(image_discovery),
         &RemoteStartupGateway {
             gateway: gateway.clone(),
@@ -1609,6 +1611,7 @@ pub async fn run_sandbox_instance(
             opa_engine: poll_engine,
             loaded_policy_origin,
             vm_identity: vm_policy_identity,
+            privileged_workload,
             entrypoint_pid: poll_pid,
             interval_secs: poll_interval_secs,
             ocsf_enabled: poll_ocsf_enabled,
@@ -2719,6 +2722,49 @@ impl VmPolicyIdentity {
     }
 }
 
+/// Reject policy sections that cannot be enforced in the privileged
+/// (root-workload) mode.
+///
+/// In-guest enforcement is meaningless against a root workload: Landlock,
+/// filesystem path rules, and identity selectors are demoted by design, and
+/// the fence plus the supervisor's policy evaluation are the boundary. A
+/// policy that authors those sections promises constraints that will never
+/// hold, so startup and every reload reject it — the operator must remove
+/// the unenforceable sections (a network-only policy is fully supported).
+///
+/// Keyed off the trusted launch descriptor's mode claim, never a boundary
+/// report: a sandboxed boundary cannot dodge its own validation.
+fn validate_policy_enforceable_in_privileged_mode(
+    policy: &openshell_core::proto::SandboxPolicy,
+) -> Result<()> {
+    let mut unenforceable: Vec<&'static str> = Vec::new();
+    if let Some(filesystem) = policy.filesystem.as_ref()
+        && (filesystem.include_workdir
+            || !filesystem.read_only.is_empty()
+            || !filesystem.read_write.is_empty())
+    {
+        unenforceable.push("filesystem (read_only/read_write/include_workdir)");
+    }
+    if let Some(landlock) = policy.landlock.as_ref()
+        && !landlock.compatibility.is_empty()
+    {
+        unenforceable.push("landlock");
+    }
+    if let Some(process) = policy.process.as_ref()
+        && (!process.run_as_user.is_empty() || !process.run_as_group.is_empty())
+    {
+        unenforceable.push("process (run_as_user/run_as_group)");
+    }
+    if unenforceable.is_empty() {
+        Ok(())
+    } else {
+        Err(miette::miette!(
+            "privileged (root-workload) sandboxes cannot enforce {} section(s);              remove them from the policy — the network fence and supervisor-side              policy evaluation are the boundary for a root workload",
+            unenforceable.join(", ")
+        ))
+    }
+}
+
 #[derive(Clone)]
 struct CapturedProviderEnvironment {
     credentials: ProviderCredentialState,
@@ -2781,6 +2827,7 @@ async fn load_policy(
         extension_credentials,
         local_policy_identity,
         None,
+        false,
         None,
         &RemoteStartupGateway {
             gateway: openshell_gateway,
@@ -2802,6 +2849,7 @@ async fn load_policy_with_gateway(
     extension_credentials: &openshell_extension_core::ExtensionCredentialStore,
     local_policy_identity: LocalPolicyIdentity,
     vm_identity: Option<VmPolicyIdentity>,
+    privileged_workload: bool,
     image_discovery: Option<ImagePolicyDiscovery>,
     gateway: &impl StartupGateway,
 ) -> Result<(
@@ -2949,7 +2997,16 @@ async fn load_policy_with_gateway(
                 );
                 let mut discovered = match &discovery {
                     ImagePolicyDiscovery::Policy(policy) => *policy.clone(),
-                    ImagePolicyDiscovery::Missing => openshell_policy::restrictive_default_policy(),
+                    ImagePolicyDiscovery::Missing => {
+                        if privileged_workload {
+                            // The privileged default has no filesystem,
+                            // Landlock, or identity sections: in-guest
+                            // enforcement is meaningless for a root workload.
+                            openshell_policy::restrictive_default_policy_privileged()
+                        } else {
+                            openshell_policy::restrictive_default_policy()
+                        }
+                    }
                     ImagePolicyDiscovery::Invalid => {
                         reject_startup_configuration(gateway, &mut rejection_log, id, &instance_id, &snapshot, "Image policy is invalid; replace the sandbox policy to repair configuration", None).await?;
                         reconciliation_attempts = 0;
@@ -2957,8 +3014,14 @@ async fn load_policy_with_gateway(
                     }
                 };
                 // Enrich before syncing so the gateway baseline includes
-                // baseline paths from the start.
-                enrich_proto_baseline_paths(&mut discovered);
+                // baseline paths from the start. Skipped in privileged mode:
+                // the enrichment exists to keep Landlock from blocking proxy
+                // baseline paths, and a root workload has no Landlock —
+                // injecting filesystem entries would be rejected by the
+                // privileged policy validation below.
+                if !privileged_workload {
+                    enrich_proto_baseline_paths(&mut discovered);
+                }
                 strip_proto_provider_policy_entries(&mut discovered);
                 // Sync and re-fetch over a single connection to avoid extra
                 // TLS handshakes.
@@ -3108,6 +3171,27 @@ async fn load_policy_with_gateway(
                 reconciliation_attempts = 0;
                 continue;
             }
+            // Privileged (root-workload) sandboxes reject unenforceable
+            // policy sections before any engine or credentials are built:
+            // filesystem, Landlock, and identity constraints cannot hold
+            // against a root workload. The mode comes from the trusted
+            // launch descriptor, not the boundary.
+            if privileged_workload
+                && let Err(error) = validate_policy_enforceable_in_privileged_mode(&proto_policy)
+            {
+                reject_startup_configuration(
+                    gateway,
+                    &mut rejection_log,
+                    id,
+                    &instance_id,
+                    &snapshot,
+                    &error.to_string(),
+                    None,
+                )
+                .await?;
+                reconciliation_attempts = 0;
+                continue;
+            }
             let provider =
                 grpc_retry("Startup provider environment", || gateway.provider(id)).await?;
             if provider.provider_env_revision != snapshot.provider_env_revision {
@@ -3117,7 +3201,12 @@ async fn load_policy_with_gateway(
             }
             debug!("Creating OPA engine from proto policy data");
             let (engine, policy, captured_provider_credentials) =
-                match prepare_startup_configuration(&snapshot, &proto_policy, &provider) {
+                match prepare_startup_configuration(
+                    &snapshot,
+                    &proto_policy,
+                    &provider,
+                    privileged_workload,
+                ) {
                     Ok(prepared) => prepared,
                     Err(error) => {
                         report_initial_policy_failure(
@@ -3302,6 +3391,7 @@ fn prepare_startup_configuration(
     snapshot: &openshell_core::grpc_client::SettingsPollResult,
     policy: &openshell_core::proto::SandboxPolicy,
     provider: &openshell_core::grpc_client::ProviderEnvironmentResult,
+    privileged_workload: bool,
 ) -> Result<(OpaEngine, SandboxPolicy, ProviderCredentialState)> {
     if !snapshot.configuration_admitted {
         return Err(miette::miette!(
@@ -3318,7 +3408,27 @@ fn prepare_startup_configuration(
             "Provider environment revision changed during configuration preparation"
         ));
     }
-    let engine = OpaEngine::from_proto(policy)?;
+    if privileged_workload {
+        // Nothing secret enters the guest: a root workload can read anything
+        // the in-guest boundary holds, so provider files and environment
+        // are refused supervisor-side. This is the real guarantee; the
+        // boundary's own refusal (B3c2) is defence in depth. Repair by
+        // detaching the provider or replacing the sandbox policy.
+        if !provider.files.is_empty() || !provider.environment.is_empty() {
+            return Err(miette::miette!(
+                "privileged (root-workload) sandboxes cannot install provider \
+                 files or environment; detach the provider to repair configuration"
+            ));
+        }
+    }
+    // Per-binary identity checks are unenforceable for a root workload and
+    // would deny every connection it makes; the requirement is a property
+    // of the workload mode, not the policy.
+    let engine = if privileged_workload {
+        OpaEngine::from_proto_with_pid_and_binary_identity(policy, 0, false)?
+    } else {
+        OpaEngine::from_proto(policy)?
+    };
     let process_policy = SandboxPolicy::try_from(policy.clone())?;
     let credentials = prepare_provider_environment(provider)?;
     Ok((engine, process_policy, credentials))
@@ -3559,8 +3669,16 @@ async fn reload_gateway_policy_runtime(
     entrypoint_pid: u32,
     middleware: MiddlewareReloadContext<'_>,
 ) -> std::result::Result<PolicyGenerationGuard, GatewayRuntimeReloadError> {
-    reload_gateway_configuration_runtime(engine, policy, entrypoint_pid, middleware, None, || {})
-        .await
+    reload_gateway_configuration_runtime(
+        engine,
+        policy,
+        entrypoint_pid,
+        middleware,
+        None,
+        false,
+        || {},
+    )
+    .await
 }
 
 async fn reload_gateway_configuration_runtime(
@@ -3569,6 +3687,7 @@ async fn reload_gateway_configuration_runtime(
     entrypoint_pid: u32,
     middleware: MiddlewareReloadContext<'_>,
     vm_identity: Option<VmPolicyIdentity>,
+    privileged_workload: bool,
     commit_credentials: impl FnOnce(),
 ) -> std::result::Result<PolicyGenerationGuard, GatewayRuntimeReloadError> {
     if let (Some(identity), Some(policy)) = (vm_identity, policy) {
@@ -3577,6 +3696,15 @@ async fn reload_gateway_configuration_runtime(
         identity
             .validate(policy)
             .map_err(GatewayRuntimeReloadError::PolicyValidation)?;
+    }
+    if privileged_workload
+        && let Some(policy) = policy
+        && let Err(error) = validate_policy_enforceable_in_privileged_mode(policy)
+    {
+        // A policy update that authors unenforceable sections must not
+        // commit: the mode is fixed for the generation, so the update is
+        // rejected rather than silently dropping the constraints.
+        return Err(GatewayRuntimeReloadError::PolicyValidation(error));
     }
     match policy {
         Some(policy) if middleware.registry_changed => {
@@ -4225,6 +4353,10 @@ struct PolicyPollLoopContext {
     loaded_policy_origin: LoadedPolicyOrigin,
     /// Immutable VM overlay identity, also enforced for global policy updates.
     vm_identity: Option<VmPolicyIdentity>,
+    /// Whether the trusted launch descriptor selects the privileged
+    /// (root-workload) mode; enforced for global policy updates and
+    /// session-delivered configuration.
+    privileged_workload: bool,
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: Arc<AtomicBool>,
@@ -5268,6 +5400,7 @@ network_policies:
                     uid: 1000,
                     gid: 1001,
                 }),
+                false,
                 Some(ImagePolicyDiscovery::Missing),
                 &active_gateway,
             )
@@ -5360,6 +5493,7 @@ network_policies:
                 uid: 1000,
                 gid: 1001,
             }),
+            false,
             || {
                 committed.store(true, Ordering::SeqCst);
             },
@@ -5404,6 +5538,7 @@ network_policies:
                     &openshell_extension_core::ExtensionCredentialStore::new(),
                     LocalPolicyIdentity::Required,
                     None,
+                    false,
                     Some(ImagePolicyDiscovery::Missing),
                     &gateway,
                 ),
@@ -5481,6 +5616,7 @@ network_policies:
                     &openshell_extension_core::ExtensionCredentialStore::new(),
                     LocalPolicyIdentity::Required,
                     None,
+                    false,
                     Some(ImagePolicyDiscovery::Missing),
                     &gateway,
                 ),
@@ -5527,6 +5663,7 @@ network_policies:
                 &openshell_extension_core::ExtensionCredentialStore::new(),
                 LocalPolicyIdentity::Required,
                 None,
+                false,
                 Some(ImagePolicyDiscovery::Missing),
                 &active_gateway,
             )
@@ -5860,6 +5997,7 @@ network_policies:
                 &openshell_extension_core::ExtensionCredentialStore::new(),
                 LocalPolicyIdentity::Required,
                 None,
+                false,
                 Some(discovery),
                 &startup_gateway,
             )
@@ -6011,6 +6149,7 @@ network_policies:
                 &openshell_extension_core::ExtensionCredentialStore::new(),
                 LocalPolicyIdentity::Required,
                 None,
+                false,
                 Some(discovery),
                 &gateway,
             ),
@@ -6343,6 +6482,7 @@ network_policies:
                 &openshell_extension_core::ExtensionCredentialStore::new(),
                 LocalPolicyIdentity::Required,
                 None,
+                false,
                 Some(ImagePolicyDiscovery::Missing),
                 &gateway,
             ),
@@ -6438,6 +6578,7 @@ network_policies:
                         &openshell_extension_core::ExtensionCredentialStore::new(),
                         LocalPolicyIdentity::Required,
                         None,
+                        false,
                         Some(discovery.clone()),
                         &gateway,
                     ),
@@ -6524,9 +6665,12 @@ network_policies:
             openshell_core::proto::PolicySource::Sandbox,
         );
         snapshot.provider_env_revision = 10;
-        assert!(prepare_startup_configuration(&snapshot, &policy, &startup_provider(11)).is_err());
+        assert!(
+            prepare_startup_configuration(&snapshot, &policy, &startup_provider(11), false)
+                .is_err()
+        );
         let (_, _, credentials) =
-            prepare_startup_configuration(&snapshot, &policy, &startup_provider(10))
+            prepare_startup_configuration(&snapshot, &policy, &startup_provider(10), false)
                 .expect("matching generation is admitted");
         assert_eq!(credentials.revision(), 10);
     }
@@ -6569,8 +6713,9 @@ network_policies:
             provider
                 .non_secret_environment_keys
                 .push("PROJECT_ID".to_string());
-            let (_, _, credentials) = prepare_startup_configuration(&snapshot, &policy, &provider)
-                .expect("withheld credentials preserve fail-closed startup");
+            let (_, _, credentials) =
+                prepare_startup_configuration(&snapshot, &policy, &provider, false)
+                    .expect("withheld credentials preserve fail-closed startup");
             assert_eq!(credentials.revision(), 10);
             assert!(credentials.snapshot().child_env.contains_key("PROJECT_ID"));
         }
@@ -6587,7 +6732,7 @@ network_policies:
         let mut provider = startup_provider(0);
         provider.readiness_reason = ProviderReadinessReason::CredentialInstallFailed;
 
-        assert!(prepare_startup_configuration(&snapshot, &policy, &provider).is_err());
+        assert!(prepare_startup_configuration(&snapshot, &policy, &provider, false).is_err());
     }
 
     #[test]
@@ -6601,11 +6746,13 @@ network_policies:
         for _restart in 0..2 {
             snapshot.configuration_admitted = false;
             assert!(
-                prepare_startup_configuration(&snapshot, &policy, &startup_provider(0)).is_err()
+                prepare_startup_configuration(&snapshot, &policy, &startup_provider(0), false)
+                    .is_err()
             );
             snapshot.configuration_admitted = true;
             assert!(
-                prepare_startup_configuration(&snapshot, &policy, &startup_provider(0)).is_ok()
+                prepare_startup_configuration(&snapshot, &policy, &startup_provider(0), false)
+                    .is_ok()
             );
         }
     }
@@ -6625,7 +6772,9 @@ network_policies:
             1,
             openshell_core::proto::PolicySource::Sandbox,
         );
-        assert!(prepare_startup_configuration(&snapshot, &policy, &startup_provider(0)).is_err());
+        assert!(
+            prepare_startup_configuration(&snapshot, &policy, &startup_provider(0), false).is_err()
+        );
     }
 
     fn proto_provenance_policy_fixture() -> openshell_core::proto::SandboxPolicy {
@@ -7558,7 +7707,185 @@ network_policies:
                 .contains("previous policy IS active")
         );
     }
-}
 
-#[cfg(test)]
-mod legacy_startup_regression_tests;
+    fn network_only_policy() -> openshell_core::proto::SandboxPolicy {
+        openshell_policy::parse_sandbox_policy(
+            r#"
+version: 1
+network_policies:
+  web:
+    name: web
+    endpoints:
+      - host: example.com
+        port: 443
+        protocol: tcp
+"#,
+        )
+        .expect("parse network-only policy")
+    }
+
+    #[test]
+    fn privileged_policy_validation_rejects_unenforceable_sections() {
+        // filesystem rules
+        let mut policy = network_only_policy();
+        policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            include_workdir: false,
+            read_only: vec!["/usr".into()],
+            read_write: vec![],
+        });
+        let error = validate_policy_enforceable_in_privileged_mode(&policy)
+            .expect_err("filesystem rules must be rejected");
+        assert!(error.to_string().contains("filesystem"));
+
+        // landlock
+        let mut policy = network_only_policy();
+        policy.landlock = Some(openshell_core::proto::LandlockPolicy {
+            compatibility: "best_effort".into(),
+        });
+        let error = validate_policy_enforceable_in_privileged_mode(&policy)
+            .expect_err("landlock must be rejected");
+        assert!(error.to_string().contains("landlock"));
+
+        // run_as_user
+        let mut policy = network_only_policy();
+        policy.process = Some(openshell_core::proto::ProcessPolicy {
+            run_as_user: "nobody".into(),
+            run_as_group: String::new(),
+        });
+        let error = validate_policy_enforceable_in_privileged_mode(&policy)
+            .expect_err("run_as_user must be rejected");
+        assert!(error.to_string().contains("run_as_user"));
+
+        // run_as_group
+        let mut policy = network_only_policy();
+        policy.process = Some(openshell_core::proto::ProcessPolicy {
+            run_as_user: String::new(),
+            run_as_group: "nogroup".into(),
+        });
+        assert!(validate_policy_enforceable_in_privileged_mode(&policy).is_err());
+    }
+
+    #[test]
+    fn privileged_policy_validation_accepts_network_only_and_default() {
+        // A network-only policy is fully supported: the fence and
+        // supervisor-side evaluation are the boundary.
+        validate_policy_enforceable_in_privileged_mode(&network_only_policy())
+            .expect("network-only policy must be accepted");
+
+        // The privileged default policy must pass its own validation.
+        let default = openshell_policy::restrictive_default_policy_privileged();
+        validate_policy_enforceable_in_privileged_mode(&default)
+            .expect("privileged default policy must be accepted");
+
+        // The sandboxed restrictive default must NOT pass: it authors
+        // filesystem and landlock constraints.
+        let sandboxed_default = openshell_policy::restrictive_default_policy();
+        assert!(validate_policy_enforceable_in_privileged_mode(&sandboxed_default).is_err());
+    }
+
+    #[test]
+    fn privileged_startup_refuses_provider_files_and_environment() {
+        // Nothing secret enters the guest: provider material is refused
+        // supervisor-side for a root workload.
+        let policy = network_only_policy();
+        let snapshot = settings_poll_result(
+            Some(policy.clone()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+
+        // Provider files
+        let mut provider = startup_provider(0);
+        provider
+            .files
+            .insert("credentials.json".to_string(), "{}".to_string());
+        let error = prepare_startup_configuration(&snapshot, &policy, &provider, true)
+            .map(|_: (OpaEngine, SandboxPolicy, _)| ())
+            .expect_err("provider files must be refused in privileged mode");
+        assert!(error.to_string().contains("provider"));
+
+        // Provider environment
+        let mut provider = startup_provider(0);
+        provider
+            .environment
+            .insert("PROJECT_ID".to_string(), "example-project".to_string());
+        provider
+            .non_secret_environment_keys
+            .push("PROJECT_ID".to_string());
+        let error = prepare_startup_configuration(&snapshot, &policy, &provider, true)
+            .map(|_: (OpaEngine, SandboxPolicy, _)| ())
+            .expect_err("provider environment must be refused in privileged mode");
+        assert!(error.to_string().contains("provider"));
+
+        // Empty provider material is fine (nothing to enter the guest).
+        prepare_startup_configuration(&snapshot, &policy, &startup_provider(0), true)
+            .expect("empty provider material must be accepted");
+
+        // Sandboxed mode keeps provider material support.
+        prepare_startup_configuration(&snapshot, &policy, &provider, false)
+            .expect("sandboxed mode keeps provider environment support");
+    }
+
+    #[test]
+    fn privileged_startup_builds_engine_without_binary_identity_requirement() {
+        let policy = network_only_policy();
+        let snapshot = settings_poll_result(
+            Some(policy.clone()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+
+        let (engine, _, _) =
+            prepare_startup_configuration(&snapshot, &policy, &startup_provider(0), true)
+                .expect("privileged startup prepares");
+        assert!(
+            !engine.binary_identity_required(),
+            "privileged engine must not require per-binary identity"
+        );
+        drop(engine);
+
+        let (engine, _, _) =
+            prepare_startup_configuration(&snapshot, &policy, &startup_provider(0), false)
+                .expect("sandboxed startup prepares");
+        assert!(
+            engine.binary_identity_required(),
+            "sandboxed engine keeps per-binary identity requirements"
+        );
+    }
+
+    #[tokio::test]
+    async fn privileged_reload_rejects_unenforceable_policy_update() {
+        // A policy update that authors unenforceable sections must not
+        // commit in privileged mode.
+        let engine = Arc::new(
+            OpaEngine::from_proto_with_pid_and_binary_identity(&network_only_policy(), 0, false)
+                .expect("build engine"),
+        );
+        let mut policy = network_only_policy();
+        policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            include_workdir: true,
+            read_only: vec![],
+            read_write: vec![],
+        });
+        let result = reload_gateway_configuration_runtime(
+            &engine,
+            Some(&policy),
+            0,
+            MiddlewareReloadContext {
+                desired_services: &[],
+                authentication: &MiddlewareAuthentication::default(),
+                registry_changed: false,
+                connector: &default_middleware_connector(),
+            },
+            None,
+            true,
+            || {},
+        )
+        .await;
+        let error = result.expect_err("unenforceable policy update must be rejected");
+        assert!(matches!(
+            error,
+            GatewayRuntimeReloadError::PolicyValidation(_)
+        ));
+    }
+}

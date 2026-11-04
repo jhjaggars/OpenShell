@@ -42,6 +42,16 @@ case "${TOPOLOGY}" in
     dedicated|gateway) ;;
     *) fail "OPENSHELL_KVPOC_TOPOLOGY must be 'dedicated' or 'gateway', got '${TOPOLOGY}'" ;;
 esac
+WORKLOAD="${OPENSHELL_KVPOC_WORKLOAD:-sandboxed}"
+case "${WORKLOAD}" in
+    sandboxed) DEMO_POLICY="${ROOT}/e2e/kubevirt/demo-policy.yaml" ;;
+    # Root workloads reject filesystem/landlock/process policy sections
+    # (unenforceable in-guest); the root policy keeps the same network
+    # semantics without them and without binaries lists (binary identity
+    # is not required in root mode).
+    root) DEMO_POLICY="${ROOT}/e2e/kubevirt/demo-policy-root.yaml" ;;
+    *) fail "OPENSHELL_KVPOC_WORKLOAD must be 'sandboxed' or 'root', got '${WORKLOAD}'" ;;
+esac
 NAME="kvpoc-demo"
 VM_SELECTOR="openshell.ai/sandbox-name=${NAME}"
 FENCE_PREFIX="openshell-kubevirt-fence-"
@@ -142,7 +152,7 @@ fi
 kubectl delete pod,svc,secret,pvc,netpol -n "${SANDBOX_NAMESPACE}" -l "${VM_SELECTOR}" --ignore-not-found >/dev/null 2>&1 || true
 sleep 5
 "${OPENSHELL_CLI}" sandbox create --detach --name "${NAME}" \
-    --policy "${ROOT}/e2e/kubevirt/demo-policy.yaml" \
+    --policy "${DEMO_POLICY}" \
     -- /bin/sleep infinity
 wait_for_phase Ready
 echo "objects:"
