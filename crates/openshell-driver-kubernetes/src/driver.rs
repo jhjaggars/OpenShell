@@ -6275,26 +6275,15 @@ impl KubernetesComputeDriver {
         let kube_name = object.metadata.name.clone().ok_or_else(|| {
             KubernetesDriverError::Message("VirtualMachine has no name".to_string())
         })?;
-        // The stopped generation releases its supervisor, mirroring the pod
-        // path's stop. A shared generation ends its sandbox instance: the
-        // supervisor stops serving this sandbox's route, and the pool's
-        // record is withdrawn now (not by the later async sweep) so an
-        // immediate start can re-register the route for the new
-        // generation. A dedicated generation's supervisor Pod is deleted
-        // (cascading its bootstrap Secret), exactly as the pod path's stop
-        // deletes both Pods.
-        match Self::kubevirt_recorded_placement(&object)? {
-            SupervisorPlacement::Shared { route } => {
-                if let Some(shared) = &self.shared_supervisor {
-                    shared.supervision().withdraw(&route);
-                }
-            }
-            SupervisorPlacement::Dedicated => {
-                self.delete_sandbox_runtime_supervisor_pod(sandbox_id, &namespace)
-                    .await?;
-            }
-        }
-
+        // Halt the VirtualMachine BEFORE releasing the supervisor (S1): the
+        // stop used to delete the dedicated supervisor Pod first, and in
+        // that window the watch mapped the exiting Pod (restartPolicy
+        // Never -> Failed) plus the not-yet-halted VM to SupervisorFailed,
+        // aborting the stop RPC. With the halt patch first, the supervisor
+        // exiting — as its boundary goes away or as the explicit delete
+        // lands — is observed against a Halted (or Stopping) VM and is
+        // correctly treated as the expected end of a stop.
+        //
         // Also clear any lingering create-in-flight annotation: a create
         // interrupted before its Once patch leaves one, and the
         // provisioning-timeout reclaim reaches this stop.
@@ -6323,6 +6312,26 @@ impl KubernetesComputeDriver {
             run_strategy = "Halted",
             "Patched KubeVirt VirtualMachine run strategy"
         );
+
+        // The stopped generation releases its supervisor, mirroring the pod
+        // path's stop. A shared generation ends its sandbox instance: the
+        // supervisor stops serving this sandbox's route, and the pool's
+        // record is withdrawn now (not by the later async sweep) so an
+        // immediate start can re-register the route for the new
+        // generation. A dedicated generation's supervisor Pod is deleted
+        // (cascading its bootstrap Secret), exactly as the pod path's stop
+        // deletes both Pods.
+        match Self::kubevirt_recorded_placement(&object)? {
+            SupervisorPlacement::Shared { route } => {
+                if let Some(shared) = &self.shared_supervisor {
+                    shared.supervision().withdraw(&route);
+                }
+            }
+            SupervisorPlacement::Dedicated => {
+                self.delete_sandbox_runtime_supervisor_pod(sandbox_id, &namespace)
+                    .await?;
+            }
+        }
 
         let deadline = tokio::time::Instant::now() + VMI_TERMINATION_TIMEOUT;
         let mut poll_interval = Duration::from_millis(500);

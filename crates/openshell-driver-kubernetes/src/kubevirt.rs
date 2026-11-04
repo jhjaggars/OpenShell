@@ -734,8 +734,13 @@ fn vm_status_from_object(
     // terminal failure (`restartPolicy: Never`): the boundary can never
     // connect, so the sandbox surfaces as Error rather than provisioning
     // forever. It wins over the not-ready fallback but not over an
-    // already-terminal VM failure.
-    let supervisor_failed = supervisor_failure.filter(|_| terminal.is_none() && !halted);
+    // already-terminal VM failure. Suppressed while the VM is halted OR
+    // halting (`printableStatus: Stopping` — the VMI is terminating): the
+    // supervisor exiting then is the expected end of a stop, not a failure
+    // (S1 — mapping it aborted stops whose supervisor Pod exited while the
+    // stop was still in flight).
+    let supervisor_failed =
+        supervisor_failure.filter(|_| terminal.is_none() && !halted && printable != "Stopping");
 
     let mut conditions = Vec::new();
     conditions.push(DriverCondition {
@@ -1518,6 +1523,64 @@ mod kubevirt_review_tests {
                 .any(|condition| condition.r#type == "Bootstrapping"),
             "user-stopped Halted VM must not report Bootstrapping: {conditions:?}"
         );
+    }
+
+    #[test]
+    fn supervisor_failure_while_vm_halting_is_not_an_error() {
+        // S1: while the VM is halting (`printableStatus: Stopping` — the
+        // VMI is terminating), the dedicated supervisor Pod exiting
+        // (restartPolicy Never -> Failed) is the EXPECTED end of a stop,
+        // not a failure. Mapping it to SupervisorFailed aborted in-flight
+        // stops ("sandbox lifecycle changed while stop completed").
+        let cfg = review_config();
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+        vm.data["spec"]["runStrategy"] = serde_json::json!("Once");
+        vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Stopping"});
+        let (_, sbx) = sandbox_from_vm_object_with_runtime(
+            "kvpoc-sandboxes",
+            vm,
+            Some("Running"),
+            Some("supervisor Pod failed (restartPolicy Never)"),
+            None,
+            None,
+        )
+        .expect("converts");
+        let ready = sbx.status.clone().unwrap().conditions[0].clone();
+        assert_eq!(ready.status, "False");
+        assert_ne!(
+            ready.reason, REASON_SUPERVISOR_FAILED,
+            "a supervisor exiting while the VM halts must not be SupervisorFailed"
+        );
+        // And the sandbox is NOT terminal: no Error-mapping reason, so the
+        // gateway keeps composing Stopping/Stopped from the desired state.
+        assert!(
+            !sbx.status
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|condition| condition.reason == REASON_SUPERVISOR_FAILED),
+            "no condition may carry SupervisorFailed while the VM is halting"
+        );
+
+        // Control: the same failed supervisor Pod on a Running (not
+        // halting) VM still maps to the terminal Error — the suppression
+        // must not hide genuine crashes.
+        let cfg = review_config();
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
+        vm.data["spec"]["runStrategy"] = serde_json::json!("Once");
+        vm.data["status"] = serde_json::json!({"ready": true, "printableStatus": "Running"});
+        let (_, sbx) = sandbox_from_vm_object_with_runtime(
+            "kvpoc-sandboxes",
+            vm,
+            Some("Running"),
+            Some("supervisor Pod failed (restartPolicy Never)"),
+            None,
+            None,
+        )
+        .expect("converts");
+        let ready = sbx.status.unwrap().conditions[0].clone();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, REASON_SUPERVISOR_FAILED);
     }
 
     #[test]
