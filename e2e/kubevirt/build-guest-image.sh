@@ -8,8 +8,20 @@
 # Produces a local image `kvpoc/openshell-sandbox-vm:dev` containing:
 #   /disk/disk.qcow2       bootable ext4 rootfs (Alpine + openshell-sandbox
 #                          supervisor + the guest init from guest-init.sh)
+#                          with a dm-verity hash tree appended after the
+#                          filesystem (no superblock)
 #   /boot/vmlinuz-virt     guest kernel (direct kernel boot)
-#   /boot/initramfs-virt   guest initramfs
+#   /boot/initramfs-virt   guest initramfs: the trusted init
+#                          (initramfs-init.sh) opens dm-verity over the
+#                          rootfs, mounts the read-only verified lower,
+#                          stacks a tmpfs overlay, bind-mounts the trusted
+#                          init and boundary binaries, and switch_roots.
+#
+# The root hash and geometry are stamped as image labels:
+#   io.openshell.kubevirt.root-hash        <sha256 hex>
+#   io.openshell.kubevirt.verity-geometry  <blocks>:<hash-start>
+# The demo renders them into the gateway's kubevirt config; the driver
+# passes them to the guest on the kernel command line.
 #
 # Usage: e2e/kubevirt/build-guest-image.sh [image-tag]
 #        (then: k3d image import <image-tag> -c kvpoc)
@@ -66,6 +78,8 @@ docker export kvpoc-guest-rootfs -o "${WORKDIR}/rootfs.tar"
 docker rm kvpoc-guest-rootfs >/dev/null
 
 cp "${REPO_ROOT}/e2e/kubevirt/idmap-mount.c" "${WORKDIR}/idmap-mount.c"
+cp "${REPO_ROOT}/e2e/kubevirt/verity-open.c" "${WORKDIR}/verity-open.c"
+cp "${REPO_ROOT}/e2e/kubevirt/initramfs-init.sh" "${WORKDIR}/initramfs-init.sh"
 
 # 2. Unpack the exported rootfs, usr-merge it, render the ext4 disk, and
 #    repack the initramfs — all as root inside a container. An unprivileged
@@ -76,7 +90,7 @@ cp "${REPO_ROOT}/e2e/kubevirt/idmap-mount.c" "${WORKDIR}/idmap-mount.c"
 docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
     -v "${WORKDIR}:/work:Z" alpine:3.22 sh -c '
     set -eu
-    apk add --no-cache e2fsprogs gcc musl-dev linux-headers >/dev/null
+    apk add --no-cache e2fsprogs gcc musl-dev linux-headers cryptsetup kmod >/dev/null
 
     mkdir -p /work/rootfs
     tar -xpf /work/rootfs.tar -C /work/rootfs
@@ -100,17 +114,61 @@ docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
     merge_into /work/rootfs/bin /work/rootfs/usr/bin
     merge_into /work/rootfs/sbin /work/rootfs/usr/sbin
 
-    # Render the ext4 rootfs disk (~700 MiB: Alpine base + kernel +
-    # supervisor with headroom for runtime).
+    # Render the ext4 rootfs disk (exactly 700 MiB: Alpine base + kernel +
+    # supervisor with headroom for runtime). The exact size matters: the
+    # dm-verity hash tree is appended right after the filesystem, so the
+    # data-block count (700 MiB / 4096 = 179200) is the verity geometry.
+    ROOTFS_BYTES=$(( 700 * 1024 * 1024 ))
     mkfs.ext4 -F -q -d /work/rootfs /work/disk.raw 700m
+    [ "$(stat -c %s /work/disk.raw)" = "${ROOTFS_BYTES}" ] \
+        || { echo "rootfs is not exactly 700 MiB"; exit 1; }
+    NUM_DATA_BLOCKS=$(( ROOTFS_BYTES / 4096 ))
 
-    # Alpine 3.22 stock initramfs-virt is missing the /sysroot mountpoint
-    # its own init mounts the root filesystem on, so root mounting fails
-    # with ENOENT. Repack the initramfs with the directory added.
+    # dm-verity: format the hash tree (no superblock, fixed salt — the
+    # kernel table interface requires a salt field, and the root hash is
+    # the binding anyway) and append it to the image. The root hash is
+    # printed and stamped as an image label; the runtime geometry is
+    # blocks and the hash-start block. The salt matches the constant in
+    # verity-open.c by construction.
+    veritysetup format --no-superblock \
+        --salt=6f70656e7368656c6c \
+        /work/disk.raw /work/hash.bin > /work/verity-format.log 2>&1
+    ROOT_HASH="$(sed -n "s/^Root hash:[[:space:]]*//p" /work/verity-format.log)"
+    [ -n "${ROOT_HASH}" ] || { cat /work/verity-format.log; exit 1; }
+    cat /work/disk.raw /work/hash.bin > /work/disk-verity.raw
+    printf "blocks=%s hash_start=%s root_hash=%s\n" \
+        "${NUM_DATA_BLOCKS}" "${NUM_DATA_BLOCKS}" "${ROOT_HASH}" \
+        > /work/verity-info.txt
+
+    # The trusted initramfs: our init (verity + overlay + switch_root) and
+    # the static verity-open helper. The device-mapper modules are copied
+    # (decompressed) into the stock module tree and depmod is re-run, so
+    # the kmod modprobe in the initramfs resolves them along with virtio_blk.
     mkdir -p /work/initrd
     cd /work/initrd
     zcat /work/rootfs/boot/initramfs-virt | cpio -idm --quiet
-    mkdir -p sysroot
+    cc -static -O2 -o verity-open /work/verity-open.c
+    KVER="$(ls lib/modules | head -1)"
+    # The full dependency closure of dm-verity (dm-bufio, reed-solomon,
+    # libcrc32c, ...) resolved against the rootfs module tree: modprobe
+    # --show-depends lists every .ko needed, which are then copied
+    # (decompressed) into the initramfs tree.
+    for mod in $(modprobe -d /work/rootfs -S "${KVER}" --show-depends dm_verity \
+                    | sed -n "s/^insmod //p" | sort -u); do
+        # modprobe prints paths relative to the -d root (with or without
+        # its prefix); normalize to the tree-relative path.
+        rel="${mod#/work/rootfs/}"
+        rel="${rel#/}"
+        dest="lib/modules/${KVER}/kernel/${rel#lib/modules/${KVER}/kernel/}"
+        mkdir -p "$(dirname "${dest}")"
+        case "${mod}" in
+            *.gz) gzip -dc "${mod}" > "${dest%.gz}" ;;
+            *) cp "${mod}" "${dest}" ;;
+        esac
+    done
+    depmod -b /work/initrd "${KVER}"
+    cp /work/initramfs-init.sh init
+    chmod 0755 init
     find . | cpio -o -H newc --quiet | gzip -9 > /work/initramfs-virt
 
     # Hand the workdir back to the invoking user: the docker build context
@@ -118,9 +176,15 @@ docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
     chown -R "${HOST_UID}:${HOST_GID}" /work
 '
 
-# 3. Compress to qcow2 and stage the kernel artifacts.
-qemu-img convert -c -O qcow2 "${WORKDIR}/disk.raw" "${WORKDIR}/disk.qcow2"
+# 3. Compress to qcow2 and stage the kernel artifacts. The disk carries
+# the appended verity hash tree.
+qemu-img convert -c -O qcow2 "${WORKDIR}/disk-verity.raw" "${WORKDIR}/disk.qcow2"
 cp "${ROOTFS}/boot/vmlinuz-virt" "${WORKDIR}/vmlinuz-virt"
+# The verity info the demo/driver need (written by the build container).
+VERITY_INFO="$(cat "${WORKDIR}/verity-info.txt")"
+NUM_DATA_BLOCKS="$(printf '%s\n' "${VERITY_INFO}" | sed -n 's/blocks=//p' | awk '{print $1}')"
+ROOT_HASH="$(printf '%s\n' "${VERITY_INFO}" | sed -n 's/.*root_hash=//p')"
+echo "==> verity: blocks=${NUM_DATA_BLOCKS} root_hash=${ROOT_HASH}"
 
 # 5. Assemble the containerDisk image. KubeVirt >= 1.9 runs each
 #    containerDisk image as a virt-launcher init container executing
@@ -140,9 +204,12 @@ COPY disk.qcow2 /disk/disk.qcow2
 COPY vmlinuz-virt /boot/vmlinuz-virt
 COPY initramfs-virt /boot/initramfs-virt
 COPY container-disk /container-disk-binary/usr/bin/container-disk
+LABEL io.openshell.kubevirt.root-hash="${ROOT_HASH}"
+LABEL io.openshell.kubevirt.verity-geometry="${NUM_DATA_BLOCKS}:${NUM_DATA_BLOCKS}"
 EOF
 docker build -t "${IMAGE_TAG}" "${WORKDIR}"
 
 echo "==> built ${IMAGE_TAG}"
 docker image inspect "${IMAGE_TAG}" --format 'size: {{.Size}} bytes'
+echo "==> verity label: root-hash=${ROOT_HASH} geometry=${NUM_DATA_BLOCKS}:${NUM_DATA_BLOCKS}"
 echo "==> import into the cluster with: k3d image import ${IMAGE_TAG} -c kvpoc"

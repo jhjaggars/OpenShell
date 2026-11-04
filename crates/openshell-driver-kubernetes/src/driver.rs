@@ -5084,6 +5084,7 @@ impl KubernetesComputeDriver {
                 generation.workload_uid,
                 generation.workload_gid,
                 generation.workload_mode,
+                &self.config.kubevirt.root_hash,
             )
             .map_err(KubernetesDriverError::Precondition)?
         };
@@ -6113,6 +6114,7 @@ impl KubernetesComputeDriver {
             workload_uid,
             workload_gid,
             workload_mode,
+            &self.config.kubevirt.root_hash,
         )
         .map_err(KubernetesDriverError::Precondition)?;
 

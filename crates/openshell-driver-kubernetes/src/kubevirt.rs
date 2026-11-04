@@ -70,6 +70,27 @@ const KUBEVIRT_GUEST_INITRD_PATH: &str = "/boot/initramfs-virt";
 const KUBEVIRT_KERNEL_ARGS: &str =
     "console=ttyS0 root=/dev/vda rw rootfstype=ext4 modules=ext4 init=/opt/openshell/init";
 
+/// Kernel arguments for the verified boot (commit 6): the initramfs init
+/// (initramfs-init.sh, shipped in the image) consumes the verity geometry
+/// and root hash, opens dm-verity over the containerDisk, mounts the
+/// read-only verified lower, stacks a tmpfs overlay, and execs the guest
+/// init from a trusted bind path. The `root=`/`init=` of the legacy args
+/// are inert in this flow — the initramfs owns the root decision — but
+/// kept for the stock initramfs fallback path.
+fn kubevirt_kernel_args(root_hash: &str) -> String {
+    if root_hash.is_empty() {
+        KUBEVIRT_KERNEL_ARGS.to_string()
+    } else {
+        format!("{KUBEVIRT_KERNEL_ARGS} openshell_verity={root_hash}")
+    }
+}
+
+/// Resource claim carrying the verified-root binding: the dm-verity root
+/// hash of the guest image, when configured. The claim makes the binding
+/// auditable on the trusted descriptor (it mirrors what the guest actually
+/// verified at boot).
+pub const ROOT_HASH_CLAIM: &str = "kubevirt.root_hash";
+
 /// Condition reason set on `Ready=False` while the VM is booting. Matches the
 /// gateway's transient-reason vocabulary so the sandbox stays `Provisioning`
 /// rather than `Error`.
@@ -432,7 +453,7 @@ pub fn render_virtual_machine(params: &KubeVirtSandboxParams<'_>) -> DynamicObje
                         "firmware": {
                             "kernelBoot": {
                                 "container": kernel_boot_container,
-                                "kernelArgs": KUBEVIRT_KERNEL_ARGS
+                                "kernelArgs": kubevirt_kernel_args(&kubevirt.root_hash)
                             }
                         },
                         "cpu": {"cores": kubevirt.cpu_cores},
@@ -942,6 +963,7 @@ mod tests {
                 memory: "2Gi".to_string(),
                 workspace_pvc: true,
                 workload: crate::config::KubeVirtWorkloadMode::default(),
+                root_hash: String::new(),
             },
             shared_supervisor: Some(crate::SharedSupervisorConfig {
                 service_name: "openshell-supervisor".to_string(),
@@ -1329,6 +1351,7 @@ mod kubevirt_review_tests {
                 memory: "2Gi".to_string(),
                 workspace_pvc: true,
                 workload: crate::config::KubeVirtWorkloadMode::default(),
+                root_hash: String::new(),
             },
             shared_supervisor: Some(crate::SharedSupervisorConfig {
                 service_name: "openshell-supervisor".to_string(),
@@ -1522,6 +1545,19 @@ mod kubevirt_review_tests {
                 .iter()
                 .any(|condition| condition.r#type == "Bootstrapping"),
             "user-stopped Halted VM must not report Bootstrapping: {conditions:?}"
+        );
+    }
+
+    #[test]
+    fn kernel_args_carry_verity_binding_when_configured() {
+        // Commit 6: the verified boot passes the dm-verity geometry and
+        // root hash to the initramfs init on the kernel command line; an
+        // empty binding keeps the legacy plain boot.
+        assert_eq!(kubevirt_kernel_args(""), KUBEVIRT_KERNEL_ARGS);
+        let args = kubevirt_kernel_args("179200:179200:0123abcd");
+        assert!(
+            args.contains("openshell_verity=179200:179200:0123abcd"),
+            "the verity binding must reach the command line: {args}"
         );
     }
 

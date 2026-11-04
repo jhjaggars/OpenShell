@@ -65,6 +65,8 @@ pub const CLAIM_IMAGE_IDENTITY: &str = "kubevirt.image_identity";
 /// (a sandboxed guest presenting a root config, or the reverse).
 pub const CLAIM_WORKLOAD_MODE: &str = "kubevirt.workload_mode";
 
+use crate::kubevirt::ROOT_HASH_CLAIM;
+
 /// The dedicated supervisor Pod's UID, claimed only in the dedicated
 /// topology (mirrors the pod path's `kubernetes.supervisor_pod_uid`).
 pub const CLAIM_SUPERVISOR_POD_UID: &str = "kubevirt.supervisor_pod_uid";
@@ -229,6 +231,11 @@ pub struct KubeVirtBoundarySpec {
     pub workload_identity: ResolvedWorkloadIdentity,
     /// The workload mode ("root" | "sandboxed") — claimed and confirmed.
     pub workload_mode: crate::config::KubeVirtWorkloadMode,
+    /// The dm-verity binding for the guest rootfs
+    /// ("<blocks>:<hash-start>:<root-hash>"), empty for the legacy plain
+    /// boot. Claimed (`kubevirt.root_hash`) and passed to the guest on the
+    /// kernel command line by the VM renderer.
+    pub root_hash: String,
     /// Environment the boundary passes to workload children.
     pub child_env: HashMap<String, String>,
 }
@@ -256,6 +263,12 @@ impl KubeVirtBoundarySpec {
                 self.workload_mode.to_string(),
             ),
         ]);
+        // The verified-root binding, when configured: the dm-verity root
+        // hash the guest verified at boot is auditable on the trusted
+        // descriptor.
+        if !self.root_hash.trim().is_empty() {
+            resource_claims.insert(ROOT_HASH_CLAIM.to_string(), self.root_hash.clone());
+        }
         // The dedicated topology claims the supervisor Pod's UID (mirroring
         // the pod path's `kubernetes.supervisor_pod_uid`); the shared
         // topology instead names its instance by the route handle carried in
@@ -427,6 +440,7 @@ mod tests {
             vm_uid: "vm-uid-1".to_string(),
             image_identity: "kvpoc/openshell-sandbox-vm:dev".to_string(),
             workload_mode: crate::config::KubeVirtWorkloadMode::Sandboxed,
+            root_hash: String::new(),
             network_policy_uid: "np-uid-1".to_string(),
             network_policy_resource_version: "1945".to_string(),
             supervisor,
@@ -645,6 +659,7 @@ mod tests {
             0,
             0,
             crate::config::KubeVirtWorkloadMode::Root,
+            "",
         )
         .expect("root-mode bootstrap renders");
         // The descriptor carries the mode claim and the uid-0 identity.
@@ -655,6 +670,26 @@ mod tests {
         let identity = &bootstrap.runtime_descriptor.workload_identity;
         assert_eq!(identity.uid, 0, "root mode runs as uid 0");
         assert_eq!(identity.gid, 0, "root mode runs as gid 0");
+    }
+
+    #[test]
+    fn root_hash_claim_present_only_when_configured() {
+        // The verified-root binding is claimed on the trusted descriptor
+        // when configured and absent for the legacy plain boot.
+        let mut root_spec = spec();
+        root_spec.root_hash = "179200:179200:0123abcd".to_string();
+        let provisioned = root_spec.provision().expect("provision");
+        assert_eq!(
+            provisioned.runtime_descriptor.resource_claims[ROOT_HASH_CLAIM],
+            "179200:179200:0123abcd"
+        );
+        let provisioned = spec().provision().expect("provision");
+        assert!(
+            !provisioned
+                .runtime_descriptor
+                .resource_claims
+                .contains_key(ROOT_HASH_CLAIM)
+        );
     }
 
     #[test]
@@ -1507,6 +1542,7 @@ mod payload_tests {
             10001,
             10001,
             crate::config::KubeVirtWorkloadMode::Sandboxed,
+            "",
         )
         .expect("render");
         let decoded = bootstrap
@@ -1569,6 +1605,7 @@ mod payload_tests {
             10001,
             10001,
             crate::config::KubeVirtWorkloadMode::Sandboxed,
+            "",
         )
         .expect("render");
 
@@ -1656,6 +1693,7 @@ pub fn render_kubevirt_bootstrap(
     workload_uid: u32,
     workload_gid: u32,
     workload_mode: crate::config::KubeVirtWorkloadMode,
+    root_hash: &str,
 ) -> Result<KubeVirtBootstrap, String> {
     let launch_inputs = boundary_launch_inputs(launch_authentication)
         .map_err(|error| format!("boundary launch inputs: {error}"))?;
@@ -1710,6 +1748,7 @@ pub fn render_kubevirt_bootstrap(
             trust_anchor_pem: launch_inputs.tls.trust_anchor_pem.clone(),
         },
         workload_identity: workload_identity.clone(),
+        root_hash: root_hash.to_string(),
         child_env: HashMap::new(),
     };
     let _ = sandbox_name;

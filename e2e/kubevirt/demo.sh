@@ -147,6 +147,25 @@ FRAG
     SHARED_SUPERVISOR_CONFIG=''
 fi
 
+# The verified-boot binding: read the dm-verity labels the guest image
+# build stamped (io.openshell.kubevirt.root-hash and verity-geometry) and
+# render them into the kubevirt config. The driver passes the binding to
+# the guest on the kernel command line and claims it on the descriptor. An
+# image without the labels (pre-verity builds) boots the legacy plain path.
+ROOT_HASH_CONFIG=''
+if ROOT_HASH_LABEL="$(docker inspect "${GUEST_IMAGE}" \
+        --format '{{index .Config.Labels "io.openshell.kubevirt.root-hash"}}' \
+        2>/dev/null)" \
+    && GEOMETRY_LABEL="$(docker inspect "${GUEST_IMAGE}" \
+        --format '{{index .Config.Labels "io.openshell.kubevirt.verity-geometry"}}' \
+        2>/dev/null)" \
+    && [ -n "${ROOT_HASH_LABEL}" ] && [ -n "${GEOMETRY_LABEL}" ]; then
+    ROOT_HASH_CONFIG="root_hash = '${GEOMETRY_LABEL}:${ROOT_HASH_LABEL}'"
+    echo "==> verified boot: verity geometry ${GEOMETRY_LABEL}, root hash ${ROOT_HASH_LABEL}"
+else
+    echo "==> guest image carries no verity labels; using the legacy plain boot"
+fi
+
 CONFIG_PATH="${STATE_DIR}/gateway.toml"
 cat >"${CONFIG_PATH}" <<EOF
 # OpenShell gateway for the KubeVirt compute-driver PoC (e2e/kubevirt/).
@@ -192,6 +211,7 @@ guest_image_pull_policy = "IfNotPresent"
 cpu_cores = 1
 memory = "1Gi"
 workload = "${OPENSHELL_KVPOC_WORKLOAD:-sandboxed}"
+${ROOT_HASH_CONFIG}
 ${SHARED_SUPERVISOR_CONFIG}
 EOF
 

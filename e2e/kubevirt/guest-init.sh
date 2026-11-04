@@ -9,8 +9,11 @@
 # init (crates/openshell-driver-vm/scripts/openshell-vm-sandbox-init.sh) but
 # for KubeVirt hardware:
 #
-#   /dev/vda  rootfs      (containerDisk, read-only in practice: writes are
-#                          lost when the VMI goes away)
+#   /dev/vda  rootfs      (containerDisk carrying the dm-verity hash tree;
+#                          the initramfs mounts the verified read-only lower
+#                          and stacks a tmpfs overlay as the writable root —
+#                          in-session writes are RAM and every boot starts
+#                          from the verified image)
 #   /dev/vdb  config disk (cloudInitNoCloud ISO rendered from the driver's
 #                          bootstrap Secret; shell-sourceable user-data)
 #   workspace  virtio-fs share backed by the per-sandbox PVC (filesystem
@@ -53,9 +56,9 @@ mount_fs() {
     [ -e /dev/ptmx ] || ln -sf pts/ptmx /dev/ptmx
     mount -t tmpfs tmpfs /run 2>/dev/null || true
     mount -t tmpfs tmpfs /tmp 2>/dev/null || true
-    # The Alpine initramfs mounts the rootfs read-only; the containerDisk
-    # block device is writable for the lifetime of the VMI (writes are
-    # ephemeral — durable state lives on the workspace PVC).
+    # On the verified boot the root is the tmpfs overlay (already rw).
+    # On the legacy plain boot the initramfs mounted the containerDisk
+    # read-only and the remount makes it writable for the VMI's lifetime.
     mount -o remount,rw / 2>/dev/null || true
 }
 
@@ -208,13 +211,23 @@ main() {
         # exit (see the wait + poweroff below). Root mode (uid/gid 0)
         # launches the privileged boundary; the sandboxed default uses
         # the capability-free launch.
+        # The boundary binary comes from the trusted bind path when the
+        # verified boot staged it (the initramfs pins the verity-verified
+        # inode at /run/openshell/openshell-sandbox); the legacy plain boot
+        # falls back to the rootfs copy. A root workload can shadow the
+        # rootfs copy in the overlay, but the pinned inode is read-only.
+        BOUNDARY_BIN=/usr/local/bin/openshell-sandbox
+        if [ -x /run/openshell/openshell-sandbox ]; then
+            BOUNDARY_BIN=/run/openshell/openshell-sandbox
+            ts "boundary from the verified trusted path (${BOUNDARY_BIN})"
+        fi
         if [ "${launch_uid}" = "0" ] && [ "${launch_gid}" = "0" ]; then
             ts "launching privileged (root-workload) boundary"
-            /usr/local/bin/openshell-sandbox launch-privileged \
+            "${BOUNDARY_BIN}" launch-privileged \
                 /.openshell/state/bootstrap/boundary.json &
         else
             # shellcheck disable=SC2086
-            /usr/local/bin/openshell-sandbox launch-capability-free \
+            "${BOUNDARY_BIN}" launch-capability-free \
                 "${launch_uid}" "${launch_gid}" \
                 /.openshell/state/bootstrap/boundary.json &
         fi

@@ -229,6 +229,14 @@ pub struct KubeVirtConfig {
     /// class — root workload, no in-guest enforcement, dedicated
     /// supervisor topology required).
     pub workload: KubeVirtWorkloadMode,
+    /// dm-verity binding for the guest rootfs: "<blocks>:<hash-start>:<root
+    /// hash>" as stamped by the image build
+    /// (io.openshell.kubevirt.verity-geometry + root-hash labels). When
+    /// set, the guest boots through the trusted initramfs: dm-verity over
+    /// the containerDisk rootfs, a read-only verified lower, and a tmpfs
+    /// overlay for the writable root. When empty, the legacy plain boot
+    /// (writable rootfs, no verification) is used.
+    pub root_hash: String,
 }
 
 impl Default for KubeVirtConfig {
@@ -240,6 +248,7 @@ impl Default for KubeVirtConfig {
             workload: KubeVirtWorkloadMode::default(),
             memory: "1Gi".to_string(),
             workspace_pvc: true,
+            root_hash: String::new(),
         }
     }
 }
