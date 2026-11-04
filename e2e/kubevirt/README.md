@@ -261,11 +261,13 @@ fence: openshell-kubevirt-fence-cb8d091f-... (uid 56d1d4ae-...)
 exactly one virt-launcher pod matches the fence podSelector
 === 3/10 exec inside the VM ===
 Linux (none) 6.12.114-0-virt #1-Alpine SMP PREEMPT_DYNAMIC x86_64 Linux
-uid=10001(sandbox) gid=10001(sandbox)
+uid=10001(sandbox) gid=10001(sandbox)   # uid=0(root) gid=0(root) in root mode
 init
 === 4/10 no gateway material in the workload environment ===
 environment clean (no BOUNDARY/PRIVATE/TOKEN/OPENSHELL_ENDPOINT vars)
 === 5/10 L4 allow/deny and L7 HTTPS GET allow / POST deny ===
+(skipped in root mode: in-guest mediation is demoted; steps 5–6 resume
+ when the nftables transparent relay lands)
 L4 ALLOW: connected
 L4 DENY: connect to example.org:80 blocked
 <!doctype html>...(Example Domain page over HTTPS)...

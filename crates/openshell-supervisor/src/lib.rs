@@ -3250,13 +3250,18 @@ async fn load_policy_with_gateway(
                             &error,
                         )
                         .await;
+                        // Carry the specific failure (privileged section
+                        // rejection, provider refusal, engine build error)
+                        // into the user-visible configuration error rather
+                        // than a generic message.
+                        let diagnostic = render_bounded_rejection_detail(&error.to_string());
                         reject_startup_configuration(
                             gateway,
                             &mut rejection_log,
                             id,
                             &instance_id,
                             &snapshot,
-                            "Policy or provider environment failed runtime validation",
+                            &diagnostic,
                             None,
                         )
                         .await?;
@@ -3575,6 +3580,17 @@ impl StartupRejectionLog {
         self.0 = Some(rejection);
         true
     }
+}
+
+/// Render a startup rejection detail for the user-visible configuration
+/// error: drop control characters and keep at most 512 characters, mirroring
+/// the gateway's own configuration diagnostics.
+fn render_bounded_rejection_detail(error: &str) -> String {
+    error
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(512)
+        .collect()
 }
 
 async fn reject_startup_configuration(

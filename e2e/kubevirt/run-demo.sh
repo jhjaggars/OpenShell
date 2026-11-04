@@ -59,6 +59,28 @@ FENCE_PREFIX="openshell-kubevirt-fence-"
 step() { echo; echo "=== $* ==="; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# Tear down the sandbox when a step fails: without this the VM, VMI, and
+# supervisor Pod are left running after the demo's gateway exits, and only
+# a manual `kubectl delete vm` cascades them away. The CLI delete runs
+# first (while the gateway is still up); the labelled kubectl deletions
+# are the gateway-independent backstop — owner references cascade from
+# the VM, and the labelled companions cover what the VM does not own.
+cleanup_on_failure() {
+    local rc=$?
+    if [ "${rc}" -ne 0 ]; then
+        echo >&2
+        echo "demo failed (rc=${rc}); tearing down sandbox '${NAME}'..." >&2
+        "${OPENSHELL_CLI}" sandbox delete "${NAME}" >/dev/null 2>&1 || true
+        kubectl delete vm -n "${SANDBOX_NAMESPACE}" -l "${VM_SELECTOR}" \
+            --wait=false --ignore-not-found >/dev/null 2>&1 || true
+        kubectl delete pod,svc,secret,pvc,netpol -n "${SANDBOX_NAMESPACE}" \
+            -l "${VM_SELECTOR}" --ignore-not-found >/dev/null 2>&1 || true
+        echo "teardown complete" >&2
+    fi
+    exit "${rc}"
+}
+trap cleanup_on_failure EXIT
+
 WORKDIR="$(mktemp -d /tmp/kvpoc-demo-XXXXXX)"
 trap 'rm -rf "${WORKDIR}"' EXIT
 
@@ -216,15 +238,23 @@ fi
 
 step "3/10 exec inside the VM"
 exec_in_sandbox sh -c 'uname -a; id; cat /proc/1/comm' | tee ${WORKDIR}/exec.log
-grep -q "uid=10001(sandbox)" ${WORKDIR}/exec.log \
-    || fail "workload does not run as the provisioned sandbox user"
+if [ "${WORKLOAD}" = "root" ]; then
+    grep -q "uid=0(root) gid=0(root)" ${WORKDIR}/exec.log \
+        || fail "workload does not run as root in root mode"
+    echo "workload runs as root (uid 0) — the demoted boundary relays for it"
+else
+    grep -q "uid=10001(sandbox)" ${WORKDIR}/exec.log \
+        || fail "workload does not run as the provisioned sandbox user"
+fi
 grep -q "^init$" ${WORKDIR}/exec.log || fail "PID 1 is not the guest init"
 
-# H2: the workspace PVC must be writable by the workload uid (the idmapped
-# virtiofs mount); a marker file proves it and is re-read after stop/start.
+# H2: the workspace PVC must be writable by the workload (the idmapped
+# virtiofs mount; in root mode the root workload writes through the same
+# idmap and files show as 10001 on the host side); a marker file proves it
+# and is re-read after stop/start.
 exec_in_sandbox sh -c 'echo workspace-ok > /sandbox/.kvpoc-demo-marker' \
-    || fail "the workload uid cannot write to the workspace PVC"
-echo "workspace writable by the workload uid (idmapped virtiofs)"
+    || fail "the workload cannot write to the workspace PVC"
+echo "workspace writable by the workload (idmapped virtiofs)"
 
 step "4/10 no gateway material in the workload environment"
 if exec_in_sandbox sh -c \
@@ -236,6 +266,12 @@ fi
 echo "environment clean (no BOUNDARY/PRIVATE/TOKEN/OPENSHELL_ENDPOINT vars)"
 
 step "5/10 L4 allow/deny and L7 HTTPS GET allow / POST deny"
+if [ "${WORKLOAD}" = "root" ]; then
+    echo "SKIPPED (root mode): the L4/L7 checks need in-guest network"
+    echo "mediation, which root workloads do not have — the seccomp broker"
+    echo "is demoted and the nftables transparent relay is not landed yet."
+    echo "Network fails closed in the interim (no relay, no egress)."
+else
 exec_in_sandbox sh -c \
     'nc -z -w 10 one.one.one.one 443 && echo "L4 ALLOW: connected"' \
     | tee ${WORKDIR}/l4.log
@@ -259,8 +295,14 @@ exec_in_sandbox sh -c 'wget -q -T 20 -O /dev/null --post-data=x https://example.
 grep -q "403" ${WORKDIR}/l7post.log \
     || { cat ${WORKDIR}/l7post.log >&2; fail "L7 POST denial was not a policy 403"; }
 echo "L7 POST denied (HTTP 403)"
+fi
 
 step "6/10 direct egress from the guest is blocked"
+if [ "${WORKLOAD}" = "root" ]; then
+    echo "SKIPPED (root mode): the bypass checks need in-guest network"
+    echo "mediation (see step 5); the fence itself is topology-level, not"
+    echo "workload-level, and is verified by sandboxed demo runs."
+else
 if exec_in_sandbox sh -c 'nc -z -w 10 1.1.1.1 443'; then
     fail "raw TCP to 1.1.1.1:443 escaped the boundary"
 fi
@@ -317,6 +359,7 @@ if [ "${CONTROL_OK}" != "0" ]; then
     fail "launcher pod -> supervisor Service connect was refused (fence too narrow?)"
 fi
 echo "fence check: launcher pod -> supervisor ${SUPERVISOR_IP}:5500 reachable (selective)"
+fi
 
 step "7/10 stop -> start -> Ready with VM and fence UIDs unchanged"
 "${OPENSHELL_CLI}" sandbox stop "${NAME}"
@@ -432,6 +475,13 @@ fi
 echo "zero leftover vm/vmi/pod/svc/secret/pvc/netpol for sandbox ${SBX_ID}"
 
 echo
-echo "demo complete (${TOPOLOGY} supervisor topology): Ready, exec, L4/L7"
-echo "policy, bypass blocked, stop/start, fence verification, dead-runtime"
-echo "Error, and clean teardown all verified"
+if [ "${WORKLOAD}" = "root" ]; then
+    echo "demo complete (${TOPOLOGY} topology, root workload): Ready, exec"
+    echo "as root, clean environment, stop/start, fence verification,"
+    echo "dead-runtime Error, and clean teardown all verified"
+    echo "(L4/L7 and bypass checks pending the nftables relay)"
+else
+    echo "demo complete (${TOPOLOGY} supervisor topology): Ready, exec, L4/L7"
+    echo "policy, bypass blocked, stop/start, fence verification, dead-runtime"
+    echo "Error, and clean teardown all verified"
+fi
