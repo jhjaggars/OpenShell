@@ -119,6 +119,24 @@ launcher_pod_name() {
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
 }
 
+# Summed container restart counts: virt-launcher (this sandbox's launcher
+# pod) and virt-handler (the node's daemonset pod that owns the launcher).
+launcher_pod_restarts() {
+    kubectl get pod -n "${SANDBOX_NAMESPACE}" "$(launcher_pod_name)" \
+        -o jsonpath='{.status.containerStatuses[*].restartCount}' 2>/dev/null \
+        | tr ' ' '\n' | awk '{s+=$1} END {print s+0}'
+}
+
+virt_handler_restarts() {
+    local node
+    node="$(kubectl get pod -n "${SANDBOX_NAMESPACE}" "$(launcher_pod_name)" \
+        -o jsonpath='{.spec.nodeName}' 2>/dev/null)"
+    kubectl get pods -n kubevirt -l kubevirt.io=virt-handler \
+        --field-selector "spec.nodeName=${node}" \
+        -o jsonpath='{.items[0].status.containerStatuses[*].restartCount}' 2>/dev/null \
+        | tr ' ' '\n' | awk '{s+=$1} END {print s+0}'
+}
+
 # ---------------------------------------------------------------------------
 step "setup: create a root sandbox reaching Ready"
 
@@ -150,21 +168,33 @@ echo "supervisor: ${SUPERVISOR_POD} (${TOPOLOGY} topology)"
 # Listeners in the launcher pod's network namespace (the netns the guest's
 # masquerade traffic lands in). /proc/net/tcp is hex-encoded
 # little-endian-address:big-endian-port; the audit lists the decoded ports.
-echo "launcher netns TCP listeners (/proc/net/tcp, /proc/net/tcp6):"
+echo "launcher netns listeners (/proc/net/tcp, /proc/net/tcp6, /proc/net/udp, /proc/net/udp6):"
 # Decode without gawk extensions: the port field is hex big-endian; POSIX
 # awk converts it with CONVFMT via +"0x" arithmetic where supported, so do
 # the decode in the pipeline's shell instead. virtiofsd (unix socket +
 # vhost device) and QEMU's guest-facing dataplane do not listen on TCP;
 # what remains in this netns is the masquerade and anything the launcher
 # itself runs.
-kubectl exec -n "${SANDBOX_NAMESPACE}" "${LAUNCHER}" -c compute -- \
-    sh -c 'cat /proc/net/tcp /proc/net/tcp6 2>/dev/null' \
-    | awk '$4 == "0A" { split($2, a, ":"); print a[2], $10 }' \
-    | sort -u \
-    | while read -r hexport inode; do
-        port="$(( 0x${hexport} ))"
-        echo "  listening port ${port} (inode ${inode})"
-      done | tee "${WORKDIR}/listeners.log" || true
+# TCP listeners have state 0A (LISTEN) in /proc/net/tcp; UDP sockets carry
+# state 07 (unconnected) — a bound-but-unconnected udp socket IS the
+# listener shape. Filter per protocol or the DHCP server is missed.
+for proto in tcp tcp6 udp udp6; do
+    state="0A"
+    case "${proto}" in udp*) state="07" ;; esac
+    kubectl exec -n "${SANDBOX_NAMESPACE}" "${LAUNCHER}" -c compute -- \
+        sh -c "cat /proc/net/${proto} 2>/dev/null" \
+        | awk -v st="${state}" '$4 == st { split($2, a, ":"); print a[2], $10 }' \
+        | sort -u \
+        | while read -r hexport inode; do
+            port="$(( 0x${hexport} ))"
+            echo "  ${proto} listening port ${port} (inode ${inode})"
+          done
+done | tee "${WORKDIR}/listeners.log" || true
+# The masquerade DHCP server (KubeVirt's dnsmasq) listens on udp 0.0.0.0:67
+# and is reachable from the guest over the tap — a guest-reachable parser.
+grep -q " udp listening port 67 " "${WORKDIR}/listeners.log" \
+    && echo "FINDING: the masquerade DHCP server (udp 67) listens in the launcher netns — guest-reachable, named in the RFC alongside the guest agent" \
+    || echo "NOTE: no udp 67 listener found in the launcher netns"
 
 # Reachability from the launcher netns (the fence's egress applies to this
 # pod): the fence must admit ONLY the supervisor service. Probe the
@@ -205,6 +235,32 @@ fi
 [ -n "${K8S_API_IP}" ] && probe_tcp "${K8S_API_IP}:443" "Kubernetes API service"
 [ -n "${NODE_IP}" ] && probe_tcp "${NODE_IP}:10250" "node kubelet"
 probe_tcp "1.1.1.1:443" "external internet"
+
+# The guest-reachable parser probe: the masquerade DHCP server (dnsmasq in
+# the launcher netns) parses what the guest sends over the tap. Send
+# malformed and oversized DHCP datagrams from the ROOT guest and assert
+# virt-launcher stays healthy and the sandbox is unaffected.
+GUEST_GW="$(exec_in_sandbox sh -c \
+    'ip route 2>/dev/null | sed -n "s/^default via \([0-9.]*\).*/\1/p" | head -1' 2>/dev/null || true)"
+[ -n "${GUEST_GW}" ] || GUEST_GW="10.0.2.2"
+echo "guest-side DHCP parser probe (targeting ${GUEST_GW}:67):"
+LAUNCHER_RESTARTS_BEFORE="$(launcher_pod_restarts)"
+exec_in_sandbox sh -c \
+    "printf 'MALFORMED-DHCP-PROBE-NOT-BOOTP' | nc -u -w 2 ${GUEST_GW} 67" \
+    >/dev/null 2>&1 || true
+exec_in_sandbox sh -c \
+    "head -c 60000 /dev/urandom | nc -u -w 2 ${GUEST_GW} 67" \
+    >/dev/null 2>&1 || true
+sleep 10
+LAUNCHER_RESTARTS_AFTER="$(launcher_pod_restarts)"
+echo "virt-launcher restarts: ${LAUNCHER_RESTARTS_BEFORE} -> ${LAUNCHER_RESTARTS_AFTER}"
+[ "${LAUNCHER_RESTARTS_AFTER}" = "${LAUNCHER_RESTARTS_BEFORE}" ] \
+    || fail "virt-launcher restarted from malformed/oversized guest DHCP datagrams"
+PHASE_AFTER_DHCP="$(sandbox_phase)"
+[ "${PHASE_AFTER_DHCP}" = "Phase: Ready" ] \
+    || fail "sandbox left Ready after malformed/oversized guest DHCP datagrams"
+exec_in_sandbox true || fail "exec broken after malformed/oversized guest DHCP datagrams"
+echo "PASS: virt-launcher stayed healthy and the sandbox is unaffected by malformed/oversized DHCP from the root guest"
 echo "P5 recorded (evidence above; the fence is expected to admit only the supervisor Service)"
 
 # ---------------------------------------------------------------------------
@@ -218,28 +274,45 @@ if [ -z "${GA_PORT}" ]; then
     echo "FINDING: no virtio-ports device in the guest — the agent channel is absent"
 else
     echo "guest-agent port: /dev/virtio-ports/${GA_PORT}"
+
     # The responder runs as a background exec session (it must keep the
-    # port open). Its answers are deliberately identifiable lies.
+    # port open). It first completes the QGA handshake so KubeVirt proceeds
+    # past the version check (guest-sync echoes the request id; guest-info
+    # advertises a supported schema version), then answers the polling
+    # commands with deliberately identifiable lies.
+    # The responder holds the port with one read-write fd (the port is
+    # single-open: a second open gets EBUSY) and answers on that fd. The
+    # open itself drives KubeVirt's agent lifecycle: opening fires the
+    # connect event (the agent poller starts), closing ends it.
     "${OPENSHELL_CLI}" sandbox exec "${NAME}" -- sh -c "
-        while IFS= read -r line; do
+        exec 3<>/dev/virtio-ports/${GA_PORT} || { echo 'port open failed'; exit 1; }
+        while IFS= read -r line <&3; do
+            printf '%s\n' \"\$line\" >> /tmp/ga-rx.log
             case \"\$line\" in
+                *guest-sync-delimited*|*guest-sync*)
+                    id=\"\$(printf '%s' \"\$line\" | sed -n 's/.*\"id\":\([0-9]*\).*/\1/p')\"
+                    printf '{\"return\": %s}\n' \"\${id:-1}\" >&3 ;;
+                *guest-info*)
+                    printf '{\"return\": {\"version\": 1, \"supported_commands\": [{\"enabled\": true, \"name\": \"guest-ping\", \"success-response\": true}, {\"enabled\": true, \"name\": \"guest-get-osinfo\", \"success-response\": true}, {\"enabled\": true, \"name\": \"guest-get-host-name\", \"success-response\": true}, {\"enabled\": true, \"name\": \"guest-get-users\", \"success-response\": true}, {\"enabled\": true, \"name\": \"guest-get-fsinfo\", \"success-response\": true}]}}\n' >&3 ;;
                 *guest-ping*)
-                    printf '{\"return\": {}}\n' ;;
+                    printf '{\"return\": {}}\n' >&3 ;;
                 *guest-get-host-name*)
-                    printf '{\"return\": {\"host-name\": \"totally-honest-host\"}}\n' ;;
+                    printf '{\"return\": {\"host-name\": \"totally-honest-host\"}}\n' >&3 ;;
                 *guest-get-osinfo*)
-                    printf '{\"return\": {\"kernel-release\": \"6.6.6-fake\", \"machine\": \"x86_64\", \"name\": \"FakeOS\", \"pretty-name\": \"FakeOS 99 (Liar Edition)\"}}\n' ;;
+                    printf '{\"return\": {\"kernel-release\": \"6.6.6-fake\", \"machine\": \"x86_64\", \"name\": \"FakeOS\", \"pretty-name\": \"FakeOS 99 (Liar Edition)\", \"version\": \"99\", \"version-id\": \"99\", \"id\": \"fakeos\"}}\n' >&3 ;;
                 *guest-get-users*)
-                    printf '{\"return\": [{\"user\": \"definitely-real-user\", \"login-time\": 1.0}]}\n' ;;
+                    printf '{\"return\": [{\"user\": \"definitely-real-user\", \"login-time\": 1.0}]}\n' >&3 ;;
+                *guest-get-fsinfo*)
+                    printf '{\"return\": [{\"name\": \"disk-fake\", \"mountpoint\": \"/fake\", \"type\": \"fakefs\", \"disk\": []}]}\n' >&3 ;;
                 *)
-                    printf '{\"return\": {}}\n' ;;
+                    printf '{\"return\": {}}\n' >&3 ;;
             esac
-        done < /dev/virtio-ports/${GA_PORT} > /dev/virtio-ports/${GA_PORT}
+        done
     " > "${WORKDIR}/fake-agent.log" 2>&1 &
     FAKE_AGENT_PID=$!
     echo "fake agent running (pid ${FAKE_AGENT_PID})"
 
-    # Give KubeVirt time to poll the agent and surface the answers.
+    # Give KubeVirt time to complete the handshake and poll the agent.
     sleep 45
     echo "VMI status after the fake agent answered:"
     kubectl get vmi -n "${SANDBOX_NAMESPACE}" "${VMI_NAME}" -o json \
@@ -252,10 +325,17 @@ for c in status.get("conditions", []):
 print("  guestOSInfo: %s" % json.dumps(status.get("guestOSInfo", {})))
 ' | tee "${WORKDIR}/vmi-agent-status.log"
 
+    # Diagnostics: what the host actually sent down the channel.
+    echo "host->guest requests received by the fake agent:"
+    exec_in_sandbox sh -c 'cat /tmp/ga-rx.log 2>/dev/null' \
+        | tee "${WORKDIR}/ga-rx.log" | head -10 || echo "  (nothing received)"
+
     if grep -q "FakeOS" "${WORKDIR}/vmi-agent-status.log"; then
-        echo "FINDING (expected): KubeVirt surfaces the fake agent's lies in VMI status"
+        echo "FINDING (expected): KubeVirt surfaces the fake agent's lies in VMI status (osinfo/name/fsinfo reach the VMI object)"
+    elif grep -q "AgentConnected=True" "${WORKDIR}/vmi-agent-status.log"; then
+        echo "FINDING: KubeVirt connected to the fake agent (AgentConnected) but the OS-info lies did not surface within the window"
     else
-        echo "NOTE: the fake agent's OS info did not reach VMI status (agent polling cadence or protocol mismatch)"
+        echo "NOTE: the fake agent did not complete the handshake (see the VMI conditions above); the channel evidence is whatever condition KubeVirt recorded"
     fi
 
     # The invariant the posture requires: nothing in OpenShell consumes the
@@ -267,8 +347,54 @@ print("  guestOSInfo: %s" % json.dumps(status.get("guestOSInfo", {})))
     exec_in_sandbox true || fail "exec broken while the fake agent ran"
     echo "PASS: the sandbox is unaffected by the lying guest agent (Ready, exec works)"
 
+    # Hostile phase: malformed and oversized replies. The user's decision
+    # (option B) requires virt-launcher and virt-handler to stay healthy
+    # while the guest-side agent misbehaves. Replace the responder with a
+    # hostile one: invalid JSON first, then a 10 MiB single-line reply.
     kill "${FAKE_AGENT_PID}" 2>/dev/null || true
     wait "${FAKE_AGENT_PID}" 2>/dev/null || true
+    sleep 2
+    LAUNCHER_RESTARTS_BEFORE="$(launcher_pod_restarts)"
+    VIRT_HANDLER_RESTARTS_BEFORE="$(virt_handler_restarts)"
+    # The oversized write is bounded: virtio-serial applies host-side flow
+    # control, so a guest write with no host consumer BLOCKS (itself a
+    # finding — the guest cannot flood the host unboundedly). A 20s bound
+    # proves the oversized payload was offered without hanging the probe.
+    # The CLI-level timeout bounds the whole session: once the virtio port
+    # buffer fills (no host consumer), EVERY further guest write blocks —
+    # including small ones — so the guest-side timeout alone cannot free the
+    # session. Killing the CLI closes the relay, and the boundary reaps the
+    # exec child when the channel ends.
+    timeout 60 "${OPENSHELL_CLI}" sandbox exec "${NAME}" -- sh -c "
+        exec 3<>/dev/virtio-ports/${GA_PORT} || { echo 'port open failed'; exit 1; }
+        # Malformed: not JSON at all.
+        printf 'NOT JSON AT ALL {{{\n' >&3
+        sleep 3
+        # Oversized: a single 10 MiB reply line. The write blocks once the
+        # port buffer fills (virtio-serial host flow control) — recorded as
+        # a finding, the session is bounded by the CLI timeout.
+        printf '{\"return\": \"' >&3
+        head -c 10485760 /dev/zero | tr '\\0' 'A' >&3
+        printf '\"}\n' >&3
+        sleep 5
+    " > "${WORKDIR}/hostile-agent.log" 2>&1 || true
+    grep -q "port open failed" "${WORKDIR}/hostile-agent.log" 2>/dev/null \
+        && echo "NOTE: the hostile agent could not open the port (single-open contention with the poller window)" \
+        || echo "hostile replies delivered (or bounded by flow control); session closed"
+    sleep 10
+    LAUNCHER_RESTARTS_AFTER="$(launcher_pod_restarts)"
+    VIRT_HANDLER_RESTARTS_AFTER="$(virt_handler_restarts)"
+    echo "virt-launcher restarts: ${LAUNCHER_RESTARTS_BEFORE} -> ${LAUNCHER_RESTARTS_AFTER}"
+    echo "virt-handler restarts: ${VIRT_HANDLER_RESTARTS_BEFORE} -> ${VIRT_HANDLER_RESTARTS_AFTER}"
+    [ "${LAUNCHER_RESTARTS_AFTER}" = "${LAUNCHER_RESTARTS_BEFORE}" ] \
+        || fail "virt-launcher restarted from malformed/oversized guest-agent replies"
+    [ "${VIRT_HANDLER_RESTARTS_AFTER}" = "${VIRT_HANDLER_RESTARTS_BEFORE}" ] \
+        || fail "virt-handler restarted from malformed/oversized guest-agent replies"
+    PHASE_AFTER_HOSTILE="$(sandbox_phase)"
+    [ "${PHASE_AFTER_HOSTILE}" = "Phase: Ready" ] \
+        || fail "sandbox left Ready after hostile guest-agent replies"
+    exec_in_sandbox true || fail "exec broken after hostile guest-agent replies"
+    echo "PASS: virt-launcher and virt-handler stayed healthy and the sandbox is unaffected by malformed/oversized guest-agent replies"
 fi
 
 # ---------------------------------------------------------------------------
@@ -370,6 +496,25 @@ echo "after: phase='${RESET_OBSERVED:-unresolved (${PHASE:-none})}'"
 echo "  VMI uid: ${VMI_UID_BEFORE:-none} -> ${VMI_UID_AFTER:-none}"
 echo "  supervisor pod uid: ${SUP_POD_UID_BEFORE:-none} -> ${SUP_POD_UID_AFTER:-none}"
 "${OPENSHELL_CLI}" sandbox get "${NAME}" 2>/dev/null | grep -aE "Phase:|Ready:|exit code" | head -3 || true
+# The detection mechanism: guest init re-runs after the warm reset, re-stages
+# the SAME bootstrap (same key) from the cloud-init disk, and launches a
+# fresh privileged boundary that reconnects to the live generation. The
+# supervisor ends the sandbox when the fresh boundary attaches — the handle
+# changed during launch recovery. Record the supervisor's own reason line.
+SUP_EXIT_REASON="$(kubectl logs -n "${SANDBOX_NAMESPACE}" \
+    "$(supervisor_pod_name)" --tail=200 2>/dev/null \
+    | grep -a "attachment denied" | tail -1 || true)"
+if [ -n "${SUP_EXIT_REASON}" ]; then
+    echo "  supervisor exit reason: ${SUP_EXIT_REASON}"
+    echo "PASS mechanism: the reset is detected by the supervisor's boundary-handle check on launch recovery (a fresh boundary attaching to the live generation ends it)"
+else
+    echo "NOTE: the supervisor's attachment-denied line was not captured (log cadence); the phase flip above is the detection evidence"
+fi
+# RFC caveat: root can read the boundary's memory, learn the handle, and
+# present it after a reset. Acceptable: root already holds the key and
+# handle in-session (it can impersonate its own boundary without
+# rebooting). The initramfs agent plus dm-verity (commit 6) make post-reset
+# CODE trusted.
 
 # The invariant: a reset must not pass unnoticed. Whatever terminal or
 # observed state results, the sandbox must not silently continue the SAME
@@ -396,16 +541,64 @@ sleep 5
     -- /bin/sleep infinity
 wait_for_phase Ready
 
+# The stock linux-virt kernel ships iTCO_wdt.ko but cannot bind it (lpc_ich
+# is not built), so /dev/watchdog is absent. A root workload can still load
+# its own lpc_ich build, or program the TCO timer directly through
+# /dev/port. The probe tries, in order: the module, the device node, and a
+# direct port-I/O arm of the TCO timer. RFC wording: "not exposed by the
+# stock kernel; reachable by root; covered by reset detection (P1) and
+# trusted boot (commit 6)".
+MODPROBE_RC="$(exec_in_sandbox sh -c 'modprobe iTCO_wdt 2>&1; echo rc=$?' || true)"
+echo "modprobe iTCO_wdt: ${MODPROBE_RC}"
 WD_PRESENT="$(exec_in_sandbox sh -c 'ls -l /dev/watchdog* 2>/dev/null || echo absent')"
 echo "watchdog device: ${WD_PRESENT}"
-if echo "${WD_PRESENT}" | grep -q "absent"; then
-    echo "FINDING: no /dev/watchdog in the guest — the iTCO is not exposed to root"
-else
+ARMED=0
+if ! echo "${WD_PRESENT}" | grep -q "absent"; then
     # Opening /dev/watchdog starts it; closing WITHOUT the magic 'V' leaves
-    # it armed, and the iTCO resets the machine when it expires. This is
-    # the attack a root guest can always perform.
+    # it armed, and the iTCO resets the machine when it expires.
     echo "arming: open + non-magic close of /dev/watchdog"
     exec_in_sandbox sh -c 'exec 3>/dev/watchdog' || true
+    ARMED=1
+else
+    echo "no /dev/watchdog after modprobe (lpc_ich is not built for linux-virt; the module cannot bind)"
+    # Direct port-I/O arm through the guest's port-io helper (static musl,
+    # shipped in the image). /dev/port CANNOT be used: it is byte-granular,
+    # and QEMU drops byte writes to the dword/word emulated registers (the
+    # PCI config address 0xcf8 and the TCO counters) — verified live: dd
+    # writes through /dev/port never latch.
+    # The ACPI PMBASE is discovered from the ICH9 LPC's PCI config (bus 0,
+    # device 0x1f, function 0, offset 0x40 = PMBA) via 0xCF8/0xCFC — never
+    # hardcoded, so a different QEMU default cannot misdirect the writes.
+    #   TCO base = PMBASE + 0x60 (TCO_RLD at +0x00)
+    #   TCO1_CNT = PMBASE + 0x68 (bit 11: TCO_TMR_HLT)
+    # On ICH9 the GCS NO_REBOOT bit lives in RCBA MMIO, not PMBASE I/O —
+    # and the launcher passes -global ICH9-LPC.noreboot=off (resets
+    # allowed), so arming only needs the TCO timer: clear TMR_HLT and kick
+    # TCO_RLD.
+    PORT_ARM="$(exec_in_sandbox sh -c '
+        PIO=/usr/local/bin/port-io
+        [ -x "${PIO}" ] || { echo "no port-io helper in the guest image"; exit 9; }
+        # PCI config read: 0xcf8 <- 0x8000f840 (00:1f.0 offset 0x40), read 0xcfc.
+        "${PIO}" write32 0xcf8 0x8000f840
+        pmba=$("${PIO}" read32 0xcfc)
+        pmba=$(( pmba & 0xfffffff0 ))
+        case "${pmba}" in
+            0x0|0xffffffff) echo "PMBA readback implausible (${pmba}); no LPC?"; exit 7 ;;
+        esac
+        cnt=$("${PIO}" read16 $(( pmba + 0x68 )))
+        echo "PMBASE=${pmba} TCO1_CNT=${cnt} (bit11 halt=$(( (cnt >> 11) & 1 )))"
+        # Arm: clear the halt bit and kick the reload register.
+        "${PIO}" write16 $(( pmba + 0x68 )) $(( cnt & ~0x800 ))
+        "${PIO}" write16 $(( pmba + 0x60 )) 0
+        after=$("${PIO}" read16 $(( pmba + 0x68 )))
+        echo "after arm: TCO1_CNT=${after} (bit11 halt=$(( (after >> 11) & 1 )))"
+        [ $(( (after >> 11) & 1 )) = 0 ] \
+            && echo "armed: TCO_TMR_HLT cleared, TCO_RLD kicked (timer running)"
+    ' 2>&1 || true)"
+    echo "port-I/O arm: ${PORT_ARM}"
+    echo "${PORT_ARM}" | grep -q "armed:" && ARMED=1
+fi
+if [ "${ARMED}" = "1" ]; then
     echo "watching for the watchdog reset (up to 120s)..."
     WD_RESET=""
     DEADLINE=$(( $(date +%s) + 120 ))
@@ -418,11 +611,27 @@ else
         [ "${UPTIME}" -lt 30 ] && { WD_RESET="guest-rebooted(uptime=${UPTIME}s)"; break; }
         sleep 5
     done
+    # Whether or not the machine reset, read the TCO status flags: the
+    # timer FIRING is provable even when QEMU's reset gating holds.
+    TCO_STATUS="$(exec_in_sandbox sh -c '
+        PIO=/usr/local/bin/port-io
+        "${PIO}" write32 0xcf8 0x8000f840
+        pmba=$(( $("${PIO}" read32 0xcfc) & 0xfffffff0 ))
+        [ "${pmba}" -gt 0 ] || pmba=0x600
+        echo "TCO1_STS=$("${PIO}" read16 $(( pmba + 0x64 ))) TCO2_STS=$("${PIO}" read16 $(( pmba + 0x66 )))"
+    ' 2>/dev/null || true)"
+    echo "TCO status after the window: ${TCO_STATUS:-unavailable}"
     if [ -n "${WD_RESET}" ]; then
-        echo "PASS/recorded: the iTCO watchdog reset the guest; control plane observed: ${WD_RESET}"
+        echo "PASS/recorded: the iTCO watchdog reset the guest; control plane observed: ${WD_RESET} — covered by reset detection (P1) and trusted boot"
+    elif echo "${TCO_STATUS}" | grep -q "TCO1_STS=0x0008"; then
+        # TCO1_STS bit 3 = TCO_TIMEOUT (the timer fired); TCO2_STS bits
+        # SECOND_TO_STS/BOOT_STS record the double timeout.
+        echo "FINDING: the TCO timer FIRED (TCO1_STS TIMEOUT${TCO_STATUS#*TCO1_STS=0x0008}) but the machine did not reset (uptime continuous, phase unchanged) — QEMU's reset gating (ICH9-LPC.noreboot wiring) held. The surface is armed-and-firing by root; a reset would be covered by reset detection (P1) and trusted boot"
     else
-        echo "FINDING: the watchdog did not fire within 120s (long timeout or disarmed on close); the iTCO default timeout may exceed the window"
+        echo "FINDING: the watchdog did not observably fire within 120s and no status flags were readable; the RFC records the surface as reachable-by-root regardless — covered by reset detection (P1) and trusted boot"
     fi
+else
+    echo "FINDING: the TCO could not be armed from the stock guest (no /dev/watchdog, port-I/O arm unavailable or readback implausible); the surface is still reachable by root with a custom kernel module — covered by reset detection (P1) and trusted boot"
 fi
 
 # ---------------------------------------------------------------------------

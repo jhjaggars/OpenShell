@@ -66,6 +66,7 @@ docker export kvpoc-guest-rootfs -o "${WORKDIR}/rootfs.tar"
 docker rm kvpoc-guest-rootfs >/dev/null
 
 cp "${REPO_ROOT}/e2e/kubevirt/idmap-mount.c" "${WORKDIR}/idmap-mount.c"
+cp "${REPO_ROOT}/e2e/kubevirt/port-io.c" "${WORKDIR}/port-io.c"
 
 # 2. Unpack the exported rootfs, usr-merge it, render the ext4 disk, and
 #    repack the initramfs — all as root inside a container. An unprivileged
@@ -85,6 +86,10 @@ docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
     # workspace share with an idmap so the workload uid can write through
     # the unprivileged virtiofsd.
     cc -static -O2 -o /work/rootfs/usr/local/bin/idmap-mount /work/idmap-mount.c
+    # The port-I/O helper (static musl) for the e2e probes: /dev/port is
+    # byte-granular, but the emulated PCI config and TCO registers need
+    # word/dword OUT instructions (byte writes are dropped by QEMU).
+    cc -static -O2 -o /work/rootfs/usr/local/bin/port-io /work/port-io.c
     chmod 0755 /work/rootfs/usr/local/bin/openshell-sandbox /work/rootfs/opt/openshell/init
 
     # Usr-merge /bin and /sbin into /usr: the supervisor default Landlock
