@@ -335,17 +335,27 @@ print("  guestOSInfo: %s" % json.dumps(status.get("guestOSInfo", {})))
     elif grep -q "AgentConnected=True" "${WORKDIR}/vmi-agent-status.log"; then
         echo "FINDING: KubeVirt connected to the fake agent (AgentConnected) but the OS-info lies did not surface within the window"
     else
-        echo "NOTE: the fake agent did not complete the handshake (see the VMI conditions above); the channel evidence is whatever condition KubeVirt recorded"
+        echo "NOT EXERCISABLE in this environment: the guest-agent parser cannot be"
+        echo "reached. The channel DOES connect (a read-write guest open flips the"
+        echo "host-side port state to connected and starts KubeVirt's agent poller,"
+        echo "which attempts guest-sync every 5s), but ZERO bytes traverse"
+        echo "host->guest even with a live guest reader on the open port — verified"
+        echo "on both kvpoc and kvreview with raw readers. The break is in the"
+        echo "virtualization stack's chardev->virtqueue data path, not in the probe"
+        echo "mechanics. The RFC records the guest-agent parser as a NAMED,"
+        echo "UNTESTED root-mode surface; the mitigation is the upstream ask for a"
+        echo "supported way to disable the channel."
     fi
 
-    # The invariant the posture requires: nothing in OpenShell consumes the
-    # agent data. The sandbox must be unaffected: same phase, exec still
-    # works.
+    # The OpenShell-side invariant is still observable and holds: nothing in
+    # OpenShell consumes agent data. The sandbox must be unaffected: same
+    # phase, exec still works. (Recorded as an observation, not a PASS of the
+    # parser probe — nothing on the host read the replies.)
     PHASE_AFTER_AGENT="$(sandbox_phase)"
     [ "${PHASE_AFTER_AGENT}" = "Phase: Ready" ] \
         || fail "sandbox left Ready while only the fake agent ran (something consumed agent data?)"
     exec_in_sandbox true || fail "exec broken while the fake agent ran"
-    echo "PASS: the sandbox is unaffected by the lying guest agent (Ready, exec works)"
+    echo "OBSERVED (OpenShell-side only): the sandbox is unaffected by the fake agent (Ready, exec works) — no host-side parser was exercised"
 
     # Hostile phase: malformed and oversized replies. The user's decision
     # (option B) requires virt-launcher and virt-handler to stay healthy
@@ -356,6 +366,12 @@ print("  guestOSInfo: %s" % json.dumps(status.get("guestOSInfo", {})))
     sleep 2
     LAUNCHER_RESTARTS_BEFORE="$(launcher_pod_restarts)"
     VIRT_HANDLER_RESTARTS_BEFORE="$(virt_handler_restarts)"
+    # NOTE: with the host->guest data path dead, the guest->host replies at
+    # most reach QEMU's chardev flow control (writes block once the buffer
+    # fills) — no host-side parser reads them. The health assertion below is
+    # therefore an OpenShell/cluster stability observation, not a parser
+    # fuzz; the parser itself is NOT EXERCISABLE here (see the handshake
+    # note above).
     # The oversized write is bounded: virtio-serial applies host-side flow
     # control, so a guest write with no host consumer BLOCKS (itself a
     # finding — the guest cannot flood the host unboundedly). A 20s bound
@@ -394,7 +410,7 @@ print("  guestOSInfo: %s" % json.dumps(status.get("guestOSInfo", {})))
     [ "${PHASE_AFTER_HOSTILE}" = "Phase: Ready" ] \
         || fail "sandbox left Ready after hostile guest-agent replies"
     exec_in_sandbox true || fail "exec broken after hostile guest-agent replies"
-    echo "PASS: virt-launcher and virt-handler stayed healthy and the sandbox is unaffected by malformed/oversized guest-agent replies"
+    echo "OBSERVED (stability only): virt-launcher and virt-handler stayed healthy through malformed/oversized guest-agent replies — the host-side parser was not exercised (see above)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -529,6 +545,28 @@ fi
 # ---------------------------------------------------------------------------
 step "P2: the iTCO watchdog (root can arm it; no configurable action)"
 
+# Compile the port-io helper for the guest (static musl). The product guest
+# image does not ship it — this is a probe-time tool.
+echo "compiling the port-io helper (static musl, docker alpine)..."
+docker run --rm \
+    -v "${ROOT}/e2e/kubevirt:/src:ro,Z" \
+    -v "${WORKDIR}:/out:Z" \
+    alpine:3.22 sh -c '
+        apk add --no-cache gcc musl-dev linux-headers >/dev/null 2>&1
+        cc -static -O2 -o /out/port-io /src/port-io.c
+    ' || fail "could not compile the port-io helper"
+[ -s "${WORKDIR}/port-io" ] || fail "the port-io helper did not build"
+echo "port-io built: $(wc -c < "${WORKDIR}/port-io") bytes"
+
+# Stage it into the guest through the exec channel (base64 over stdin).
+stage_port_io() {
+    local sandbox="$1"
+    base64 < "${WORKDIR}/port-io" \
+        | "${OPENSHELL_CLI}" sandbox exec "${sandbox}" -- sh -c \
+            'base64 -d > /tmp/port-io && chmod +x /tmp/port-io && /tmp/port-io read16 0x60' \
+        > /dev/null 2>&1
+}
+
 # Recreate the sandbox (P1 left it in a terminal or ambiguous state).
 "${OPENSHELL_CLI}" sandbox delete "${NAME}" >/dev/null 2>&1 || true
 kubectl delete vm -n "${SANDBOX_NAMESPACE}" -l "${VM_SELECTOR}" \
@@ -540,6 +578,7 @@ sleep 5
     --policy "${DEMO_POLICY}" \
     -- /bin/sleep infinity
 wait_for_phase Ready
+stage_port_io "${NAME}" || fail "could not stage the port-io helper into the guest"
 
 # The stock linux-virt kernel ships iTCO_wdt.ko but cannot bind it (lpc_ich
 # is not built), so /dev/watchdog is absent. A root workload can still load
@@ -548,6 +587,13 @@ wait_for_phase Ready
 # direct port-I/O arm of the TCO timer. RFC wording: "not exposed by the
 # stock kernel; reachable by root; covered by reset detection (P1) and
 # trusted boot (commit 6)".
+#
+# The port-io helper is a PROBE TOOL and does not ship in the guest image:
+# /dev/port is byte-granular and QEMU drops byte writes to the dword/word
+# emulated registers (the PCI config address 0xcf8 and the TCO counters),
+# so the arm needs real OUT instructions from a compiled binary. The probe
+# compiles it (static musl, in a docker alpine container like the image
+# build) and stages it into the guest through the exec channel.
 MODPROBE_RC="$(exec_in_sandbox sh -c 'modprobe iTCO_wdt 2>&1; echo rc=$?' || true)"
 echo "modprobe iTCO_wdt: ${MODPROBE_RC}"
 WD_PRESENT="$(exec_in_sandbox sh -c 'ls -l /dev/watchdog* 2>/dev/null || echo absent')"
@@ -576,7 +622,7 @@ else
     # allowed), so arming only needs the TCO timer: clear TMR_HLT and kick
     # TCO_RLD.
     PORT_ARM="$(exec_in_sandbox sh -c '
-        PIO=/usr/local/bin/port-io
+        PIO=/tmp/port-io
         [ -x "${PIO}" ] || { echo "no port-io helper in the guest image"; exit 9; }
         # PCI config read: 0xcf8 <- 0x8000f840 (00:1f.0 offset 0x40), read 0xcfc.
         "${PIO}" write32 0xcf8 0x8000f840
@@ -599,22 +645,31 @@ else
     echo "${PORT_ARM}" | grep -q "armed:" && ARMED=1
 fi
 if [ "${ARMED}" = "1" ]; then
-    echo "watching for the watchdog reset (up to 120s)..."
+    # The watch must distinguish a RESET from the sandbox's own young boot:
+    # wait until the guest has been up for at least 60s, record the uptime
+    # at arm time, and only count a reboot when the uptime DROPS.
+    echo "waiting for the guest to settle (uptime >= 60s) before arming..."
+    while :; do
+        UPTIME_AT_ARM="$(exec_in_sandbox sh -c 'cut -d. -f1 /proc/uptime' 2>/dev/null || echo 0)"
+        [ "${UPTIME_AT_ARM}" -ge 60 ] && break
+        sleep 5
+    done
+    echo "watching for the watchdog reset (up to 120s, uptime at arm ${UPTIME_AT_ARM}s)..."
     WD_RESET=""
     DEADLINE=$(( $(date +%s) + 120 ))
     PHASE_AT_ARM="$(sandbox_phase)"
     while [ "$(date +%s)" -lt "${DEADLINE}" ]; do
         PHASE="$(sandbox_phase)"
         [ "${PHASE}" != "${PHASE_AT_ARM}" ] && { WD_RESET="${PHASE}"; break; }
-        # A guest-side check: uptime resets when the machine resets.
+        # A guest-side check: the uptime drops when the machine resets.
         UPTIME="$(exec_in_sandbox sh -c 'cut -d. -f1 /proc/uptime' 2>/dev/null || echo 0)"
-        [ "${UPTIME}" -lt 30 ] && { WD_RESET="guest-rebooted(uptime=${UPTIME}s)"; break; }
+        [ "${UPTIME}" -lt "${UPTIME_AT_ARM}" ] && { WD_RESET="guest-rebooted(uptime=${UPTIME}s, was ${UPTIME_AT_ARM}s)"; break; }
         sleep 5
     done
     # Whether or not the machine reset, read the TCO status flags: the
     # timer FIRING is provable even when QEMU's reset gating holds.
     TCO_STATUS="$(exec_in_sandbox sh -c '
-        PIO=/usr/local/bin/port-io
+        PIO=/tmp/port-io
         "${PIO}" write32 0xcf8 0x8000f840
         pmba=$(( $("${PIO}" read32 0xcfc) & 0xfffffff0 ))
         [ "${pmba}" -gt 0 ] || pmba=0x600
@@ -622,7 +677,29 @@ if [ "${ARMED}" = "1" ]; then
     ' 2>/dev/null || true)"
     echo "TCO status after the window: ${TCO_STATUS:-unavailable}"
     if [ -n "${WD_RESET}" ]; then
-        echo "PASS/recorded: the iTCO watchdog reset the guest; control plane observed: ${WD_RESET} — covered by reset detection (P1) and trusted boot"
+        # P2(a): prove the reset ENDS the generation, like P1 — the same
+        # handle-check line and Phase Error, not just a guest-side uptime
+        # observation. The phase flip takes ~25s (the fresh boundary must
+        # attach and be denied first), so poll rather than sample once.
+        P2_PHASE=""
+        P2_DEADLINE=$(( $(date +%s) + 120 ))
+        while [ "$(date +%s)" -lt "${P2_DEADLINE}" ]; do
+            P2_PHASE="$(sandbox_phase)"
+            [ "${P2_PHASE}" = "Phase: Error" ] && break
+            sleep 5
+        done
+        P2_HANDLE_LINE="$(kubectl logs -n "${SANDBOX_NAMESPACE}" \
+            "$(supervisor_pod_name)" --tail=200 2>/dev/null \
+            | grep -a "attachment denied" | tail -1 || true)"
+        echo "control plane after the watchdog reset: phase='${P2_PHASE}'"
+        [ -n "${P2_HANDLE_LINE}" ] \
+            && echo "  supervisor exit reason: ${P2_HANDLE_LINE}" \
+            || echo "  (no attachment-denied line captured; log cadence)"
+        if [ "${P2_PHASE}" = "Phase: Error" ]; then
+            echo "PASS/recorded: the iTCO watchdog reset the guest (guest side: ${WD_RESET}); the control plane ended the generation (Phase Error) — covered by reset detection (P1) and trusted boot"
+        else
+            echo "FINDING: the watchdog reset the guest (${WD_RESET}) but the control plane reports '${P2_PHASE}'; record for the reset-detection design (item 7)"
+        fi
     elif echo "${TCO_STATUS}" | grep -q "TCO1_STS=0x0008"; then
         # TCO1_STS bit 3 = TCO_TIMEOUT (the timer fired); TCO2_STS bits
         # SECOND_TO_STS/BOOT_STS record the double timeout.
