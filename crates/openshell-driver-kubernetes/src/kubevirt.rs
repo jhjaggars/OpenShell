@@ -81,8 +81,46 @@ fn kubevirt_kernel_args(root_hash: &str) -> String {
     if root_hash.is_empty() {
         KUBEVIRT_KERNEL_ARGS.to_string()
     } else {
+        // R2: the binding is operator config interpolated into kernelArgs
+        // — the trust anchor. A malformed value (e.g. containing a space)
+        // would inject kernel arguments, so validate the exact shape
+        // before it reaches the command line.
+        validate_root_hash_binding(root_hash)
+            .expect("the verity binding was validated at config load");
         format!("{KUBEVIRT_KERNEL_ARGS} openshell_verity={root_hash}")
     }
+}
+
+/// Validate a dm-verity root-hash binding: `<blocks>:<hash-start>:<hash>`
+/// with decimal block counts and a 64-character lowercase-hex sha256.
+/// Returns a descriptive error for anything else.
+pub fn validate_root_hash_binding(root_hash: &str) -> Result<(), String> {
+    let parts: Vec<&str> = root_hash.split(':').collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "root_hash must be <blocks>:<hash-start>:<hash> (3 colon-separated \
+             fields), got {root_hash:?}"
+        ));
+    }
+    // The first two fields are decimal block counts (the digest is hex and
+    // validated separately below).
+    for (index, part) in parts.iter().take(2).enumerate() {
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!(
+                "root_hash field {} ({part:?}) must be a decimal block count",
+                index + 1
+            ));
+        }
+    }
+    let hash = parts[2];
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err("root_hash digest must be 64 lowercase hex characters (sha256)".to_string());
+    }
+    Ok(())
 }
 
 /// Resource claim carrying the verified-root binding: the dm-verity root
@@ -1549,12 +1587,43 @@ mod kubevirt_review_tests {
     }
 
     #[test]
+    fn root_hash_binding_format_is_validated() {
+        // R2: the binding is interpolated into kernelArgs; anything that is
+        // not <decimal>:<decimal>:<64 lowercase hex> must be rejected — a
+        // value with a space would inject kernel arguments.
+        let digest = "0123abcd".repeat(8);
+        assert!(validate_root_hash_binding(&format!("179200:179200:{digest}")).is_ok());
+        assert!(
+            validate_root_hash_binding(&format!("179200:179200:{}", "1e89c067".repeat(8))).is_ok()
+        );
+        // Argument injection: a space in any field.
+        assert!(validate_root_hash_binding("179200:179200:0123 init=/bin/sh").is_err());
+        assert!(validate_root_hash_binding("179200 1:2:0123abcd").is_err());
+        // Wrong field counts.
+        assert!(validate_root_hash_binding("179200:0123abcd").is_err());
+        assert!(validate_root_hash_binding("1:2:3:0123abcd").is_err());
+        // Non-decimal counts.
+        assert!(validate_root_hash_binding("0x10:179200:0123abcd").is_err());
+        assert!(validate_root_hash_binding(":179200:0123abcd").is_err());
+        // Digest shape: too short, too long, non-hex, uppercase.
+        assert!(validate_root_hash_binding("1:2:0123").is_err());
+        assert!(
+            validate_root_hash_binding(
+                "1:2:0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd00"
+            )
+            .is_err()
+        );
+        assert!(validate_root_hash_binding("1:2:zz23abcd").is_err());
+        assert!(validate_root_hash_binding("1:2:0123ABCD").is_err());
+    }
+
+    #[test]
     fn kernel_args_carry_verity_binding_when_configured() {
         // Commit 6: the verified boot passes the dm-verity geometry and
         // root hash to the initramfs init on the kernel command line; an
         // empty binding keeps the legacy plain boot.
         assert_eq!(kubevirt_kernel_args(""), KUBEVIRT_KERNEL_ARGS);
-        let args = kubevirt_kernel_args("179200:179200:0123abcd");
+        let args = kubevirt_kernel_args(&format!("179200:179200:{}", "0123abcd".repeat(8)));
         assert!(
             args.contains("openshell_verity=179200:179200:0123abcd"),
             "the verity binding must reach the command line: {args}"
@@ -2142,6 +2211,8 @@ mod kubevirt_review_tests {
         let mut cfg = review_config();
         cfg.kubevirt.workload = crate::config::KubeVirtWorkloadMode::Root;
         cfg.shared_supervisor = None;
+        // R1: the privileged class must carry the verity binding.
+        cfg.kubevirt.root_hash = format!("179200:179200:{}", "0123abcd".repeat(8));
         assert!(cfg.validate_kubevirt_config().is_ok());
 
         cfg.supervisor_topology = Some(crate::SupervisorTopology::Gateway);

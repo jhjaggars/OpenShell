@@ -804,6 +804,27 @@ impl KubernetesComputeConfig {
                     .to_string(),
             );
         }
+        // R1: the root workload class must not boot unverified — without
+        // the dm-verity binding the trusted-boot property silently
+        // disappears (a pre-verity image or a forgotten config would boot
+        // fine and nothing would say so). Sandboxed mode keeps it optional.
+        if self.kubevirt.workload == KubeVirtWorkloadMode::Root
+            && self.kubevirt.root_hash.trim().is_empty()
+        {
+            return Err(
+                "kubevirt workload = \"root\" requires root_hash (the dm-verity \
+                 binding of a verified guest image); the privileged class must not \
+                 boot unverified"
+                    .to_string(),
+            );
+        }
+        // R2: validate the binding's shape wherever it is set (root mode
+        // requires it; sandboxed mode may carry it) — it is interpolated
+        // into kernelArgs, so a malformed value must fail at load, not at
+        // render time.
+        if !self.kubevirt.root_hash.trim().is_empty() {
+            crate::kubevirt::validate_root_hash_binding(self.kubevirt.root_hash.trim())?;
+        }
         Ok(())
     }
 
@@ -1301,6 +1322,55 @@ fn validate_provider_spiffe_workload_api_socket_path_value(
 
 #[cfg(test)]
 mod tests {
+
+    fn kubevirt_config(workload: KubeVirtWorkloadMode, root_hash: &str) -> KubernetesComputeConfig {
+        // Reach the kubevirt validation path (the default runtime is the
+        // pod mode, which skips it entirely).
+        KubernetesComputeConfig {
+            runtime: KubernetesRuntimeMode::KubeVirt,
+            grpc_endpoint: "https://gateway:443".to_string(),
+            kubevirt: KubeVirtConfig {
+                guest_image: "kvpoc/openshell-sandbox-vm:dev".to_string(),
+                workload,
+                root_hash: root_hash.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn root_workload_requires_verity_binding() {
+        // R1: the privileged class must not boot unverified — an empty
+        // root_hash with workload = "root" fails validation, while a
+        // binding passes and sandboxed mode stays optional.
+        let error = kubevirt_config(KubeVirtWorkloadMode::Root, "")
+            .validate_configuration()
+            .expect_err("root mode without root_hash must fail");
+        assert!(error.contains("root_hash"), "{error}");
+        kubevirt_config(
+            KubeVirtWorkloadMode::Root,
+            &format!("179200:179200:{}", "0123abcd".repeat(8)),
+        )
+        .validate_configuration()
+        .expect("root mode with a binding passes");
+        kubevirt_config(KubeVirtWorkloadMode::Sandboxed, "")
+            .validate_configuration()
+            .expect("sandboxed mode keeps the binding optional");
+    }
+
+    #[test]
+    fn malformed_verity_binding_fails_validation_in_any_mode() {
+        // R2 at the config boundary: a malformed binding is rejected even
+        // in sandboxed mode (it would be interpolated into kernelArgs).
+        let error = kubevirt_config(
+            KubeVirtWorkloadMode::Sandboxed,
+            "179200:179200:0123 init=/bin/sh",
+        )
+        .validate_configuration()
+        .expect_err("a space in the binding must fail validation");
+        assert!(error.contains("root_hash"), "{error}");
+    }
     use super::*;
     use BTreeMap as HashMap;
 

@@ -6589,6 +6589,14 @@ impl KubernetesComputeDriver {
                 .map(|shared| shared.config().clone()),
         };
         let mut reconcile_tick = tokio::time::interval(FENCE_RECONCILE_INTERVAL);
+        // R3: a root workload whose generation ended terminally keeps
+        // executing unsupervised (fenced, but burning CPU and writing the
+        // workspace PVC) while the user sees Error — the watch halts the
+        // VM (runStrategy Halted, a trusted control-plane action) when a
+        // root-mode sandbox reaches SupervisorFailed (which covers the
+        // reset-detection path).
+        let halt_ended_root_workloads =
+            self.config.kubevirt.workload == crate::config::KubeVirtWorkloadMode::Root;
         tokio::spawn(async move {
             async fn emit(
                 vm: DynamicObject,
@@ -6596,6 +6604,7 @@ impl KubernetesComputeDriver {
                 vmi_phases: &std::collections::HashMap<String, (Option<String>, Option<i64>)>,
                 client: &Client,
                 tx: &mpsc::Sender<Result<WatchSandboxesEvent, KubernetesDriverError>>,
+                halt_ended_root_workloads: bool,
             ) -> bool {
                 let Some(kube_name) = vm.metadata.name.clone() else {
                     return true;
@@ -6612,7 +6621,7 @@ impl KubernetesComputeDriver {
                     .cloned();
                 let Ok((_, sandbox)) = crate::kubevirt::sandbox_from_vm_object_with_runtime(
                     namespace,
-                    vm,
+                    vm.clone(),
                     vmi_state.0.as_deref(),
                     supervisor_failure.as_deref(),
                     fence_restored.as_deref(),
@@ -6620,6 +6629,56 @@ impl KubernetesComputeDriver {
                 ) else {
                     return true;
                 };
+                // R3: halt the VM when a root-mode generation ended while
+                // the guest keeps running (SupervisorFailed with a live
+                // VMI — the P1/P2 reset-detection outcome). Already-halted
+                // VMs and terminal VM failures (the guest is dead) are
+                // skipped.
+                if halt_ended_root_workloads && supervisor_failure.is_some() {
+                    let halted = vm
+                        .data
+                        .get("spec")
+                        .and_then(|spec| spec.get("runStrategy"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("Halted");
+                    let vmi_running = matches!(vmi_state.0.as_deref(), Some("Running"));
+                    if !halted && vmi_running {
+                        let patch = serde_json::json!({
+                            "spec": {"runStrategy": "Halted"}
+                        });
+                        let vm_api = crate::kubevirt::virtual_machine_api(client, namespace);
+                        match tokio::time::timeout(
+                            KUBE_API_TIMEOUT,
+                            vm_api.patch(
+                                &kube_name,
+                                &PatchParams::default(),
+                                &Patch::Merge(&patch),
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => {
+                                warn!(
+                                    sandbox = %kube_name,
+                                    "halted root-workload VM after terminal generation end (R3)"
+                                );
+                            }
+                            Ok(Err(error)) => {
+                                warn!(
+                                    sandbox = %kube_name,
+                                    %error,
+                                    "could not halt root-workload VM after terminal generation end (R3)"
+                                );
+                            }
+                            Err(_) => {
+                                warn!(
+                                    sandbox = %kube_name,
+                                    "timed out halting root-workload VM after terminal generation end (R3)"
+                                );
+                            }
+                        }
+                    }
+                }
                 let event = WatchSandboxesEvent {
                     payload: Some(watch_sandboxes_event::Payload::Sandbox(
                         WatchSandboxesSandboxEvent {
@@ -6639,7 +6698,7 @@ impl KubernetesComputeDriver {
                 tokio::select! {
                     event = vm_stream.next() => match event {
                         Some(Event::Apply(obj) | Event::InitApply(obj)) => {
-                            if !emit(obj, &namespace, &vmi_phases, &watch_client, &tx).await {
+                            if !emit(obj, &namespace, &vmi_phases, &watch_client, &tx, halt_ended_root_workloads).await {
                                 break;
                             }
                         }
@@ -6701,7 +6760,7 @@ impl KubernetesComputeDriver {
                                 if let Ok(vm) =
                                     tokio::time::timeout(KUBE_API_TIMEOUT, vm_api.get(&name)).await
                                     && let Ok(vm) = vm
-                                    && !emit(vm, &namespace, &vmi_phases, &watch_client, &tx).await
+                                    && !emit(vm, &namespace, &vmi_phases, &watch_client, &tx, halt_ended_root_workloads).await
                                 {
                                     break;
                                 }
@@ -6769,6 +6828,7 @@ impl KubernetesComputeDriver {
                                     &vmi_phases,
                                     &watch_client,
                                     &tx,
+                                    halt_ended_root_workloads,
                                 )
                                 .await
                                 {
