@@ -2755,12 +2755,30 @@ fn validate_policy_enforceable_in_privileged_mode(
     {
         unenforceable.push("process (run_as_user/run_as_group)");
     }
+    // Per-binary selectors are also unenforceable: a root workload cannot be
+    // pinned to a binary identity in-guest, so an authored binaries list
+    // promises a restriction that will never hold (it would be silently
+    // ignored through require_binary_identity=false).
+    let binary_scoped: Vec<&str> = policy
+        .network_policies
+        .iter()
+        .filter(|(_, rule)| !rule.binaries.is_empty())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !binary_scoped.is_empty() {
+        unenforceable.push("network per-binary selectors (binaries)");
+    }
     if unenforceable.is_empty() {
         Ok(())
     } else {
         Err(miette::miette!(
-            "privileged (root-workload) sandboxes cannot enforce {} section(s);              remove them from the policy — the network fence and supervisor-side              policy evaluation are the boundary for a root workload",
-            unenforceable.join(", ")
+            "privileged (root-workload) sandboxes cannot enforce {} section(s); remove them from the policy — the network fence and supervisor-side policy evaluation are the boundary for a root workload{}",
+            unenforceable.join(", "),
+            if binary_scoped.is_empty() {
+                String::new()
+            } else {
+                format!(" (per-binary rules: {})", binary_scoped.join(", "))
+            }
         ))
     }
 }
@@ -2916,7 +2934,12 @@ async fn load_policy_with_gateway(
             landlock: config.landlock,
             process: config.process,
         };
-        enrich_sandbox_baseline_paths(&mut policy);
+        // Skipped in privileged (root-workload) mode: the enrichment is a
+        // Landlock accommodation and would inject filesystem sections the
+        // privileged policy validation rejects (B9).
+        if !privileged_workload {
+            enrich_sandbox_baseline_paths(&mut policy);
+        }
         // File mode has no operator-registered middleware to connect.
         return Ok((
             policy,
@@ -3082,7 +3105,18 @@ async fn load_policy_with_gateway(
             // a sandbox-sourced policy is written back. The gateway refuses
             // every sandbox policy write while a global policy is active, so a
             // global policy keeps the added paths in this process only.
-            let enriched = enrich_proto_baseline_paths(&mut proto_policy);
+            //
+            // Skipped entirely in privileged (root-workload) mode: the
+            // enrichment exists to keep Landlock from blocking proxy baseline
+            // paths, a root workload has no Landlock, and a synced-back
+            // filesystem section would be rejected by the privileged policy
+            // validation below (B9 — the supervisor was enriching its own
+            // root policy and then rejecting it).
+            let enriched = if privileged_workload {
+                false
+            } else {
+                enrich_proto_baseline_paths(&mut proto_policy)
+            };
             let sync_policy = proto_sync_payload_for_enriched_policy(&proto_policy, enriched)
                 .filter(|_| snapshot.policy_source == openshell_core::proto::PolicySource::Sandbox);
             if let Some(sync_policy) = sync_policy {
@@ -5272,6 +5306,9 @@ network_policies:
         report_error: Option<tonic::Code>,
         pending_snapshot: bool,
         pending_acceptance: bool,
+        /// Policies written back through sync, for asserting no privileged
+        /// policy is enriched and synced.
+        synced: Arc<std::sync::Mutex<Vec<openshell_core::proto::SandboxPolicy>>>,
     }
 
     impl StartupGateway for TestStartupGateway {
@@ -5300,9 +5337,10 @@ network_policies:
         async fn sync(
             &self,
             _sandbox: &str,
-            _policy: &openshell_core::proto::SandboxPolicy,
+            policy: &openshell_core::proto::SandboxPolicy,
             _workspace: &str,
         ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
+            self.synced.lock().unwrap().push(policy.clone());
             self.snapshot("").await
         }
         async fn report(
@@ -5385,6 +5423,7 @@ network_policies:
             report_error: None,
             pending_snapshot: false,
             pending_acceptance: false,
+            synced: Arc::default(),
         };
         let active_gateway = gateway.clone();
         let handle = tokio::spawn(async move {
@@ -5526,6 +5565,7 @@ network_policies:
                 report_error: None,
                 pending_snapshot,
                 pending_acceptance: !pending_snapshot,
+                synced: Arc::default(),
             };
             let result = timeout(
                 Duration::from_mins(2),
@@ -5604,6 +5644,7 @@ network_policies:
                 report_error,
                 pending_snapshot: false,
                 pending_acceptance: false,
+                synced: Arc::default(),
             };
             let result = timeout(
                 Duration::from_secs(1),
@@ -5651,6 +5692,7 @@ network_policies:
             report_error: None,
             pending_snapshot: false,
             pending_acceptance: false,
+            synced: Arc::default(),
         };
         let active_gateway = gateway.clone();
         let handle = tokio::spawn(async move {
@@ -7887,5 +7929,108 @@ network_policies:
             error,
             GatewayRuntimeReloadError::PolicyValidation(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn privileged_startup_keeps_network_policy_unchanged_and_unsynced() {
+        // B9 regression: the supervisor used to enrich its own root policy
+        // with baseline filesystem paths, sync the enriched policy back to
+        // the gateway, and then reject the filesystem section it just
+        // created. A network-only policy delivered in root mode must stay
+        // network-only, never sync back, and pass validation.
+        use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
+
+        let policy = network_only_policy();
+        assert!(
+            policy.filesystem.is_none() && policy.landlock.is_none(),
+            "fixture must be network-only"
+        );
+        let (reports, mut reported) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = TestStartupGateway {
+            desired: Arc::new(std::sync::Mutex::new(settings_poll_result(
+                Some(policy.clone()),
+                1,
+                PolicySource::Sandbox,
+            ))),
+            reports,
+            reject_next_accept: Arc::new(AtomicBool::new(false)),
+            snapshot_error: None,
+            report_error: None,
+            pending_snapshot: false,
+            pending_acceptance: false,
+            synced: Arc::default(),
+        };
+        let synced = gateway.synced.clone();
+        let active_gateway = gateway.clone();
+        let (loaded, _engine, retained, ..) = timeout(
+            Duration::from_secs(30),
+            load_policy_with_gateway(
+                Some("sandbox-id".to_string()),
+                Some("sandbox".to_string()),
+                Some(test_gateway()),
+                None,
+                None,
+                &openshell_extension_core::ExtensionCredentialStore::new(),
+                LocalPolicyIdentity::Required,
+                None,
+                true,
+                Some(ImagePolicyDiscovery::Missing),
+                &active_gateway,
+            ),
+        )
+        .await
+        .expect("privileged startup with a network-only policy must succeed")
+        .expect("startup result");
+        assert_eq!(
+            reported.recv().await,
+            Some(ConfigurationAdmissionState::Pending)
+        );
+        assert_eq!(
+            reported.recv().await,
+            Some(ConfigurationAdmissionState::Accepted)
+        );
+
+        // The effective policy stays network-only: no enrichment ran.
+        let retained = retained.expect("retained proto policy");
+        assert!(
+            retained.filesystem.is_none(),
+            "privileged policy must not be enriched with filesystem sections"
+        );
+        assert!(
+            loaded.filesystem.read_only.is_empty() && loaded.filesystem.read_write.is_empty(),
+            "the compiled policy stays network-only"
+        );
+        // Nothing was synced back: an unenriched policy is never written.
+        assert!(
+            synced.lock().unwrap().is_empty(),
+            "privileged startup must not sync an enriched policy back to the gateway"
+        );
+    }
+
+    #[test]
+    fn privileged_policy_validation_rejects_per_binary_selectors() {
+        // Per-binary selectors are unenforceable for a root workload and
+        // must be rejected rather than silently ignored through
+        // require_binary_identity=false.
+        let mut policy = network_only_policy();
+        let rule = policy.network_policies.get_mut("web").expect("web rule");
+        rule.binaries = vec![openshell_core::proto::NetworkBinary {
+            path: "/usr/bin/busybox".into(),
+        }];
+        let error = validate_policy_enforceable_in_privileged_mode(&policy)
+            .expect_err("per-binary selectors must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("binaries"),
+            "message names the section: {message}"
+        );
+        assert!(message.contains("web"), "message names the rule: {message}");
+
+        // Without binaries the same policy passes.
+        let mut policy = network_only_policy();
+        let rule = policy.network_policies.get_mut("web").expect("web rule");
+        rule.binaries = Vec::new();
+        validate_policy_enforceable_in_privileged_mode(&policy)
+            .expect("network-only policy without binaries passes");
     }
 }

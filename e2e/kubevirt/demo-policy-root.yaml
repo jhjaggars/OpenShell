@@ -11,11 +11,10 @@
 #   enforcement is meaningless against a root workload (the fence and
 #   supervisor-side policy evaluation are the boundary), and the
 #   supervisor rejects a root-mode policy that authors them.
-# - No binaries lists. The root workload runs with
-#   require_binary_identity=false (per-binary identity is unenforceable
-#   in-guest), so network policies are endpoint/L7 scoped and
-#   policy.binaries are ignored; they are omitted here rather than
-#   promising restrictions that cannot hold.
+# - No binaries lists. Per-binary identity is unenforceable in-guest for
+#   a root workload, so the supervisor REJECTS any policy that authors
+#   them (require_binary_identity=false would otherwise silently ignore
+#   the restriction); they are omitted here.
 version: 1
 
 network_policies:
