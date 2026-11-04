@@ -59,13 +59,19 @@ FENCE_PREFIX="openshell-kubevirt-fence-"
 step() { echo; echo "=== $* ==="; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-# Tear down the sandbox when a step fails: without this the VM, VMI, and
+# The single EXIT trap. A second `trap ... EXIT` later in the script would
+# REPLACE this one (bash keeps one EXIT trap), which is exactly how the
+# failure teardown was silently lost before — keep every exit handling
+# here.
+#
+# On failure, tear down the sandbox: without this the VM, VMI, and
 # supervisor Pod are left running after the demo's gateway exits, and only
 # a manual `kubectl delete vm` cascades them away. The CLI delete runs
 # first (while the gateway is still up); the labelled kubectl deletions
 # are the gateway-independent backstop — owner references cascade from
 # the VM, and the labelled companions cover what the VM does not own.
-cleanup_on_failure() {
+# On every exit (success or failure), remove the scratch directory.
+demo_exit_trap() {
     local rc=$?
     if [ "${rc}" -ne 0 ]; then
         echo >&2
@@ -77,12 +83,12 @@ cleanup_on_failure() {
             -l "${VM_SELECTOR}" --ignore-not-found >/dev/null 2>&1 || true
         echo "teardown complete" >&2
     fi
+    rm -rf "${WORKDIR:-}"
     exit "${rc}"
 }
-trap cleanup_on_failure EXIT
+trap demo_exit_trap EXIT
 
 WORKDIR="$(mktemp -d /tmp/kvpoc-demo-XXXXXX)"
-trap 'rm -rf "${WORKDIR}"' EXIT
 
 sandbox_phase() {
     "${OPENSHELL_CLI}" sandbox get "${NAME}" 2>/dev/null | grep -a "Phase:" | head -1 \
@@ -425,9 +431,46 @@ fi
 grep -q "spec drifted" ${WORKDIR}/drift.log \
     || { cat ${WORKDIR}/drift.log >&2; fail "start failure was not the drift error"; }
 echo "spec drift rejected: $(grep -a 'drifted' ${WORKDIR}/drift.log | head -1 | tr -s ' ')"
-kubectl patch netpol -n "${SANDBOX_NAMESPACE}" "${FENCE}" --type=json \
-    -p '[{"op":"test","path":"/spec/egress/1","value":{}},{"op":"remove","path":"/spec/egress/1"}]' \
-    >/dev/null
+# Remove the drift idempotently. The M1 reconciler may re-fence (restore
+# the rendered spec) before this script removes its own drift entry, and
+# the previous test+remove patch then failed on the missing path ("The
+# request is invalid"). Wait briefly for the reconciler's restore — which
+# also demonstrates M1 drift repair live — and only patch the drift away
+# ourselves if the reconciler has not acted yet.
+fence_drift_present() {
+    # The demo's drift is a trailing empty egress entry.
+    [ "$(kubectl get netpol -n "${SANDBOX_NAMESPACE}" "${FENCE}" \
+        -o jsonpath='{.spec.egress}' 2>/dev/null | python3 -c \
+        'import json,sys
+e = json.load(sys.stdin)
+print(len(e) >= 2 and e[-1] == {})')" = "True" ]
+}
+RECONCILED=1
+DRIFT_DEADLINE=$(( $(date +%s) + 60 ))
+while fence_drift_present; do
+    if [ "$(date +%s)" -ge "${DRIFT_DEADLINE}" ]; then
+        RECONCILED=0
+        break
+    fi
+    sleep 3
+done
+if [ "${RECONCILED}" = "1" ]; then
+    echo "M1 reconciler re-fenced the drifted fence (spec restored)"
+else
+    # The reconciler has not acted; remove the demo's own drift entry.
+    # test/remove need the concrete index (the `-` append suffix is only
+    # valid for `add`), so compute the last egress position first —
+    # fence_drift_present already confirmed it is the empty drift entry.
+    EGRESS_LEN="$(kubectl get netpol -n "${SANDBOX_NAMESPACE}" "${FENCE}" \
+        -o jsonpath='{.spec.egress}' 2>/dev/null | python3 -c \
+        'import json,sys; print(len(json.load(sys.stdin)))')"
+    LAST_IDX=$(( EGRESS_LEN - 1 ))
+    kubectl patch netpol -n "${SANDBOX_NAMESPACE}" "${FENCE}" --type=json \
+        -p "[{\"op\":\"test\",\"path\":\"/spec/egress/${LAST_IDX}\",\"value\":{}},{\"op\":\"remove\",\"path\":\"/spec/egress/${LAST_IDX}\"}]" \
+        >/dev/null \
+        || fail "could not remove the demo's drift entry from the fence"
+    echo "removed the demo's drift entry (reconciler had not re-fenced yet)"
+fi
 kubectl label netpol -n "${SANDBOX_NAMESPACE}" "${FENCE}" \
     kvpoc-demo-label-edit=1 --overwrite >/dev/null
 "${OPENSHELL_CLI}" sandbox start "${NAME}"
