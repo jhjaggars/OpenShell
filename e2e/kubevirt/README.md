@@ -109,6 +109,7 @@ OCI sandbox images as VM disks (the guest image is purpose-built). See
 | File | Purpose |
 |---|---|
 | `build-guest-image.sh` | Builds the `kvpoc/openshell-sandbox-vm:dev` containerDisk (Alpine rootfs + static musl supervisor + guest init + kernel, repacked initramfs, KubeVirt's `container-disk` helper). |
+| `run-probes.sh` | Root-workload attack-surface probes (run via `demo.sh --probes`): in-guest reset via the reboot syscall and the iTCO watchdog, a fake qemu-guest-agent over the virtio-serial channel, virtiofsd privileged-operation surface (chown past the idmap, mknod, setuid), and the launcher-netns listener audit. Outcomes are recorded as findings for the RFC; only posture invariants (the fake agent must not affect the sandbox; a reset must not pass unnoticed) are asserted. |
 | `demo-policy-root.yaml` | Root-workload variant of the acceptance policy: same network semantics as `demo-policy.yaml` without the `filesystem_policy`, `landlock`, and `process` sections (rejected for root workloads — unenforceable in-guest) and without `binaries` lists (binary identity is not required in root mode). `run-demo.sh` selects it automatically for `OPENSHELL_KVPOC_WORKLOAD=root`. |
 | `guest-init.sh` | Guest PID-1 init (baked into the image). |
 | `demo.sh` | Starts a host gateway (TLS) against the `kvpoc` cluster and registers it as the CLI's mTLS gateway; `--demo` then runs `run-demo.sh` against it. Defaults to the dedicated supervisor topology; `OPENSHELL_KVPOC_TOPOLOGY=gateway` selects the shared one. |

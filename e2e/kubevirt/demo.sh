@@ -15,10 +15,14 @@
 #   - kvpoc k3d cluster with KubeVirt deployed and the guest image imported
 #   - e2e/kubevirt/build-guest-image.sh has been run
 #
-# Usage: e2e/kubevirt/demo.sh [--demo]
-#   --demo  after the gateway starts, run the create/exec/teardown demo
-#           (requires the gateway to stay in the foreground; the demo runs
-#           against it from a background shell)
+# Usage: e2e/kubevirt/demo.sh [--demo | --probes]
+#   --demo    after the gateway starts, run the create/exec/teardown demo
+#             (requires the gateway to stay in the foreground; the demo runs
+#             against it from a background shell)
+#   --probes  after the gateway starts, run the root-workload attack-surface
+#             probes (e2e/kubevirt/run-probes.sh): in-guest reset (reboot
+#             syscall + iTCO watchdog), fake qemu-guest-agent, virtiofsd
+#             privileged operations, and the launcher-netns listener audit
 
 set -euo pipefail
 
@@ -34,7 +38,17 @@ SANDBOX_NAMESPACE="kvpoc-sandboxes"
 GUEST_IMAGE="${OPENSHELL_KVPOC_GUEST_IMAGE:-kvpoc/openshell-sandbox-vm:dev}"
 
 RUN_DEMO=0
-[ "${1:-}" = "--demo" ] && RUN_DEMO=1
+RUN_PROBES=0
+case "${1:-}" in
+    --demo) RUN_DEMO=1 ;;
+    --probes) RUN_PROBES=1 ;;
+esac
+# The probes exercise the root workload mode by definition; the gateway's
+# kubevirt config must select it at render time, so set the variable here
+# (before the gateway TOML heredoc below reads it).
+if [ "${RUN_PROBES}" = "1" ]; then
+    export OPENSHELL_KVPOC_WORKLOAD=root
+fi
 
 # Supervisor topology for this run: "dedicated" (the default — one
 # supervisor Pod per sandbox, matching the pod path's default) or "gateway"
@@ -250,7 +264,7 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 
-if [ "${RUN_DEMO}" = "1" ]; then
+if [ "${RUN_DEMO}" = "1" ] || [ "${RUN_PROBES}" = "1" ]; then
     # The gateway topology's supervisor Deployment must attach to the
     # gateway's assignment stream before the first create: the token the
     # gateway mints is only served once the replica is attached, and a
@@ -276,10 +290,17 @@ if [ "${RUN_DEMO}" = "1" ]; then
             exit 1
         fi
     fi
-    "${ROOT}/e2e/kubevirt/run-demo.sh" || {
-        kill "${GATEWAY_PID}" 2>/dev/null || true
-        exit 1
-    }
+    if [ "${RUN_PROBES}" = "1" ]; then
+        "${ROOT}/e2e/kubevirt/run-probes.sh" || {
+            kill "${GATEWAY_PID}" 2>/dev/null || true
+            exit 1
+        }
+    else
+        "${ROOT}/e2e/kubevirt/run-demo.sh" || {
+            kill "${GATEWAY_PID}" 2>/dev/null || true
+            exit 1
+        }
+    fi
     kill "${GATEWAY_PID}" 2>/dev/null || true
     trap - EXIT
     wait "${GATEWAY_PID}" 2>/dev/null || true
