@@ -114,6 +114,7 @@ pub async fn spawn_workload(
         tls_environment_mode,
         &provider_env,
         otlp_relay_active,
+        privileged,
     )
     .wrap_err("spawn delegated workload process")?;
     #[cfg(not(target_os = "linux"))]
@@ -127,6 +128,7 @@ pub async fn spawn_workload(
         tls_environment_mode,
         &provider_env,
         otlp_relay_active,
+        privileged,
     )?;
 
     entrypoint_pid.store(handle.pid(), Ordering::Release);
