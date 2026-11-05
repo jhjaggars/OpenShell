@@ -2006,6 +2006,7 @@ fn build_connect_allow_ocsf_event(
         .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
         .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
         .firewall_rule(policy, "opa")
+        .guest_sourced()
         .message(format!("{connect_msg} allowed {host}:{port}"))
         .build()
 }
@@ -2235,6 +2236,7 @@ fn build_connect_destination_deny_ocsf_event(
         .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
         .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
         .firewall_rule("-", "ssrf")
+        .guest_sourced()
         .message(message)
         .status_detail(&denial.reason)
         .build()

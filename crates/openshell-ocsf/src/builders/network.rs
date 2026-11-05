@@ -201,6 +201,14 @@ impl<'a, EndpointState> NetworkActivityBuilder<'a, EndpointState> {
         self
     }
 
+    /// Mark the event's payload as guest-sourced: the data originated
+    /// from the in-guest boundary (untrusted after start in root-workload
+    /// mode), not from a supervisor-verified observation.
+    #[must_use]
+    pub fn guest_sourced(self) -> Self {
+        self.unmapped("data_origin", "guest")
+    }
+
     #[must_use]
     pub fn activity(mut self, id: ActivityId) -> Self {
         self.activity = id;
@@ -333,5 +341,76 @@ mod tests {
         assert_eq!(json["container"]["name"], "my-sandbox");
         assert_eq!(json["device"]["hostname"], "sandbox-abc123");
         assert_eq!(json["is_src_dst_assignment_known"], true);
+    }
+}
+
+#[cfg(test)]
+mod guest_sourced_tests {
+    use super::*;
+    use crate::{ActivityId, SeverityId, StatusId};
+
+    #[test]
+    fn guest_sourced_sets_the_data_origin_field() {
+        use crate::{ActionId, DispositionId, Endpoint};
+        let event = NetworkActivityBuilder::new(crate::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .dst_endpoint(Endpoint::from_domain("example.com", 443))
+            .guest_sourced()
+            .message("test")
+            .build();
+        let json = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(
+            json.get("unmapped")
+                .and_then(|u| u.get("data_origin"))
+                .and_then(serde_json::Value::as_str),
+            Some("guest"),
+            "the marking must appear as unmapped.data_origin=guest: {json}"
+        );
+    }
+
+    #[test]
+    fn guest_sourced_appears_in_shorthand_format() {
+        use crate::{ActionId, DispositionId, Endpoint, StatusId};
+        let event = NetworkActivityBuilder::new(crate::ctx::ctx())
+            .activity(ActivityId::Refuse)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain("example.org", 53))
+            .status_detail("policy_dns_ineligible")
+            .guest_sourced()
+            .message("Policy DNS refused a name")
+            .build();
+        let shorthand = event.format_shorthand();
+        assert!(
+            shorthand.contains("data_origin:guest"),
+            "the shorthand format must render the guest-sourced marking: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn unmarked_events_have_no_data_origin() {
+        use crate::{ActionId, DispositionId, Endpoint};
+        let event = NetworkActivityBuilder::new(crate::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .dst_endpoint(Endpoint::from_domain("example.com", 443))
+            .message("test")
+            .build();
+        let json = serde_json::to_value(&event).expect("serialize");
+        assert!(
+            json.get("unmapped")
+                .and_then(|u| u.get("data_origin"))
+                .is_none(),
+            "unmarked events must not carry data_origin: {json}"
+        );
     }
 }

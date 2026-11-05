@@ -284,6 +284,10 @@ impl OcsfEvent {
                     (false, true) => format!(" {action}"),
                     (false, false) => format!(" {action}{arrow}"),
                 };
+                // Unmapped fields (including the guest-sourced provenance
+                // marker) render after the reason so operators can see the
+                // data origin alongside the decision.
+                let unmapped_ctx = unmapped_context(&e.base, false);
                 // Most network messages duplicate the structured action and
                 // destination shown above. Transparent TCP correlation is the
                 // exception: its message intentionally carries the logical,
@@ -298,7 +302,9 @@ impl OcsfEvent {
                 } else {
                     String::new()
                 };
-                format!("NET:{activity} {sev}{detail}{rule_ctx}{reason_ctx}{message_ctx}")
+                format!(
+                    "NET:{activity} {sev}{detail}{rule_ctx}{reason_ctx}{unmapped_ctx}{message_ctx}"
+                )
             }
 
             Self::HttpActivity(e) => {

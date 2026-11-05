@@ -163,6 +163,14 @@ impl<'a, Context> HttpActivityBuilder<'a, Context> {
         self
     }
 
+    /// Mark the event's payload as guest-sourced: the data originated
+    /// from the in-guest boundary (untrusted after start in root-workload
+    /// mode), not from a supervisor-verified observation.
+    #[must_use]
+    pub fn guest_sourced(self) -> Self {
+        self.unmapped("data_origin", "guest")
+    }
+
     #[must_use]
     pub fn activity(mut self, id: ActivityId) -> Self {
         self.activity = id;

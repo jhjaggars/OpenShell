@@ -505,6 +505,7 @@ fn build_dns_denial_event(
         .status(StatusId::Failure)
         .dst_endpoint(dns_query_endpoint(name))
         .status_detail(detail)
+        .guest_sourced()
         .message(message)
         .build()
 }
@@ -557,6 +558,7 @@ fn build_dns_failure_event(
         .status(StatusId::Failure)
         .dst_endpoint(dns_query_endpoint(name))
         .status_detail(detail)
+        .guest_sourced()
         .unmapped("normalized_name", name.as_str())
         .unmapped("address_family", family.as_str())
         .unmapped(
@@ -607,6 +609,7 @@ fn build_observation_publication_event(
         .unmapped("policy_generation", record.policy_generation)
         .unmapped("mapping_generation", record.mapping_generation)
         .unmapped("mapping_id", record.mapping_id.to_string())
+        .guest_sourced()
         .message(format!(
             "Policy DNS staged unapproved name {} synthetic={} for TCP policy review",
             record.normalized_name, record.synthetic_address
@@ -652,6 +655,7 @@ fn build_mapping_publication_event(record: &ResolvedEndpointRecord) -> openshell
         .unmapped("policy_generation", record.policy_generation)
         .unmapped("mapping_generation", record.mapping_generation)
         .unmapped("mapping_id", mapping_id)
+        .guest_sourced()
         .message(message)
         .build()
 }
@@ -1020,7 +1024,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
 
         assert_eq!(
             event.format_shorthand(),
-            "NET:REFUSE [MED] DENIED blocked.invalid [reason:policy_dns_ineligible]"
+            "NET:REFUSE [MED] DENIED blocked.invalid [reason:policy_dns_ineligible] [data_origin:guest]"
         );
         assert_eq!(
             serde_json::to_value(event).unwrap()["dst_endpoint"],
