@@ -31,7 +31,9 @@
 //! QUIC/UDP (other than DNS) is never relayed and is blocked by the fence.
 
 use std::fmt::Write as _;
+use std::mem::size_of_val;
 use std::net::{IpAddr, SocketAddr};
+use std::os::fd::AsRawFd as _;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -291,11 +293,46 @@ async fn serve_relayed_connection(
     let decision = tokio::task::spawn_blocking(move || decision_rx.recv())
         .await
         .unwrap_or(Err(std::sync::mpsc::RecvError));
-    if decision == Ok(TcpOpenDecision::RelayReady)
-        && let Ok(stream) = stream.into_std()
-    {
-        let _ = relay_tx.send(Ok(stream));
+    if decision == Ok(TcpOpenDecision::RelayReady) {
+        if let Ok(stream) = stream.into_std() {
+            let _ = relay_tx.send(Ok(stream));
+        }
+    } else {
+        // Denied: close with an immediate RST (SO_LINGER 0) so the client
+        // fails fast on the first read/write instead of waiting out its
+        // timeout. The workload completed the TCP handshake with the local
+        // relay; the sandboxed denial completes the intercepted connect
+        // with a refusal, and the RST is the relay-mode equivalent.
+        reset_stream(&stream);
+        drop(stream);
     }
+}
+
+/// Close a TCP stream with an immediate `RST`: set `SO_LINGER` with a zero
+/// timeout, then close. The close converts to an `RST` instead of a `FIN`,
+/// so a denied client fails fast on the first read/write.
+#[allow(
+    unsafe_code,
+    reason = "setsockopt with a plain repr(C) linger struct; the pointer and size are scoped here"
+)]
+fn reset_stream(stream: &tokio::net::TcpStream) {
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    // SAFETY: `libc::linger` is a plain repr(C) struct of two scalars;
+    // `setsockopt` reads exactly its size from the pointer.
+    let _ = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            std::ptr::addr_of!(linger).cast(),
+            u32::try_from(size_of_val(&linger)).unwrap_or(u32::MAX),
+        )
+    };
+    // The caller drops the stream after this returns; the linger option
+    // converts that close into an RST.
 }
 
 struct ActiveOpenSlot(Arc<AtomicUsize>);
