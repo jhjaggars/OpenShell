@@ -284,8 +284,11 @@ exec_in_sandbox sh -c \
 grep -q "L4 ALLOW: connected" ${WORKDIR}/l4.log \
     || fail "L4 connect to the allowed host was denied"
 # Data-level denial check: the transparent relay completes the TCP
-# handshake locally before the supervisor's decision, so nc -z (handshake
-# only) cannot see a denial — a data transfer must fail instead.
+# handshake locally before the supervisor's decision, so handshake-only
+# tools (nc -z, curl --connect-timeout without a transfer) cannot see a
+# denial — the connection is accepted then reset on first read/write. A
+# data transfer must fail instead. This is not an enforcement gap: zero
+# upstream connections are made for denied destinations.
 if exec_in_sandbox sh -c 'wget -q -T 8 -O /dev/null http://example.org/'; then
     fail "L4 data transfer to a non-allowed host succeeded"
 fi
