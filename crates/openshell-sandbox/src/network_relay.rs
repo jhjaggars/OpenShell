@@ -152,7 +152,15 @@ table ip6 {NFT_TABLE} {{
             .stdin
             .as_mut()
             .expect("piped stdin exists before wait");
-        stdin.write_all(ruleset.as_bytes())?;
+        if let Err(error) = stdin.write_all(ruleset.as_bytes()) {
+            // The ruleset write failed after registration: release the
+            // PID so the reaper can reap the exiting child (otherwise it
+            // stays registered forever and the wait below never runs).
+            if let Some(managed) = registered {
+                crate::managed_children::unregister(managed);
+            }
+            return Err(error);
+        }
     }
     let output = child.wait_with_output();
     if let Some(managed) = registered {

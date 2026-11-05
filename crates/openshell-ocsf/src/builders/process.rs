@@ -22,6 +22,7 @@ pub struct ProcessActivityBuilder<'a> {
     launch_type: Option<LaunchTypeId>,
     exit_code: Option<i32>,
     message: Option<String>,
+    unmapped: serde_json::Map<String, serde_json::Value>,
 }
 
 impl<'a> ProcessActivityBuilder<'a> {
@@ -39,6 +40,8 @@ impl<'a> ProcessActivityBuilder<'a> {
             launch_type: None,
             exit_code: None,
             message: None,
+
+            unmapped: serde_json::Map::new(),
         }
     }
 
@@ -58,6 +61,21 @@ impl<'a> ProcessActivityBuilder<'a> {
         self
     }
 
+    /// Add an unmapped field.
+    #[must_use]
+    pub fn unmapped(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
+        self.unmapped.insert(key.to_string(), value.into());
+        self
+    }
+
+    /// Mark the event's payload as guest-sourced: the data originated
+    /// from the in-guest boundary (untrusted after start in root-workload
+    /// mode), not from a supervisor-verified observation.
+    #[must_use]
+    pub fn guest_sourced(self) -> Self {
+        self.unmapped("data_origin", "guest")
+    }
+
     #[must_use]
     pub fn build(self) -> OcsfEvent {
         let activity_name = self.activity.process_label().to_string();
@@ -74,6 +92,9 @@ impl<'a> ProcessActivityBuilder<'a> {
         );
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
+        if !self.unmapped.is_empty() {
+            base.unmapped = Some(serde_json::Value::Object(self.unmapped));
+        }
 
         OcsfEvent::ProcessActivity(ProcessActivityEvent {
             base,
@@ -130,5 +151,50 @@ mod tests {
 
         let json = event.to_json().unwrap();
         assert_eq!(json["exit_code"], 0);
+    }
+}
+
+#[cfg(test)]
+mod guest_sourced_tests {
+    use super::*;
+    use crate::{ActivityId, SeverityId};
+
+    #[test]
+    fn guest_sourced_process_exit_carries_the_marker() {
+        let event = ProcessActivityBuilder::new(crate::ctx::ctx())
+            .activity(ActivityId::Fail)
+            .severity(SeverityId::Informational)
+            .exit_code(137)
+            .guest_sourced()
+            .message("main process exit reported by the boundary: code 137")
+            .build();
+        let json = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(
+            json.get("unmapped")
+                .and_then(|u| u.get("data_origin"))
+                .and_then(serde_json::Value::as_str),
+            Some("guest")
+        );
+        let shorthand = event.format_shorthand();
+        assert!(
+            shorthand.contains("data_origin:guest"),
+            "the shorthand must render the marker: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn unmarked_process_exit_has_no_marker() {
+        let event = ProcessActivityBuilder::new(crate::ctx::ctx())
+            .activity(ActivityId::Fail)
+            .severity(SeverityId::Informational)
+            .exit_code(0)
+            .message("main process exited: code 0")
+            .build();
+        let json = serde_json::to_value(&event).expect("serialize");
+        assert!(
+            json.get("unmapped")
+                .and_then(|u| u.get("data_origin"))
+                .is_none()
+        );
     }
 }

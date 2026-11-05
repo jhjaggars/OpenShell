@@ -1844,6 +1844,33 @@ pub async fn run_sandbox_instance(
                 .into_diagnostic()
                 .wrap_err("persist canonical-process completion marker")?;
         }
+        // Emit an OCSF event for the main-process exit. The exit code is
+        // guest-reported (the boundary reports the workload's lifecycle);
+        // in root mode the boundary is untrusted after start, so the event
+        // is marked guest-sourced. In sandboxed mode the exit code comes
+        // from the supervised boundary and stays unmarked.
+        if privileged_mode {
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::Fail)
+                    .severity(SeverityId::Informational)
+                    .exit_code(exit_code)
+                    .guest_sourced()
+                    .message(format!(
+                        "main process exit reported by the boundary: code {exit_code}"
+                    ))
+                    .build()
+            );
+        } else {
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::Fail)
+                    .severity(SeverityId::Informational)
+                    .exit_code(exit_code)
+                    .message(format!("main process exited: code {exit_code}"))
+                    .build()
+            );
+        }
         if !completion_cancelled
             && let (Some(gateway), Some(id)) = (gateway.as_ref(), sandbox_id.as_deref())
         {

@@ -198,6 +198,30 @@ fn unmapped_fields(base: &BaseEventData) -> Vec<String> {
         .collect()
 }
 
+/// Render the guest-sourced provenance marker at a fixed position
+/// (immediately after the severity tag, before any guest-controlled
+/// content). Guest values (URL paths, domain names) appear LATER in the
+/// shorthand line, so a guest cannot forge the marker by embedding
+/// `[data_origin:guest]` text in a path — the marker is already rendered
+/// by then. The JSONL `unmapped.data_origin` field is authoritative.
+fn guest_sourced_tag(base: &BaseEventData) -> String {
+    if base
+        .unmapped
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|fields| {
+            fields
+                .get("data_origin")
+                .and_then(serde_json::Value::as_str)
+                == Some("guest")
+        })
+    {
+        " [data_origin:guest]".to_string()
+    } else {
+        String::new()
+    }
+}
+
 fn unmapped_context(base: &BaseEventData, include_reason: bool) -> String {
     let mut fields = unmapped_fields(base);
 
@@ -287,7 +311,11 @@ impl OcsfEvent {
                 // Unmapped fields (including the guest-sourced provenance
                 // marker) render after the reason so operators can see the
                 // data origin alongside the decision.
-                let unmapped_ctx = unmapped_context(&e.base, false);
+                // The guest-sourced provenance marker renders immediately
+                // after the severity tag — BEFORE any guest-controlled
+                // content (URLs, domain names, paths) so a guest cannot
+                // forge it by embedding the marker text in a path.
+                let origin_tag = guest_sourced_tag(&e.base);
                 // Most network messages duplicate the structured action and
                 // destination shown above. Transparent TCP correlation is the
                 // exception: its message intentionally carries the logical,
@@ -303,7 +331,7 @@ impl OcsfEvent {
                     String::new()
                 };
                 format!(
-                    "NET:{activity} {sev}{detail}{rule_ctx}{reason_ctx}{unmapped_ctx}{message_ctx}"
+                    "NET:{activity} {sev}{origin_tag}{detail}{rule_ctx}{reason_ctx}{message_ctx}"
                 )
             }
 
@@ -535,7 +563,8 @@ impl OcsfEvent {
                     .map(|c| format!(" [cmd:{c}]"))
                     .unwrap_or_default();
 
-                format!("PROC:{activity} {sev} {proc_str}{exit_ctx}{cmd_ctx}")
+                let origin_tag = guest_sourced_tag(&e.base);
+                format!("PROC:{activity} {sev}{origin_tag} {proc_str}{exit_ctx}{cmd_ctx}")
             }
 
             Self::DetectionFinding(e) => {

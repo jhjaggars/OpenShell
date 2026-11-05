@@ -602,6 +602,10 @@ pub const KUBEVIRT_CREATE_DEADLINE_MS: i64 = 10 * 60 * 1000;
 /// read from the local docker daemon; a registry-backed cluster would read
 /// it from the registry's image manifest. Returns None when the image has
 /// no labels (a pre-verity image) or the daemon is unreachable.
+#[allow(
+    dead_code,
+    reason = "R4 WIP: used by the paused server-side label binding work"
+)]
 pub fn read_image_verity_binding(guest_image: &str) -> Option<String> {
     // The label keys the image build stamps.
     const ROOT_HASH_LABEL: &str = "io.openshell.kubevirt.root-hash";
