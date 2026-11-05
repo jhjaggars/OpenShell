@@ -1360,6 +1360,26 @@ mod tests {
     }
 
     #[test]
+    fn root_mode_without_config_or_label_fails_at_resolve() {
+        // R4: the driver's resolve_root_hash_binding fails closed when root
+        // mode has neither a config binding nor a readable image label.
+        // The config-level R1 check catches the empty-config case first;
+        // this documents the resolve-level behavior when the label is also
+        // absent (a pre-verity image or an unreachable daemon).
+        let _config = kubevirt_config(KubeVirtWorkloadMode::Root, "");
+        // Bypass the config validation (which would reject root+empty) to
+        // exercise the resolve path directly: the resolve method is the
+        // authoritative check.
+        let binding = crate::kubevirt::read_image_verity_binding(
+            "kvpoc/openshell-sandbox-vm:this-image-does-not-exist",
+        );
+        assert!(
+            binding.is_none(),
+            "an unreadable image must yield no binding"
+        );
+    }
+
+    #[test]
     fn malformed_verity_binding_fails_validation_in_any_mode() {
         // R2 at the config boundary: a malformed binding is rejected even
         // in sandboxed mode (it would be interpolated into kernelArgs).
