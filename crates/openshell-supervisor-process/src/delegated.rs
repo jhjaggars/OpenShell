@@ -93,6 +93,7 @@ pub async fn start_boundary_access(
     config_apply_tx: tokio::sync::mpsc::Sender<crate::supervisor_session::ConfigApplyRequest>,
     config_push_updates: tokio::sync::watch::Sender<bool>,
     host_key: Option<russh::keys::PrivateKey>,
+    privileged_mode: bool,
 ) -> Result<BoundaryAccess> {
     let instance_id = uuid::Uuid::new_v4().to_string();
     let terminating = Arc::new(AtomicBool::new(false));
@@ -110,6 +111,7 @@ pub async fn start_boundary_access(
         port_forward.clone(),
         main_session.clone(),
         host_key,
+        privileged_mode,
     )
     .await?;
 
@@ -148,6 +150,10 @@ pub async fn start_boundary_access(
 
 /// The optional SSH adapter is the only platform-specific access component.
 #[cfg(unix)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the SSH server setup mirrors the supervisor's access-plane parameters"
+)]
 async fn start_optional_ssh(
     socket_path: Option<std::path::PathBuf>,
     shared_socket: bool,
@@ -156,6 +162,7 @@ async fn start_optional_ssh(
     port_forward: Arc<BoundaryLoopbackConnector>,
     main_session: Arc<crate::main_session::MainSession>,
     host_key: Option<russh::keys::PrivateKey>,
+    privileged_mode: bool,
 ) -> Result<Option<tokio::task::JoinHandle<()>>> {
     let Some(socket_path) = socket_path else {
         return Ok(None);
@@ -172,6 +179,7 @@ async fn start_optional_ssh(
             boundary_exec,
             Some(main_session),
             host_key,
+            privileged_mode,
         )
         .await
         {
@@ -204,6 +212,10 @@ async fn start_optional_ssh(
 }
 
 #[cfg(not(unix))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the SSH server setup mirrors the supervisor's access-plane parameters"
+)]
 async fn start_optional_ssh(
     socket_path: Option<std::path::PathBuf>,
     _shared_socket: bool,
@@ -374,6 +386,7 @@ mod tests {
             tokio::sync::mpsc::channel(1).0,
             tokio::sync::watch::channel(false).0,
             None,
+            false,
         )
         .await
         .expect("access without SSH is portable");
@@ -415,6 +428,7 @@ mod tests {
             tokio::sync::mpsc::channel(1).0,
             tokio::sync::watch::channel(false).0,
             None,
+            false,
         )
         .await;
         assert!(

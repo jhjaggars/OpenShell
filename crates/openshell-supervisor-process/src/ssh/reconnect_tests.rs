@@ -132,6 +132,7 @@ impl Connection {
                 rpc_test::exec(Arc::new(RejectingExec)),
                 Some(main),
                 TEST_INTERVAL * 4,
+                false,
             )
             .await;
         });

@@ -43,8 +43,8 @@ use openshell_supervisor_control::RegistrationTraceContext;
 
 use openshell_ocsf::{
     ActionId, ActivityId, AppLifecycleBuilder, ConfidenceId, ConfigStateChangeBuilder,
-    DetectionFindingBuilder, DispositionId, EventContext, FindingInfo, OcsfEvent, SeverityId,
-    StateId, StatusId, ocsf_emit,
+    DetectionFindingBuilder, DispositionId, EventContext, FindingInfo, OcsfEvent,
+    ProcessActivityBuilder, SeverityId, StateId, StatusId, ocsf_emit,
 };
 
 // ---------------------------------------------------------------------------
@@ -1708,7 +1708,7 @@ pub async fn run_sandbox_instance(
                 adopted_execs = running.adopted_exec_processes().len(),
                 "Adopted the running agent from the previous supervisor"
             );
-            observe_adopted_execs(running.adopted_exec_processes());
+            observe_adopted_execs(running.adopted_exec_processes(), privileged_mode);
         } else {
             info!(backend = %backend_name, "Isolation boundary agent started");
         }
@@ -1728,6 +1728,7 @@ pub async fn run_sandbox_instance(
             config_apply_tx,
             config_push_updates,
             ssh_host_key,
+            privileged_mode,
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.access.start"))
         .await?;
@@ -1849,12 +1850,17 @@ pub async fn run_sandbox_instance(
         // in root mode the boundary is untrusted after start, so the event
         // is marked guest-sourced. In sandboxed mode the exit code comes
         // from the supervised boundary and stays unmarked.
+        // The entrypoint binary is the workload the exit code describes;
+        // set it so the shorthand reads correctly (not "unknown(0)").
+        let process_name =
+            openshell_ocsf::Process::new(&command.first().cloned().unwrap_or_default(), 0);
         if privileged_mode {
             openshell_ocsf::ocsf_emit!(
-                openshell_ocsf::ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
                     .activity(ActivityId::Fail)
                     .severity(SeverityId::Informational)
                     .exit_code(exit_code)
+                    .process(process_name.clone())
                     .guest_sourced()
                     .message(format!(
                         "main process exit reported by the boundary: code {exit_code}"
@@ -1863,10 +1869,11 @@ pub async fn run_sandbox_instance(
             );
         } else {
             openshell_ocsf::ocsf_emit!(
-                openshell_ocsf::ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
                     .activity(ActivityId::Fail)
                     .severity(SeverityId::Informational)
                     .exit_code(exit_code)
+                    .process(process_name)
                     .message(format!("main process exited: code {exit_code}"))
                     .build()
             );
@@ -1935,16 +1942,48 @@ fn boundary_exit_code(status: openshell_isolation_interface::contract::BoundaryE
 
 /// Exec processes a replacement supervisor adopted outlive their original
 /// clients; record when each exits so their end is not silent.
-fn observe_adopted_execs(processes: &[Arc<openshell_sandbox_backend::BoundaryProcess>]) {
+fn observe_adopted_execs(
+    processes: &[Arc<openshell_sandbox_backend::BoundaryProcess>],
+    privileged_mode: bool,
+) {
     for process in processes {
         let process = process.clone();
         tokio::spawn(async move {
             match process.wait().await {
-                Ok(status) => info!(
-                    process_id = %process.process_id(),
-                    ?status,
-                    "Adopted exec process exited"
-                ),
+                Ok(status) => {
+                    info!(
+                        process_id = %process.process_id(),
+                        ?status,
+                        "Adopted exec process exited"
+                    );
+                    // The exit status is guest-reported (the boundary reports
+                    // the adopted exec's lifecycle); in root mode the
+                    // boundary is untrusted after start, so the event is
+                    // marked guest-sourced.
+                    let code = boundary_exit_code(status);
+                    if privileged_mode {
+                        openshell_ocsf::ocsf_emit!(
+                            ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::Informational)
+                                .exit_code(code)
+                                .guest_sourced()
+                                .message(format!(
+                                    "adopted exec exit reported by the boundary: code {code}"
+                                ))
+                                .build()
+                        );
+                    } else {
+                        openshell_ocsf::ocsf_emit!(
+                            ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::Informational)
+                                .exit_code(code)
+                                .message(format!("adopted exec process exited: code {code}"))
+                                .build()
+                        );
+                    }
+                }
                 Err(error) => debug!(
                     process_id = %process.process_id(),
                     %error,
