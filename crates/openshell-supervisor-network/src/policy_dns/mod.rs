@@ -776,6 +776,45 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     }
 
     #[tokio::test]
+    async fn non_policy_names_never_reach_the_upstream_resolver() {
+        // The DNS exfiltration question: a root workload can encode data in
+        // the query name of a non-policy lookup. The ineligible path must
+        // answer entirely locally (a staged observation synthetic or an
+        // Ineligible refusal) — the name must never be sent upstream.
+        let service = service(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()]);
+        let now = Instant::now();
+        for name in [
+            "review-denied.test",
+            // Data-encoded subdomains of a non-policy name.
+            "cGF5bG9hZA.exfil.review-denied.test",
+            "a.b.c.d.e.f.g.h.i.j.k.unapproved.example",
+        ] {
+            let _ = service.answer_query(name, AddressFamily::Ipv4, now).await;
+        }
+        assert_eq!(
+            service.resolver.calls.load(Ordering::SeqCst),
+            0,
+            "non-policy names must never reach the upstream resolver"
+        );
+        // And in fail-closed mode the refusal stays local too.
+        service
+            .policy
+            .enter_fail_closed("invalid candidate")
+            .unwrap();
+        assert!(matches!(
+            service
+                .answer_query("review-denied.test", AddressFamily::Ipv4, now)
+                .await,
+            Err(PolicyDnsError::Ineligible)
+        ));
+        assert_eq!(
+            service.resolver.calls.load(Ordering::SeqCst),
+            0,
+            "fail-closed non-policy refusals must not query upstream either"
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_name_correlates_without_authorizing_a_port() {
         let service = service(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()]);
         let now = Instant::now();
