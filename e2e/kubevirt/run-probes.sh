@@ -269,7 +269,21 @@ step "P3: fake qemu-guest-agent (the channel is attached unconditionally)"
 # Find the guest-agent virtio-serial port and start a lying responder: it
 # answers the standard QGA commands with fabricated data. KubeVirt polls
 # the agent through this channel and surfaces the answers in VMI status.
-GA_PORT="$(exec_in_sandbox sh -c 'ls /dev/virtio-ports/ 2>/dev/null' | head -1 || true)"
+# Find the port via the sysfs name (the stable reference; the /dev node
+# may not exist yet if the virtio_console driver has not created it —
+# mdev -s can force device creation), falling back to the /dev listing.
+GA_PORT="$(exec_in_sandbox sh -c '
+    for n in /sys/class/virtio-ports/*/name; do
+        [ -f "${n}" ] || continue
+        grep -q "org.qemu.guest_agent" "${n}" 2>/dev/null \\
+            && basename "$(dirname "${n}")" && break
+    done
+' 2>/dev/null | head -1 || true)"
+if [ -z "${GA_PORT}" ]; then
+    # Force device-node creation, then retry the /dev listing.
+    exec_in_sandbox sh -c 'mdev -s 2>/dev/null; true' >/dev/null 2>&1 || true
+    GA_PORT="$(exec_in_sandbox sh -c 'ls /dev/virtio-ports/ 2>/dev/null' | head -1 || true)"
+fi
 if [ -z "${GA_PORT}" ]; then
     echo "FINDING: no virtio-ports device in the guest — the agent channel is absent"
 else
