@@ -273,19 +273,21 @@ echo "environment clean (no BOUNDARY/PRIVATE/TOKEN/OPENSHELL_ENDPOINT vars)"
 
 step "5/10 L4 allow/deny and L7 HTTPS GET allow / POST deny"
 if [ "${WORKLOAD}" = "root" ]; then
-    echo "SKIPPED (root mode): the L4/L7 checks need in-guest network"
-    echo "mediation, which root workloads do not have — the seccomp broker"
-    echo "is demoted and the nftables transparent relay is not landed yet."
-    echo "Network fails closed in the interim (no relay, no egress)."
-else
+    echo "root mode: the nftables transparent relay carries these checks"
+    echo "(workload TCP is captured to the boundary relay, policy-enforced"
+    echo "at the supervisor; deleting the rules restores direct egress,"
+    echo "which the fence blocks — fail-closed)."
+fi
 exec_in_sandbox sh -c \
     'nc -z -w 10 one.one.one.one 443 && echo "L4 ALLOW: connected"' \
     | tee ${WORKDIR}/l4.log
 grep -q "L4 ALLOW: connected" ${WORKDIR}/l4.log \
     || fail "L4 connect to the allowed host was denied"
-if exec_in_sandbox sh -c 'nc -z -w 10 example.org 80' \
-    > ${WORKDIR}/l4deny.log 2>&1; then
-    fail "L4 connect to a non-allowed host succeeded"
+# Data-level denial check: the transparent relay completes the TCP
+# handshake locally before the supervisor's decision, so nc -z (handshake
+# only) cannot see a denial — a data transfer must fail instead.
+if exec_in_sandbox sh -c 'wget -q -T 8 -O /dev/null http://example.org/'; then
+    fail "L4 data transfer to a non-allowed host succeeded"
 fi
 supervisor_denied "example.org:80" \
     || fail "no matching OCSF NET:OPEN DENIED line for example.org:80"
@@ -301,13 +303,24 @@ exec_in_sandbox sh -c 'wget -q -T 20 -O /dev/null --post-data=x https://example.
 grep -q "403" ${WORKDIR}/l7post.log \
     || { cat ${WORKDIR}/l7post.log >&2; fail "L7 POST denial was not a policy 403"; }
 echo "L7 POST denied (HTTP 403)"
-fi
 
 step "6/10 direct egress from the guest is blocked"
 if [ "${WORKLOAD}" = "root" ]; then
-    echo "SKIPPED (root mode): the bypass checks need in-guest network"
-    echo "mediation (see step 5); the fence itself is topology-level, not"
-    echo "workload-level, and is verified by sandboxed demo runs."
+    # The fail-closed test the posture requires: root deletes the relay's
+    # nftables rules (restoring direct egress), and the fence still blocks
+    # everything — deleting the rules only breaks the workload's own
+    # connectivity. Raw DNS to the masquerade dnsmasq is blocked too (the
+    # UDP redirect died with the table, and the fence admits nothing).
+    exec_in_sandbox nft delete table ip openshell_relay \
+        || fail "root could not delete the relay ruleset"
+    echo "relay rules deleted by root; direct egress must be fenced:"
+    if exec_in_sandbox sh -c 'wget -q -T 8 -O /dev/null http://1.1.1.1/'; then
+        fail "direct egress to 1.1.1.1 escaped the fence after rule deletion"
+    fi
+    if exec_in_sandbox sh -c 'nslookup one.one.one.one 10.0.2.3'; then
+        fail "raw DNS to the masquerade dnsmasq bypassed the fence"
+    fi
+    echo "direct egress and raw DNS blocked by the fence (fail-closed)"
 else
 if exec_in_sandbox sh -c 'nc -z -w 10 1.1.1.1 443'; then
     fail "raw TCP to 1.1.1.1:443 escaped the boundary"
@@ -520,9 +533,9 @@ echo "zero leftover vm/vmi/pod/svc/secret/pvc/netpol for sandbox ${SBX_ID}"
 echo
 if [ "${WORKLOAD}" = "root" ]; then
     echo "demo complete (${TOPOLOGY} topology, root workload): Ready, exec"
-    echo "as root, clean environment, stop/start, fence verification,"
-    echo "dead-runtime Error, and clean teardown all verified"
-    echo "(L4/L7 and bypass checks pending the nftables relay)"
+    echo "as root, clean environment, L4/L7 policy through the transparent"
+    echo "relay, bypass blocked, stop/start, fence verification, dead-runtime"
+    echo "Error, and clean teardown all verified"
 else
     echo "demo complete (${TOPOLOGY} supervisor topology): Ready, exec, L4/L7"
     echo "policy, bypass blocked, stop/start, fence verification, dead-runtime"

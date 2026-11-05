@@ -285,23 +285,48 @@ mod linux {
             | BoundaryListenerConfig::RuntimeInitiatedUnix { .. }
             | BoundaryListenerConfig::RuntimeInitiatedVsock { .. } => None,
         };
+        // The transparent relay's accept loops need the async runtime; the
+        // broker is otherwise constructed before it exists.
+        let process_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("create boundary process runtime: {error}"))?;
         let (launcher, network_broker) = if qualification.privileged {
             // B3c: the privileged (root-workload) mode launches workload
-            // children WITHOUT the seccomp-notify filter (socket calls go
-            // straight to the kernel, where the network fence is the
-            // enforcement point) and installs no network broker. Until the
-            // nftables transparent relay (commit 5), network mediation is
-            // explicitly unavailable: workload sockets reach the fence and
-            // are blocked there (a fast kernel-level refusal, not a hang).
-            tracing::warn!(
-                "privileged (root-workload) boundary: network mediation is unavailable \
-                 (the seccomp broker is not installed in this mode; the nftables relay \
-                 is pending); workload network requests are blocked by the fence"
-            );
+            // children WITHOUT the seccomp-notify filter. Commit 5: the
+            // transparent nftables relay captures outbound workload
+            // traffic inside the guest (TCP redirected to a local relay,
+            // DNS to the loopback resolver) and feeds the SAME Mediate
+            // accept/decision/bridge flow the seccomp broker uses — the
+            // supervisor's proxy and policy DNS run unchanged. Deleting
+            // the ruleset restores direct egress, which the network fence
+            // blocks (fail-closed: the workload only breaks its own
+            // connectivity).
             let launcher = crate::linux::workload_launcher::start_privileged()
                 .map_err(|error| format!("start privileged workload launcher: {error}"))?;
-            let broker = NetworkBroker::unavailable()
-                .map_err(|error| format!("create unavailable network broker: {error}"))?;
+            let control_endpoints: Vec<std::net::SocketAddr> = match &config.listener {
+                BoundaryListenerConfig::RuntimeInitiatedTlsTcp { addresses, .. } => {
+                    addresses.clone()
+                }
+                // The other listener kinds (unix, vsock, in-guest TCP)
+                // have no supervisor IP:port to exclude from the
+                // capture ruleset; the relay is only wired for the
+                // runtime-initiated TCP transport the KubeVirt driver
+                // renders. Fall back to the unavailable broker there.
+                _ => Vec::new(),
+            };
+            let broker = if control_endpoints.is_empty() {
+                tracing::warn!(
+                    "privileged (root-workload) boundary: the transparent relay needs \
+                     the runtime-initiated TCP transport; network mediation is unavailable \
+                     and workload requests are blocked by the fence"
+                );
+                NetworkBroker::unavailable()
+                    .map_err(|error| format!("create unavailable network broker: {error}"))?
+            } else {
+                NetworkBroker::start_transparent_relay(&control_endpoints, process_runtime.handle())
+                    .map_err(|error| format!("start transparent network relay: {error}"))?
+            };
             (launcher, broker)
         } else {
             let (launcher, listener) = crate::linux::workload_launcher::start()
@@ -310,10 +335,6 @@ mod linux {
                 .map_err(|error| format!("start sandbox network broker: {error}"))?;
             (launcher, broker)
         };
-        let process_runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| format!("create boundary process runtime: {error}"))?;
         let runtime = Arc::new(BoundaryRuntime::new(
             config.clone(),
             process_runtime.handle().clone(),

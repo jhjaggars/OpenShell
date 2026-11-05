@@ -30,6 +30,12 @@ use tokio::sync::{mpsc, oneshot};
 const SOCKET_CAPACITY: usize = 4_096;
 const SOCKET_FD_HEADROOM: usize = 64;
 const OPEN_QUEUE_CAPACITY: usize = 256;
+
+/// The relay broker's admission bound for undecided opens (mirrors the
+/// seccomp broker's queue capacity).
+pub const fn open_queue_capacity() -> usize {
+    OPEN_QUEUE_CAPACITY
+}
 const DNS_QUEUE_CAPACITY: usize = 256;
 const DNS_WORKER_CAPACITY: usize = 256;
 const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -95,6 +101,31 @@ impl PendingTcpOpen {
     #[cfg(test)]
     pub(crate) async fn complete(self, decision: TcpOpenDecision) -> io::Result<Option<TcpStream>> {
         self.decide(decision)?.established().await
+    }
+
+    /// Construct a pending open for a transparently relayed connection
+    /// (commit 5, root mode): the destination comes from conntrack's
+    /// original-destination record instead of an intercepted syscall, and
+    /// the relayed workload stream is handed to the Mediate bridge when
+    /// the supervisor allows the open.
+    pub(crate) fn for_relayed_connection(
+        destination: SocketAddr,
+        identity: Result<BinaryIdentity, ResolveError>,
+        socket: NetworkSocketMetadata,
+        notification_to_queue: Duration,
+        queued_at: Instant,
+        decision: std::sync::mpsc::SyncSender<TcpOpenDecision>,
+        relay: oneshot::Receiver<io::Result<TcpStream>>,
+    ) -> Self {
+        Self {
+            destination,
+            identity,
+            socket,
+            notification_to_queue,
+            queued_at,
+            decision,
+            relay,
+        }
     }
 
     /// Hand the decision to the broker. Once this returns the decision has
@@ -250,6 +281,50 @@ impl NetworkBroker {
     /// no DNS relay, marked unhealthy so network requests are refused with
     /// a clear error instead of silently bypassing policy. The nftables
     /// transparent relay (commit 5) is the replacement mediation path.
+    /// Construct the transparent relay broker for a privileged
+    /// (root-workload) boundary (commit 5): the loopback DNS relay
+    /// (127.0.0.53, same as sandboxed mode), the transparent TCP relay
+    /// listeners, and the nftables capture ruleset. The pending queues
+    /// feed the SAME Mediate accept/decision/bridge flow the seccomp
+    /// broker uses — the supervisor's proxy, policy DNS, and synthetic
+    /// address mapping run unchanged.
+    pub(crate) fn start_transparent_relay(
+        control_endpoints: &[SocketAddr],
+        runtime: &tokio::runtime::Handle,
+    ) -> io::Result<Self> {
+        let (pending_tx, pending_rx) = mpsc::channel(OPEN_QUEUE_CAPACITY);
+        let (pending_dns_tx, pending_dns_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
+        let active_opens = Arc::new(AtomicUsize::new(0));
+        // The DNS relay is the sandboxed mode's loopback resolver: the
+        // workload's resolv.conf already points at 127.0.0.53.
+        let dns_relay =
+            start_dns_relay_with_admission(DNS_RELAY_ADDRESS, pending_dns_tx.clone(), true)
+                .map_err(|error| io::Error::other(format!("relay DNS listener: {error}")))?;
+        // The nftables capture ruleset and the transparent TCP listeners.
+        crate::network_relay::install_relay_rules(
+            control_endpoints,
+            crate::network_relay::TRANSPARENT_RELAY_PORT,
+        )
+        .map_err(|error| io::Error::other(format!("relay nft ruleset: {error}")))?;
+        crate::network_relay::start_tcp_relay(pending_tx.clone(), active_opens, runtime)
+            .map_err(|error| io::Error::other(format!("relay TCP listener: {error}")))?;
+        let broker = Self {
+            provider_files: crate::provider_files::ProviderFiles::default(),
+            workload_frozen: Arc::new(AtomicBool::new(false)),
+            pending: Arc::new(tokio::sync::Mutex::new(pending_rx)),
+            pending_dns: Arc::new(tokio::sync::Mutex::new(pending_dns_rx)),
+            registry: Arc::new(Mutex::new(SocketRegistry::new(1, SOCKET_CAPACITY)?)),
+            descriptor_soft_limit: descriptor_soft_limit()?,
+            dns_address: dns_relay.address,
+            healthy: Arc::new(AtomicBool::new(true)),
+            designed_unavailable: false,
+            // The relay broker IS the mediation source: hold its queue
+            // senders so the supervisor's Mediate streams stay connected.
+            _designed_unavailable_senders: (pending_tx, pending_dns_tx),
+        };
+        Ok(broker)
+    }
+
     pub(crate) fn unavailable() -> io::Result<Self> {
         // Keep the channel senders alive (do NOT drop them): the supervisor's
         // proxy accept loop and policy DNS open Mediate streams on the
@@ -470,6 +545,20 @@ fn start_dns_relay(
     address: SocketAddr,
     pending: mpsc::Sender<PendingDnsQuery>,
 ) -> io::Result<DnsRelay> {
+    start_dns_relay_with_admission(address, pending, false)
+}
+
+/// Start the loopback DNS relay. `admit_unregistered` serves the
+/// transparent-relay (root-workload) mode: the seccomp broker that
+/// normally registers workload DNS sockets is absent, so queries from any
+/// local source are admitted (the identity is the documented-unavailable
+/// kernel-write path — root-mode policy does not require binary
+/// identity).
+fn start_dns_relay_with_admission(
+    address: SocketAddr,
+    pending: mpsc::Sender<PendingDnsQuery>,
+    admit_unregistered: bool,
+) -> io::Result<DnsRelay> {
     let (udp, tcp, address) = bind_dns_relay_sockets(address)?;
     let udp_admissions = Arc::new(Mutex::new(HashMap::new()));
     let tcp_admissions = Arc::new(Mutex::new(HashMap::new()));
@@ -487,7 +576,7 @@ fn start_dns_relay(
         .spawn(move || {
             let mut request = vec![0_u8; u16::MAX as usize];
             while let Ok((length, peer)) = udp.recv_from(&mut request) {
-                if !lock(&udp_admissions).contains_key(&peer) {
+                if !admit_unregistered && !lock(&udp_admissions).contains_key(&peer) {
                     tracing::warn!(%peer, "dropping DNS datagram from unregistered socket");
                     continue;
                 }
@@ -534,8 +623,9 @@ fn start_dns_relay(
                     break;
                 };
                 // One admission authorizes exactly one accepted TCP stream;
-                // no peer mapping needs to outlive this accept.
-                if lock(&tcp_admissions).remove(&peer).is_none() {
+                // no peer mapping needs to outlive this accept. The
+                // transparent relay admits unregistered sources.
+                if !admit_unregistered && lock(&tcp_admissions).remove(&peer).is_none() {
                     tracing::warn!(%peer, "dropping DNS stream from unregistered socket");
                     continue;
                 }
