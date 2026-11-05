@@ -128,16 +128,28 @@ table ip6 {NFT_TABLE} {{
             std::env::var("PATH").unwrap_or_default()
         )));
     }
-    let mut child = std::process::Command::new(nft_path)
+    let mut blocked = nix::sys::signal::SigSet::empty();
+    blocked.add(nix::sys::signal::Signal::SIGCHLD);
+    let original = blocked
+        .thread_swap_mask(nix::sys::signal::SigmaskHow::SIG_BLOCK)
+        .map_err(|error| std::io::Error::other(format!("block SIGCHLD: {error}")))?;
+    let child = std::process::Command::new(nft_path)
         .arg("-f")
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()?;
-    // Register before waiting (see spawn_registered): the orphan reaper
-    // would otherwise race this wait.
-    let registered = crate::managed_children::register(child.id());
+        .spawn()
+        .map(|child| {
+            // Register inside the blocked window (see spawn_registered):
+            // the orphan reaper would otherwise race this wait.
+            let registered = crate::managed_children::register(child.id());
+            (child, registered)
+        })?;
+    original
+        .thread_swap_mask(nix::sys::signal::SigmaskHow::SIG_SETMASK)
+        .map_err(|error| std::io::Error::other(format!("restore signal mask: {error}")))?;
+    let (mut child, registered) = child;
     {
         use std::io::Write as _;
         let stdin = child
@@ -165,11 +177,34 @@ table ip6 {NFT_TABLE} {{
 /// before waiting: the boundary's orphan reaper reaps UNREGISTERED children
 /// process-wide (it answers the same SIGCHLD), racing any direct wait and
 /// failing it with ECHILD. The registry entry is released after the wait.
+///
+/// SIGCHLD is blocked around the spawn+register pair: the reaper's scan is
+/// event-driven (a SIGCHLD-driven eventfd wakes the scan), so blocking the
+/// signal on this thread keeps any exit notification from firing a scan
+/// between the child exiting and its registration landing. Once registered,
+/// the scan skips it; the signal is unblocked after, and the eventual
+/// child-exit SIGCHLD finds the child already registered.
 fn spawn_registered(
     command: &mut std::process::Command,
 ) -> std::io::Result<std::process::ExitStatus> {
-    let mut child = command.spawn()?;
-    let registered = crate::managed_children::register(child.id());
+    let mut blocked = nix::sys::signal::SigSet::empty();
+    blocked.add(nix::sys::signal::Signal::SIGCHLD);
+    // Block SIGCHLD on this thread for the spawn+register pair, saving the
+    // previous mask to restore before the wait.
+    let original = blocked
+        .thread_swap_mask(nix::sys::signal::SigmaskHow::SIG_BLOCK)
+        .map_err(|error| std::io::Error::other(format!("block SIGCHLD: {error}")))?;
+    let spawn_result = command.spawn().map(|child| {
+        let registered = crate::managed_children::register(child.id());
+        (child, registered)
+    });
+    // Restore the saved mask before waiting: the wait must observe the
+    // exit, and the eventual child-exit SIGCHLD must reach the reaper
+    // normally.
+    original
+        .thread_swap_mask(nix::sys::signal::SigmaskHow::SIG_SETMASK)
+        .map_err(|error| std::io::Error::other(format!("restore signal mask: {error}")))?;
+    let (mut child, registered) = spawn_result?;
     let result = child.wait();
     if let Some(managed) = registered {
         crate::managed_children::unregister(managed);
