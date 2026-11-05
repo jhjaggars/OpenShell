@@ -21,8 +21,9 @@
 //! - DNS: the loopback relay at 127.0.0.53 answers via the Mediate DNS
 //!   stream (policy DNS returns synthetic addresses). Non-loopback UDP/53
 //!   is redirected there too, closing the masquerade dnsmasq bypass.
-//! - IPv6 TCP is redirected the same way (synthetic AAAA answers); other
-//!   IPv6 UDP is dropped, failing closed.
+//! - All other UDP is dropped (IPv4 and IPv6): QUIC and arbitrary UDP
+//!   datagrams are never relayed — defence in depth matching the fence.
+//! - IPv6 TCP is redirected the same way (synthetic AAAA answers).
 //!
 //! Fail-closed: a root workload that deletes the ruleset restores direct
 //! egress through the guest's eth0, which the launcher-side network fence
@@ -88,6 +89,7 @@ table ip {NFT_TABLE} {{
 {v4_accepts}        ip daddr 127.0.0.0/8 accept
         meta l4proto tcp dnat to 127.0.0.1:{relay_port}
         udp dport 53 ip daddr != 127.0.0.0/8 dnat to 127.0.0.53
+        meta l4proto udp drop
     }}
 }}
 destroy table ip6 {NFT_TABLE}
@@ -390,6 +392,10 @@ mod tests {
             .expect("list the ruleset");
         let text = String::from_utf8_lossy(&listing.stdout);
         assert!(text.contains("dnat to 127.0.0.1:15500"), "{text}");
+        assert!(
+            text.contains("meta l4proto udp drop"),
+            "non-DNS UDP must be dropped (defence in depth): {text}"
+        );
         assert!(
             text.contains("ip daddr 10.43.0.1 tcp dport 5500 accept"),
             "{text}"
