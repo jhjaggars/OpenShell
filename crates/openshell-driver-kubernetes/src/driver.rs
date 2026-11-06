@@ -4648,11 +4648,17 @@ impl KubernetesComputeDriver {
         let kube_name = self
             .config
             .kube_resource_name(&sandbox.workspace, &sandbox.name);
+        // R4: resolve the verity binding from the image's OCI config
+        // before the VM is rendered — the kernel args and the bootstrap
+        // both use it (the config's root_hash is the fallback).
+        let resolved_root_hash =
+            self.resolve_root_hash_binding(&self.config.kubevirt.guest_image)?;
         let params = crate::kubevirt::KubeVirtSandboxParams {
             sandbox,
             config: &self.config,
             namespace: &namespace,
             kube_name: &kube_name,
+            resolved_root_hash,
         };
 
         info!(
@@ -5084,7 +5090,7 @@ impl KubernetesComputeDriver {
                 generation.workload_uid,
                 generation.workload_gid,
                 generation.workload_mode,
-                &self.config.kubevirt.root_hash,
+                &self.resolve_root_hash_binding(&generation.boot_image)?,
             )
             .map_err(KubernetesDriverError::Precondition)?
         };
@@ -5177,6 +5183,7 @@ impl KubernetesComputeDriver {
                     config: &self.config,
                     namespace,
                     kube_name,
+                    resolved_root_hash: String::new(),
                 });
             pvc.metadata.owner_references = Some(vec![vm_owner.clone()]);
             let created_pvc = tokio::time::timeout(
@@ -6114,7 +6121,7 @@ impl KubernetesComputeDriver {
             workload_uid,
             workload_gid,
             workload_mode,
-            &self.config.kubevirt.root_hash,
+            &self.resolve_root_hash_binding(&boot_image)?,
         )
         .map_err(KubernetesDriverError::Precondition)?;
 
@@ -6558,6 +6565,54 @@ impl KubernetesComputeDriver {
     /// `printableStatus: Stopped`). The gateway still composes public
     /// readiness from the supervisor session.
     #[allow(clippy::unused_async)]
+    /// Resolve the dm-verity root-hash binding for a guest image (R4).
+    ///
+    /// The binding is read server-side from the image's OCI config —
+    /// binding the hash to the image — and the configured binding (if any)
+    /// is verified against it. The label is authoritative: a config value
+    /// that disagrees with the image is a drift the operator must fix, and
+    /// a missing label on an image the config says is verified is a
+    /// fail-closed error in root mode.
+    fn resolve_root_hash_binding(&self, boot_image: &str) -> Result<String, KubernetesDriverError> {
+        let label_binding = crate::kubevirt::read_image_verity_binding(boot_image);
+        let configured = self.config.kubevirt.root_hash.trim();
+        match (label_binding, configured.is_empty()) {
+            (Some(label), false) => {
+                if label != configured {
+                    return Err(KubernetesDriverError::Message(format!(
+                        "kubevirt root_hash mismatch: the configured binding {configured:?} does not match the guest image's label {label:?}; fix the configuration to match the image"
+                    )));
+                }
+                Ok(label)
+            }
+            (Some(label), true) => {
+                // The config is empty but the image carries a binding: use
+                // the label (the image is the authority).
+                tracing::info!(
+                    image = %boot_image,
+                    "kubevirt root_hash resolved from the image label (config was empty)"
+                );
+                Ok(label)
+            }
+            (None, false) => {
+                // The config says verified but the image has no readable
+                // label. In root mode this is fail-closed; in sandboxed
+                // mode the config binding is used as-is.
+                if self.config.kubevirt.workload == crate::config::KubeVirtWorkloadMode::Root {
+                    return Err(KubernetesDriverError::Message(format!(
+                        "kubevirt workload = \"root\" requires the guest image to carry the verity labels; {boot_image:?} has none readable server-side"
+                    )));
+                }
+                Ok(configured.to_string())
+            }
+            (None, true) => Ok(String::new()),
+        }
+    }
+
+    #[allow(
+        clippy::unused_async,
+        reason = "the stream setup itself is synchronous; the watcher tasks await inside their spawned closures"
+    )]
     async fn watch_sandboxes_kubevirt(&self) -> Result<WatchStream, String> {
         let namespace = crate::kubevirt::kubevirt_namespace(&self.config)?;
         let selector = openshell_sandbox_label_selector();

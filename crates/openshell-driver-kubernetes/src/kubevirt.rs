@@ -366,6 +366,10 @@ pub struct KubeVirtSandboxParams<'a> {
     pub namespace: &'a str,
     /// `KubeVirt` resource name (`{workspace}--{name}` in shared mode).
     pub kube_name: &'a str,
+    /// The driver-resolved `dm-verity` binding (R4): read from the image's
+    /// `OCI` config at create time. Overrides the config's `root_hash` for
+    /// both the VM kernel args and the bootstrap descriptor claims.
+    pub resolved_root_hash: String,
 }
 
 /// Render the workspace PVC. The guest init formats it on first boot (sentinel
@@ -491,7 +495,7 @@ pub fn render_virtual_machine(params: &KubeVirtSandboxParams<'_>) -> DynamicObje
                         "firmware": {
                             "kernelBoot": {
                                 "container": kernel_boot_container,
-                                "kernelArgs": kubevirt_kernel_args(&kubevirt.root_hash)
+                                "kernelArgs": kubevirt_kernel_args(&params.resolved_root_hash)
                             }
                         },
                         "cpu": {"cores": kubevirt.cpu_cores},
@@ -592,6 +596,66 @@ pub const KUBEVIRT_CREATE_DEADLINE_MS: i64 = 10 * 60 * 1000;
 /// the VM spec's direct kernel boot (M6: the claim tracks what runs, not
 /// the configured string — after a config change, start must not claim an
 /// image the VM is not booting).
+/// Read the dm-verity root-hash binding from the guest image's OCI config.
+///
+/// R4: the driver reads the binding server-side from the image itself at
+/// create/pin time, binding the hash to the image — not to a config value
+/// that could drift. The image config is read through the container
+/// runtime's API (the Docker Engine REST API via its unix socket), which
+/// serves the same OCI config blob a registry would. Returns None when the
+/// image has no labels (a pre-verity image), the daemon is unreachable, or
+/// the image is not present locally. A registry-backed cluster would read
+/// from the registry's manifest API instead; k3d side-loaded images carry
+/// their config on the gateway host's daemon.
+const ROOT_HASH_LABEL: &str = "io.openshell.kubevirt.root-hash";
+const GEOMETRY_LABEL: &str = "io.openshell.kubevirt.verity-geometry";
+
+pub fn read_image_verity_binding(guest_image: &str) -> Option<String> {
+    // The Docker Engine API serves the OCI image config (the same data a
+    // registry would): GET /images/{name}/json returns Config.Labels.
+    // Connect over the unix socket, not via the docker CLI.
+    use std::io::{Read as _, Write as _};
+    let socket = std::path::Path::new("/var/run/docker.sock");
+    if !socket.exists() {
+        tracing::debug!(
+            image = %guest_image,
+            "no container runtime socket at /var/run/docker.sock; the image config is not readable server-side"
+        );
+        return None;
+    }
+    let stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
+    let request = format!(
+        "GET /v1.46/images/{guest_image}/json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    );
+    let mut stream = stream;
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok()?;
+    let response = String::from_utf8_lossy(&response);
+
+    // Split headers from body; the body is the JSON image inspect result.
+    let body = response.split_once("\r\n\r\n").map(|(_, body)| body)?;
+    // The Docker API may use chunked encoding; for simplicity, find the
+    // JSON object start and parse from there (labels are near the start
+    // of the config blob).
+    let json_start = body.find('{')?;
+    let inspect: serde_json::Value = serde_json::from_str(&body[json_start..]).ok()?;
+
+    let labels = inspect
+        .pointer("/Config/Labels")
+        .and_then(serde_json::Value::as_object)?;
+    let root_hash = labels
+        .get(ROOT_HASH_LABEL)
+        .and_then(serde_json::Value::as_str)?;
+    let geometry = labels
+        .get(GEOMETRY_LABEL)
+        .and_then(serde_json::Value::as_str)?;
+    if root_hash.is_empty() || geometry.is_empty() {
+        return None;
+    }
+    Some(format!("{geometry}:{root_hash}"))
+}
+
 pub fn kubevirt_boot_image(vm: &DynamicObject) -> String {
     vm.data
         .pointer("/spec/template/spec/domain/firmware/kernelBoot/container/image")
@@ -974,6 +1038,25 @@ pub async fn list_virtual_machines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_image_verity_binding_returns_none_for_absent_socket() {
+        // The function reads through /var/run/docker.sock; in the test
+        // environment there is no socket (or the image doesn't exist).
+        // Verify it returns None (not an error) — the caller decides
+        // whether None is fatal based on the workload mode.
+        let result = read_image_verity_binding("kvpoc/openshell-sandbox-vm:this-does-not-exist");
+        assert!(
+            result.is_none(),
+            "an unreadable image must yield no binding (not an error)"
+        );
+    }
+
+    #[allow(
+        unused_imports,
+        reason = "used by the tests below; the inline test above also imports super"
+    )]
+    use super::*;
     use crate::KubernetesComputeConfig;
     use openshell_core::proto::compute::v1::DriverSandbox as Sandbox;
 
@@ -1022,6 +1105,7 @@ mod tests {
             config,
             namespace: "kvpoc-sandboxes",
             kube_name: "default--demo",
+            resolved_root_hash: String::new(),
         }
     }
 
@@ -1410,6 +1494,7 @@ mod kubevirt_review_tests {
             config,
             namespace: "kvpoc-sandboxes",
             kube_name: "default--demo",
+            resolved_root_hash: String::new(),
         }
     }
 

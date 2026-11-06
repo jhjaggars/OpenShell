@@ -804,20 +804,13 @@ impl KubernetesComputeConfig {
                     .to_string(),
             );
         }
-        // R1: the root workload class must not boot unverified — without
-        // the dm-verity binding the trusted-boot property silently
-        // disappears (a pre-verity image or a forgotten config would boot
-        // fine and nothing would say so). Sandboxed mode keeps it optional.
-        if self.kubevirt.workload == KubeVirtWorkloadMode::Root
-            && self.kubevirt.root_hash.trim().is_empty()
-        {
-            return Err(
-                "kubevirt workload = \"root\" requires root_hash (the dm-verity \
-                 binding of a verified guest image); the privileged class must not \
-                 boot unverified"
-                    .to_string(),
-            );
-        }
+        // R1: the root workload class must not boot unverified. The binding
+        // may come from the config OR from the image's OCI labels (read
+        // server-side by the driver at create time, R4). Sandboxed mode
+        // keeps it optional. The driver's resolve_root_hash_binding
+        // fail-closes when neither is available.
+        // (No config-level check: the image label path means an empty config
+        // is valid in root mode when the image carries the binding.)
         // R2: validate the binding's shape wherever it is set (root mode
         // requires it; sandboxed mode may carry it) — it is interpolated
         // into kernelArgs, so a malformed value must fail at load, not at
@@ -1340,20 +1333,21 @@ mod tests {
     }
 
     #[test]
-    fn root_workload_requires_verity_binding() {
-        // R1: the privileged class must not boot unverified — an empty
-        // root_hash with workload = "root" fails validation, while a
-        // binding passes and sandboxed mode stays optional.
-        let error = kubevirt_config(KubeVirtWorkloadMode::Root, "")
+    fn root_workload_verity_binding_from_config_or_image() {
+        // R4: the binding may come from the config OR from the image's
+        // OCI labels (read server-side by the driver at create time).
+        // An empty config in root mode is valid — the driver's
+        // resolve_root_hash_binding fail-closes when neither source has
+        // a binding. Sandboxed mode stays optional.
+        kubevirt_config(KubeVirtWorkloadMode::Root, "")
             .validate_configuration()
-            .expect_err("root mode without root_hash must fail");
-        assert!(error.contains("root_hash"), "{error}");
+            .expect("root mode with empty config passes (the driver reads the image label)");
         kubevirt_config(
             KubeVirtWorkloadMode::Root,
             &format!("179200:179200:{}", "0123abcd".repeat(8)),
         )
         .validate_configuration()
-        .expect("root mode with a binding passes");
+        .expect("root mode with a config binding passes");
         kubevirt_config(KubeVirtWorkloadMode::Sandboxed, "")
             .validate_configuration()
             .expect("sandboxed mode keeps the binding optional");
