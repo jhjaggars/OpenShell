@@ -592,55 +592,6 @@ pub const KUBEVIRT_CREATE_DEADLINE_MS: i64 = 10 * 60 * 1000;
 /// the VM spec's direct kernel boot (M6: the claim tracks what runs, not
 /// the configured string — after a config change, start must not claim an
 /// image the VM is not booting).
-/// Read the dm-verity root-hash binding from the guest image's OCI labels
-/// (stamped by the image build as `io.openshell.kubevirt.root-hash` and
-/// `io.openshell.kubevirt.verity-geometry`).
-///
-/// R4: the driver reads the binding server-side from the image itself at
-/// create/pin time, binding the hash to the image — not to a config value
-/// that could drift. For the `PoC`'s side-loaded (`k3d`) images, the label is
-/// read from the local docker daemon; a registry-backed cluster would read
-/// it from the registry's image manifest. Returns None when the image has
-/// no labels (a pre-verity image) or the daemon is unreachable.
-#[allow(
-    dead_code,
-    reason = "R4 WIP: used by the paused server-side label binding work"
-)]
-pub fn read_image_verity_binding(guest_image: &str) -> Option<String> {
-    // The label keys the image build stamps.
-    const ROOT_HASH_LABEL: &str = "io.openshell.kubevirt.root-hash";
-    const GEOMETRY_LABEL: &str = "io.openshell.kubevirt.verity-geometry";
-
-    let output = std::process::Command::new("docker")
-        .args([
-            "image",
-            "inspect",
-            guest_image,
-            "--format",
-            &format!(
-                "{{{{index .Config.Labels \"{ROOT_HASH_LABEL}\"}}}}\\n{{{{index .Config.Labels \"{GEOMETRY_LABEL}\"}}}}"
-            ),
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        tracing::debug!(
-            image = %guest_image,
-            "docker image inspect failed; the guest image carries no verity labels readable server-side"
-        );
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut lines = text.lines();
-    let root_hash = lines.next()?.trim();
-    let geometry = lines.next()?.trim();
-    if root_hash.is_empty() || geometry.is_empty() {
-        return None;
-    }
-    // The binding format: <blocks>:<hash-start>:<root-hash>.
-    Some(format!("{geometry}:{root_hash}"))
-}
-
 pub fn kubevirt_boot_image(vm: &DynamicObject) -> String {
     vm.data
         .pointer("/spec/template/spec/domain/firmware/kernelBoot/container/image")

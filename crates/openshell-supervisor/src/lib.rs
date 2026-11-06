@@ -1857,7 +1857,7 @@ pub async fn run_sandbox_instance(
         if privileged_mode {
             openshell_ocsf::ocsf_emit!(
                 ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                    .activity(ActivityId::Fail)
+                    .activity(ActivityId::Close)
                     .severity(SeverityId::Informational)
                     .exit_code(exit_code)
                     .process(process_name.clone())
@@ -1870,7 +1870,7 @@ pub async fn run_sandbox_instance(
         } else {
             openshell_ocsf::ocsf_emit!(
                 ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                    .activity(ActivityId::Fail)
+                    .activity(ActivityId::Close)
                     .severity(SeverityId::Informational)
                     .exit_code(exit_code)
                     .process(process_name)

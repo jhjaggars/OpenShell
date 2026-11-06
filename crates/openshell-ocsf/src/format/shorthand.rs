@@ -551,7 +551,15 @@ impl OcsfEvent {
 
             Self::ProcessActivity(e) => {
                 let activity = e.base.activity_name.to_uppercase();
-                let proc_str = format!("{}({})", e.process.name, e.process.pid);
+                // Escape guest-controlled fields (process name, command
+                // line): an unescaped value starting with
+                // "[data_origin:guest] " would render like a marked event,
+                // and a newline would start a forged line.
+                let proc_str = format!(
+                    "{}({})",
+                    escape_quoted_field(&e.process.name),
+                    e.process.pid
+                );
                 let exit_ctx = e
                     .exit_code
                     .map(|c| format!(" [exit:{c}]"))
@@ -560,7 +568,7 @@ impl OcsfEvent {
                     .process
                     .cmd_line
                     .as_ref()
-                    .map(|c| format!(" [cmd:{c}]"))
+                    .map(|c| format!(" [cmd:{}]", escape_quoted_field(c)))
                     .unwrap_or_default();
 
                 let origin_tag = guest_sourced_tag(&e.base);

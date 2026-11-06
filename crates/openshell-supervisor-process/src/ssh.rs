@@ -1418,7 +1418,7 @@ impl SshHandler {
             if privileged_mode {
                 openshell_ocsf::ocsf_emit!(
                     openshell_ocsf::ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Fail)
+                        .activity(ActivityId::Close)
                         .severity(SeverityId::Informational)
                         .exit_code(code.cast_signed())
                         .process(process)
@@ -1429,7 +1429,7 @@ impl SshHandler {
             } else {
                 openshell_ocsf::ocsf_emit!(
                     openshell_ocsf::ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Fail)
+                        .activity(ActivityId::Close)
                         .severity(SeverityId::Informational)
                         .exit_code(code.cast_signed())
                         .process(process)

@@ -162,7 +162,7 @@ mod guest_sourced_tests {
     #[test]
     fn guest_sourced_process_exit_carries_the_marker() {
         let event = ProcessActivityBuilder::new(crate::ctx::ctx())
-            .activity(ActivityId::Fail)
+            .activity(ActivityId::Close)
             .severity(SeverityId::Informational)
             .exit_code(137)
             .guest_sourced()
@@ -183,9 +183,145 @@ mod guest_sourced_tests {
     }
 
     #[test]
+    fn exec_exit_carries_the_marker_in_root_mode() {
+        // The exec exit status is boundary-reported; in root mode the
+        // boundary is untrusted after start, so the event is marked.
+        use crate::Process;
+        let event = ProcessActivityBuilder::new(crate::ctx::ctx())
+            .activity(ActivityId::Close)
+            .severity(SeverityId::Informational)
+            .exit_code(0)
+            .process(Process::new("sh", 0))
+            .guest_sourced()
+            .message("exec exit reported by the boundary: code 0")
+            .build();
+        let json = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(
+            json.get("unmapped")
+                .and_then(|u| u.get("data_origin"))
+                .and_then(serde_json::Value::as_str),
+            Some("guest"),
+            "the exec exit event must carry the guest-sourced marking in root mode"
+        );
+        let shorthand = event.format_shorthand();
+        assert!(
+            shorthand.contains("data_origin:guest"),
+            "the shorthand must render the marker: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn exec_exit_has_no_marker_in_sandboxed_mode() {
+        // The exec exit status is boundary-reported but the boundary is
+        // supervised in sandboxed mode; the event stays unmarked.
+        use crate::Process;
+        let event = ProcessActivityBuilder::new(crate::ctx::ctx())
+            .activity(ActivityId::Close)
+            .severity(SeverityId::Informational)
+            .exit_code(0)
+            .process(Process::new("sh", 0))
+            .message("exec process exited: code 0")
+            .build();
+        let json = serde_json::to_value(&event).expect("serialize");
+        assert!(
+            json.get("unmapped")
+                .and_then(|u| u.get("data_origin"))
+                .is_none(),
+            "the exec exit event must NOT carry the marking in sandboxed mode"
+        );
+        let shorthand = event.format_shorthand();
+        assert!(
+            !shorthand.contains("data_origin:guest"),
+            "the shorthand must not render the marker: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn adopted_exec_exit_carries_the_marker_in_root_mode() {
+        // The adopted-exec exit is boundary-reported; in root mode the
+        // event is marked (same lifecycle semantics as the exec exit).
+        use crate::Process;
+        let event = ProcessActivityBuilder::new(crate::ctx::ctx())
+            .activity(ActivityId::Close)
+            .severity(SeverityId::Informational)
+            .exit_code(137)
+            .process(Process::new("python3", 0))
+            .guest_sourced()
+            .message("adopted exec exit reported by the boundary: code 137")
+            .build();
+        let json = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(
+            json.get("unmapped")
+                .and_then(|u| u.get("data_origin"))
+                .and_then(serde_json::Value::as_str),
+            Some("guest"),
+            "the adopted-exec exit must carry the guest-sourced marking in root mode"
+        );
+    }
+
+    #[test]
+    fn forged_process_name_cannot_create_a_marker() {
+        // The PROC shorthand escapes guest-controlled fields (process name,
+        // command line): a name starting with "[data_origin:guest] " would
+        // render like a marked event, and a newline would start a forged
+        // line. The escape prevents both.
+        use crate::Process;
+        let event = ProcessActivityBuilder::new(crate::ctx::ctx())
+            .activity(ActivityId::Close)
+            .severity(SeverityId::Informational)
+            .exit_code(0)
+            .process(Process::new("[data_origin:guest] fake-cmd", 0))
+            .message("exec process exited: code 0")
+            .build();
+        let json = serde_json::to_value(&event).expect("serialize");
+        // The event is NOT marked: the forged name is in the process field,
+        // not in the unmapped data_origin field.
+        assert!(
+            json.get("unmapped")
+                .and_then(|u| u.get("data_origin"))
+                .is_none(),
+            "a forged process name must not create a data_origin marking: {json}"
+        );
+        // The shorthand renders the escaped (quoted) name, not a marker.
+        let shorthand = event.format_shorthand();
+        assert!(
+            !shorthand.contains("[INFO] [data_origin:guest] [data_origin:guest]"),
+            "the forged name must not appear as a double marker: {shorthand}"
+        );
+        assert!(
+            shorthand.contains("PROC:TERMINATE [INFO]"),
+            "the activity must be Terminate (Close maps to process_label Terminate): {shorthand}"
+        );
+    }
+
+    #[test]
+    fn newline_in_process_name_cannot_start_a_forged_line() {
+        // A newline in a process name would start a new line in the
+        // shorthand output, potentially forging a subsequent event. The
+        // escape quotes the field, preventing this.
+        use crate::Process;
+        let event = ProcessActivityBuilder::new(crate::ctx::ctx())
+            .activity(ActivityId::Close)
+            .severity(SeverityId::Informational)
+            .exit_code(0)
+            .process(Process::new(
+                "cmd\nOCSF NET:OPEN [INFO] [data_origin:guest] fake",
+                0,
+            ))
+            .message("exec process exited: code 0")
+            .build();
+        let shorthand = event.format_shorthand();
+        // The shorthand must not contain a newline (the escaped name is quoted).
+        assert!(
+            !shorthand.contains('\n'),
+            "a newline in the process name must not create a line break: {shorthand:?}"
+        );
+    }
+
+    #[test]
     fn unmarked_process_exit_has_no_marker() {
         let event = ProcessActivityBuilder::new(crate::ctx::ctx())
-            .activity(ActivityId::Fail)
+            .activity(ActivityId::Close)
             .severity(SeverityId::Informational)
             .exit_code(0)
             .message("main process exited: code 0")
