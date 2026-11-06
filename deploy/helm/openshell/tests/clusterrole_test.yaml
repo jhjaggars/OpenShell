@@ -123,8 +123,9 @@ tests:
         - name: registry-one
         - name: registry-two
     asserts:
+      # The only named rule is the bind on the NetworkPolicy guard ClusterRole.
       - notExists:
-          path: rules[*].resourceNames
+          path: rules[?(@.resources[0] != "clusterroles")].resourceNames
       - contains:
           path: rules
           content:
