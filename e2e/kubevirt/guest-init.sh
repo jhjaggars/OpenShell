@@ -121,6 +121,35 @@ read_bootstrap_config() {
     fi
     ts "bootstrap config loaded (sandbox ${OPENSHELL_SANDBOX:-unknown})"
     umount /config
+    # L1 (one-shot config disk): eject the cloud-init disk after the
+    # read. The bootstrap carries the boundary's private key and launch
+    # authentication — it must not sit re-readable on an attached disk
+    # for the VM's whole life, where root in the guest could re-read it
+    # at any time. virtio-blk has no SCSI-style per-device `delete`, so
+    # the ejection removes the PCI function backing the disk (resolved
+    # from the sysfs device path — never a hardcoded address). A guest
+    # reset re-attaches the device, but the pristine boot re-reads it
+    # only within the boot flow (before any workload code runs), and a
+    # fresh boundary attaching to the live generation ends it (P1's
+    # handle check) and the VM is halted (R3) — the re-read material is
+    # useless for an ended generation. Failing to eject is fatal: a
+    # readable bootstrap disk is worse than a dead guest.
+    local vdb_pci=""
+    vdb_pci="$(basename "$(dirname "$(readlink -f /sys/block/vdb/device 2>/dev/null)" 2>/dev/null)" 2>/dev/null)" || true
+    case "${vdb_pci}" in
+        *:*:*.*) ;;
+        *) vdb_pci="" ;;
+    esac
+    if [ -n "${vdb_pci}" ] && [ -w "/sys/bus/pci/devices/${vdb_pci}/remove" ]; then
+        if ! echo 1 > "/sys/bus/pci/devices/${vdb_pci}/remove" 2>/dev/null; then
+            ts "FATAL: cannot eject the bootstrap config disk (pci ${vdb_pci})"
+            return 1
+        fi
+        ts "bootstrap config disk ejected (one-shot read, pci ${vdb_pci})"
+    else
+        ts "FATAL: no eject handle for the bootstrap config disk"
+        return 1
+    fi
 }
 
 mount_workspace() {

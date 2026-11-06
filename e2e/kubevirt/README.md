@@ -376,6 +376,43 @@ material); delete it to fully reset.
   device level, and every boot starts fresh from the image). There is
   deliberately no dm-verity / verified boot: the in-guest integrity of
   an untrusted guest has no security value under this model.
+- **What the outside boundary relies on**: the fence and the relay's
+  deny are only as good as the CNI's NetworkPolicy enforcement (k3d's
+  built-in flannel + policy layer here), and the boundary channel is
+  only as isolated as the dedicated supervisor topology — root mode
+  requires it precisely so a hostile guest cannot reach another
+  tenant's supervisor. The P1 boundary-handle check (a fresh boundary
+  attaching to a live generation ends it) and the R3 halt of an ended
+  root VM are the controls for a guest that resets in place (including
+  a kexec'd custom kernel): the reset ends the generation, the VM is
+  halted, and the re-read bootstrap material is useless for an ended
+  generation.
+- **The bootstrap config disk is one-shot**: the cloud-init disk
+  (`/dev/vdb`) carries the full boundary bootstrap, including the
+  boundary's private key and launch authentication. The guest init
+  reads it exactly once and ejects the block device from the guest —
+  root in a running session cannot re-read it (verified by the L1
+  probe: no `/dev/vdb`, no `/sys/block/vdb`). A guest reset re-attaches
+  the device, but the pristine boot re-reads it only within the boot
+  flow (before any workload code runs), and the fresh boundary
+  attaching to the live generation ends it (P1) and the VM halts (R3).
+  During the running session the key material lives in the boundary
+  process's memory/environment — root can read it there (ptrace), which
+  is within the model: root in the guest can do anything in the guest.
+- **Guest console logs are guest output, never authoritative**: lines
+  root writes to `/dev/ttyS0` appear verbatim in the launcher pod's
+  `guest-console-log` container. Console output is spoofable by the
+  guest; it is diagnostic only. The authoritative record of sandbox
+  behavior is the supervisor's OCSF event stream (with guest-reported
+  events marked `data_origin=guest`).
+- **Surfaces exposed to the guest** (probed in `run-probes.sh`, inputs
+  for the RFC): the iTCO watchdog (root can arm and fire it; the
+  resulting reset is covered by reset detection + the halt), the QEMU
+  guest-agent virtio-serial channel (attached unconditionally; a
+  host-driven parser exploit is the upstream risk — the disable ask is
+  filed), masquerade DHCP (udp 67 in the launcher netns,
+  guest-reachable), and virtiofsd (root can mount the share without
+  the idmap; chown/mknod are refused and setuid grants no privilege).
 - **The root disk**: a plain writable guest root. The containerDisk
   carries the pristine base (read-only device); the initramfs stacks a
   tmpfs overlay, so the workload can write anywhere in `/` at runtime.
@@ -385,7 +422,10 @@ material); delete it to fully reset.
   untrusted after the first workload executes, so persisted guest state
   has no security value, and stale mutated state would poison later
   boots of the same sandbox (a rebooting root workload would inherit
-  its own tampering).
+  its own tampering). The workspace PVC itself is persistent,
+  root-writable input to every later session of the sandbox — treat
+  anything read from it as untrusted (it is attacker-controlled
+  storage).
 - **Image identity (digest pinning, option A)**: the first boot uses the
   configured `guest_image` tag (the digest does not exist until something
   pulls it — the documented first-generation window). Once the launcher
@@ -418,6 +458,12 @@ material); delete it to fully reset.
 - Networking: masquerade pod network only; the guest clamps its MTU to 1400
   in `guest-init.sh` because the k3d flannel-vxlan pod network is 1450.
 - No GPU, no live-migration/VMI-replacement semantics.
+- The virt-launcher compute container runs without CPU or memory limits
+  (the KubeVirt default when the VM spec carries no resource requests;
+  the sandbox's `cpu_cores`/`memory` shape the domain, not the container).
+  Follow-up for multi-tenant nodes: set launcher resource
+  requests/limits so a runaway guest cannot starve co-located workloads.
+  Single-tenant PoC nodes make this informational.
 - A create interrupted between the Halted VM creation and its `Once` patch
   leaves the VM with the in-flight annotation; after ten minutes the driver
   maps it to a terminal create timeout (public `Error`), so it is visible

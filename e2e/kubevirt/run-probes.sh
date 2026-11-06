@@ -157,6 +157,21 @@ grep -q "uid=0(root)" "${WORKDIR}/id.log" || fail "probe sandbox is not root mod
 echo "probe sandbox Ready (root)"
 
 # ---------------------------------------------------------------------------
+step "L1: the bootstrap config disk is ejected after the one-shot read"
+
+# The cloud-init disk (/dev/vdb) carries the full boundary bootstrap
+# (private key + launch auth). The guest init reads it once and ejects
+# the block device; root in a running guest must not be able to
+# re-read it. A present device is an L1 failure.
+if exec_in_sandbox test -b /dev/vdb 2>/dev/null; then
+    fail "L1: /dev/vdb is still attached in the running root guest — the bootstrap disk is re-readable"
+fi
+if exec_in_sandbox sh -c 'ls /sys/block/vdb 2>/dev/null' | grep -q vdb; then
+    fail "L1: /sys/block/vdb still exists in the running root guest"
+fi
+echo "PASS: the bootstrap config disk is ejected (no /dev/vdb, no /sys/block/vdb in the running root guest)"
+
+# ---------------------------------------------------------------------------
 step "P5: launcher-netns listener audit (run first: it needs the live pair)"
 
 LAUNCHER="$(launcher_pod_name)"
