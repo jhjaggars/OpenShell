@@ -387,18 +387,27 @@ material); delete it to fully reset.
   a kexec'd custom kernel): the reset ends the generation, the VM is
   halted, and the re-read bootstrap material is useless for an ended
   generation.
-- **The bootstrap config disk is one-shot**: the cloud-init disk
-  (`/dev/vdb`) carries the full boundary bootstrap, including the
-  boundary's private key and launch authentication. The guest init
-  reads it exactly once and ejects the block device from the guest —
-  root in a running session cannot re-read it (verified by the L1
-  probe: no `/dev/vdb`, no `/sys/block/vdb`). A guest reset re-attaches
-  the device, but the pristine boot re-reads it only within the boot
-  flow (before any workload code runs), and the fresh boundary
-  attaching to the live generation ends it (P1) and the VM halts (R3).
-  During the running session the key material lives in the boundary
-  process's memory/environment — root can read it there (ptrace), which
-  is within the model: root in the guest can do anything in the guest.
+- **The bootstrap config disk is read once, then ejected (hygiene,
+  not a control)**: the cloud-init disk (`/dev/vdb`) carries the full
+  boundary bootstrap, including the boundary's private key and launch
+  authentication. The guest init reads it exactly once and removes the
+  PCI function backing it. **Root can undo the eject**: writing 1 to
+  `/sys/bus/pci/rescan` re-enumerates the disk (QEMU/KubeVirt still
+  have it attached — cloudInitNoCloud volumes cannot be hot-unplugged
+  in KubeVirt today), and the user-data is readable again. The
+  eject is therefore hygiene (the disk is not sitting attached and
+  trivially readable for the whole session), not a control: the key's
+  exposure to root is the same as through the boundary's own memory
+  (ptrace), and the blast radius is its own sandbox. The L1 probe
+  asserts the eject and then demonstrates the rescan limit. A guest
+  reset re-attaches the device too, but the pristine boot re-reads it
+  only within the boot flow (before any workload code runs), and the
+  fresh boundary attaching to the live generation ends it (P1) and the
+  VM halts (R3). Next step (not built here): deliver the bootstrap
+  through a host-side one-shot channel — e.g. a hotpluggable data
+  volume the driver detaches from the VM once the boundary is Ready,
+  or an enrollment flow over the supervisor channel — so no
+  guest-side eject is needed.
 - **Guest console logs are guest output, never authoritative**: lines
   root writes to `/dev/ttyS0` appear verbatim in the launcher pod's
   `guest-console-log` container. Console output is spoofable by the

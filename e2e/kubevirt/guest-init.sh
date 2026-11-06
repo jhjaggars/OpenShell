@@ -121,19 +121,23 @@ read_bootstrap_config() {
     fi
     ts "bootstrap config loaded (sandbox ${OPENSHELL_SANDBOX:-unknown})"
     umount /config
-    # L1 (one-shot config disk): eject the cloud-init disk after the
-    # read. The bootstrap carries the boundary's private key and launch
-    # authentication — it must not sit re-readable on an attached disk
-    # for the VM's whole life, where root in the guest could re-read it
-    # at any time. virtio-blk has no SCSI-style per-device `delete`, so
-    # the ejection removes the PCI function backing the disk (resolved
-    # from the sysfs device path — never a hardcoded address). A guest
-    # reset re-attaches the device, but the pristine boot re-reads it
-    # only within the boot flow (before any workload code runs), and a
-    # fresh boundary attaching to the live generation ends it (P1's
-    # handle check) and the VM is halted (R3) — the re-read material is
-    # useless for an ended generation. Failing to eject is fatal: a
-    # readable bootstrap disk is worse than a dead guest.
+    # L1 (bootstrap config disk hygiene): read the cloud-init disk
+    # exactly once, then remove the PCI function backing it so the disk
+    # is not sitting attached and trivially readable for the whole
+    # session. This is HYGIENE, NOT A CONTROL: root in the guest can
+    # undo it (writing 1 to /sys/bus/pci/rescan re-enumerates the disk
+    # — QEMU/KubeVirt still have it attached, and cloudInitNoCloud
+    # volumes cannot be hot-unplugged in KubeVirt today), and the
+    # boundary key is equally exposed through the boundary's own memory
+    # (ptrace). The blast radius is its own sandbox. virtio-blk has no
+    # SCSI-style per-device `delete`, so the ejection removes the PCI
+    # function (resolved from the sysfs device path — never a hardcoded
+    # address). A guest reset re-attaches the device, but the pristine
+    # boot re-reads it only within the boot flow (before any workload
+    # code runs), and a fresh boundary attaching to the live generation
+    # ends it (P1's handle check) and the VM is halted (R3). Failing to
+    # eject is fatal — it signals a broken boot environment rather
+    # than silently leaving the disk attached.
     local vdb_pci=""
     vdb_pci="$(basename "$(dirname "$(readlink -f /sys/block/vdb/device 2>/dev/null)" 2>/dev/null)" 2>/dev/null)" || true
     case "${vdb_pci}" in
