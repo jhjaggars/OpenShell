@@ -123,9 +123,21 @@ tests:
         - name: registry-one
         - name: registry-two
     asserts:
-      # The only named rule is the bind on the NetworkPolicy guard ClusterRole.
+      # The only rule that may name anything is exactly the bind on the
+      # NetworkPolicy guard ClusterRole: one resource, clusterroles, and one
+      # verb, bind.
       - notExists:
           path: rules[?(@.resources[0] != "clusterroles")].resourceNames
+      - notExists:
+          path: rules[?(@.resources[1])].resourceNames
+      - notExists:
+          path: rules[?(@.verbs[0] != "bind")].resourceNames
+      - notExists:
+          path: rules[?(@.verbs[1])].resourceNames
+      - notExists:
+          path: rules[?(@.resourceNames[0] != "openshell-netpol-guard-my-namespace")].resourceNames
+      - notExists:
+          path: rules[?(@.resourceNames[1])].resourceNames
       - contains:
           path: rules
           content:
@@ -240,6 +252,13 @@ tests:
             resources: ["clusterroles"]
             verbs: ["bind"]
             resourceNames: ["openshell-netpol-guard-my-namespace"]
+      # bind without resourceNames would allow binding any ClusterRole.
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["rbac.authorization.k8s.io"]
+            resources: ["clusterroles"]
+            verbs: ["bind"]
 
   - it: never grants cluster-wide NetworkPolicy list or watch
     set:
