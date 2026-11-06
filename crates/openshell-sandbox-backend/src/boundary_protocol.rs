@@ -2031,13 +2031,6 @@ pub const KUBEVIRT_GENERATION_CLAIM: &str = "kubevirt.generation";
 /// runs the workload as an unprivileged sandboxed user or as root.
 pub const WORKLOAD_MODE_CLAIM: &str = "kubevirt.workload_mode";
 
-/// Resource claim key carrying the dm-verity root hash of the guest image
-/// (the verified-root binding).
-///
-/// Required for the privileged (root-workload) class: the supervisor
-/// refuses an unverified privileged descriptor.
-pub const WORKLOAD_ROOT_HASH_CLAIM: &str = "kubevirt.root_hash";
-
 /// Claim value selecting the privileged (root-workload) mode: the workload
 /// runs as root in the guest and in-guest enforcement (Landlock, seccomp,
 /// identity) is demoted by design.

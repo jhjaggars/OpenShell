@@ -195,10 +195,7 @@ impl ResolvedWorkloadIdentity {
     /// boundary; see the root-workload VM plan), so this constructor
     /// accepts zero. It is only for that class: callers must gate it on
     /// the workload mode.
-    pub fn new_privileged(
-        source: String,
-        resource_digest: String,
-    ) -> Result<Self, BackendError> {
+    pub fn new_privileged(source: String, resource_digest: String) -> Result<Self, BackendError> {
         if source.trim().is_empty() || resource_digest.trim().is_empty() {
             return Err(BackendError::Descriptor(
                 "workload identity source and resource digest are required".to_string(),

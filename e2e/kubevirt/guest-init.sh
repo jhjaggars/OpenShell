@@ -9,11 +9,11 @@
 # init (crates/openshell-driver-vm/scripts/openshell-vm-sandbox-init.sh) but
 # for KubeVirt hardware:
 #
-#   /dev/vda  rootfs      (containerDisk carrying the dm-verity hash tree;
-#                          the initramfs mounts the verified read-only lower
-#                          and stacks a tmpfs overlay as the writable root —
+#   /dev/vda  rootfs      (containerDisk, read-only at the device level;
+#                          the initramfs mounts the read-only lower and
+#                          stacks a tmpfs overlay as the writable root —
 #                          in-session writes are RAM and every boot starts
-#                          from the verified image)
+#                          fresh from the image)
 #   /dev/vdb  config disk (cloudInitNoCloud ISO rendered from the driver's
 #                          bootstrap Secret; shell-sourceable user-data)
 #   workspace  virtio-fs share backed by the per-sandbox PVC (filesystem
@@ -211,11 +211,12 @@ main() {
         # exit (see the wait + poweroff below). Root mode (uid/gid 0)
         # launches the privileged boundary; the sandboxed default uses
         # the capability-free launch.
-        # The boundary binary comes from the trusted bind path when the
-        # verified boot staged it (the initramfs pins the verity-verified
-        # inode at /run/openshell/openshell-sandbox); the legacy plain boot
-        # falls back to the rootfs copy. A root workload can shadow the
-        # rootfs copy in the overlay, but the pinned inode is read-only.
+        # The boundary binary comes from the initramfs bind path when
+        # staged (the initramfs pins the image inode at
+        # /run/openshell/openshell-sandbox); otherwise the rootfs copy is
+        # used. The pin is a freshness measure (the boundary starts from
+        # image bytes), not a trust boundary — a root workload can unmount
+        # anything in-guest.
         BOUNDARY_BIN=/usr/local/bin/openshell-sandbox
         if [ -x /run/openshell/openshell-sandbox ]; then
             BOUNDARY_BIN=/run/openshell/openshell-sandbox

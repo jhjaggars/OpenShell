@@ -1457,7 +1457,8 @@ fn launch_capability_free(_args: &[String]) -> Result<()> {
 /// in-guest enforcement (capability drop, `no_new_privs`, Landlock, seccomp)
 /// is removed — it is meaningless against root. The security boundary is
 /// everything outside the guest: the fence, the supervisor's policy, and
-/// the per-boot trusted code (initramfs + dm-verity).
+/// the VM boundary itself. The guest is untrusted as soon as a workload
+/// executes; guest reports are marked `data_origin=guest`.
 #[cfg(target_os = "linux")]
 fn launch_privileged(args: &[String]) -> Result<()> {
     use miette::Context as _;

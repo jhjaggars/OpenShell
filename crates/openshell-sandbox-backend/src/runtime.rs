@@ -651,23 +651,6 @@ pub fn validate_runtime_coordinates(
             "workload identity is not canonical".into(),
         ));
     }
-    // R1: the privileged (root-workload) class must carry the dm-verity
-    // root-hash claim — the supervisor refuses an unverified privileged
-    // descriptor, so a misconfigured driver (empty root_hash, which its
-    // own config validation also rejects) cannot silently boot root
-    // workloads unverified.
-    if privileged_mode
-        && !runtime_descriptor
-            .resource_claims
-            .contains_key(crate::boundary_protocol::WORKLOAD_ROOT_HASH_CLAIM)
-    {
-        return Err(BackendError::Descriptor(
-            "privileged (root-workload) sandboxes require the kubevirt.root_hash \
-             resource claim (the dm-verity binding); refusing an unverified \
-             privileged descriptor"
-                .into(),
-        ));
-    }
     validate_resource_claims(&runtime_descriptor.resource_claims)?;
     runtime_descriptor
         .provisioning_evidence

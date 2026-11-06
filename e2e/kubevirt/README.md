@@ -114,6 +114,7 @@ OCI sandbox images as VM disks (the guest image is purpose-built). See
 | `port-io.c` | Static-musl port-I/O helper for the P2 probe — compiled at probe time in a docker alpine container and staged into the guest through the exec channel; it does NOT ship in the product guest image. `/dev/port` is byte-granular and QEMU drops byte writes to dword/word emulated registers (PCI config address, TCO counters), so the probe arms the iTCO watchdog with real `OUT` instructions through this helper. |
 | `demo-policy-root.yaml` | Root-workload variant of the acceptance policy: same network semantics as `demo-policy.yaml` without the `filesystem_policy`, `landlock`, and `process` sections (rejected for root workloads — unenforceable in-guest) and without `binaries` lists (binary identity is not required in root mode). `run-demo.sh` selects it automatically for `OPENSHELL_KVPOC_WORKLOAD=root`. |
 | `guest-init.sh` | Guest PID-1 init (baked into the image). |
+| `initramfs-init.sh` | Boot-stage initramfs init: mounts the read-only containerDisk root, stacks the writable tmpfs overlay, bind-pins the guest init + boundary binary from the image, and switch_roots. |
 | `demo.sh` | Starts a host gateway (TLS) against the `kvpoc` cluster and registers it as the CLI's mTLS gateway; `--demo` then runs `run-demo.sh` against it. Defaults to the dedicated supervisor topology; `OPENSHELL_KVPOC_TOPOLOGY=gateway` selects the shared one. |
 | `run-demo.sh` | The full acceptance demo (10 steps, no failure tolerance): create → Ready, fence check, exec, env scrub, L4/L7 policy, bypass blocked, stop/start with stable VM/fence UIDs (dedicated: a rotated and re-claimed supervisor Pod UID), fence drift verification, main-process exit → Error, delete with zero leftovers. Topology-aware via `OPENSHELL_KVPOC_TOPOLOGY`. |
 | `demo-policy.yaml` | The acceptance policy: L4 raw-TCP allow/deny and L7 HTTPS GET-allow/POST-deny. |
@@ -364,23 +365,27 @@ material); delete it to fully reset.
 
 ## Known gaps / follow-ups
 
-- **Root-mode verity binding (R4, in progress)**: in root mode the
-  driver resolves the dm-verity binding (geometry + root hash) from the
-  guest image's OCI config labels (`io.openshell.kubevirt.root-hash` /
-  `io.openshell.kubevirt.verity-geometry`, stamped by
-  `build-guest-image.sh`) at create time, and the resolved binding feeds
-  both the VM kernel args and the supervisor's launch-descriptor claim.
-  **The label read is dev-only**: it queries the gateway host's container
-  runtime (the Docker Engine REST API over its unix socket, honouring
-  `DOCKER_HOST` for the `unix://` scheme) **by tag** — the same OCI
-  config blob a registry serves, but read from the local daemon where
-  k3d side-loads land. It is not a production trust path: a
-  registry-backed cluster needs to read the config from the registry's
-  manifest API at the pinned digest (with pull-secret auth), which is
-  NOT implemented — the registry path is a pending user decision. Root
-  mode fails closed at the driver when neither the image label nor the
-  config provides a validated binding (the supervisor's claim check is
-  the second layer).
+- **Root-workload trust model**: the guest is untrusted as soon as an
+  agent/sandbox workload executes for the first time. Everything that
+  matters is enforced outside the guest: the VM boundary, the egress
+  fence (NetworkPolicy + the nftables relay's fail-closed deny), the
+  supervisor's policy, and guest-reported data marked `data_origin=guest`
+  in OCSF. Nothing in-guest is a trust anchor — root in the guest can
+  change anything, including the base, kernel, and bootloader (writes
+  land in the RAM overlay; the containerDisk base is read-only at the
+  device level, and every boot starts fresh from the image). There is
+  deliberately no dm-verity / verified boot: the in-guest integrity of
+  an untrusted guest has no security value under this model.
+- **The root disk**: a plain writable guest root. The containerDisk
+  carries the pristine base (read-only device); the initramfs stacks a
+  tmpfs overlay, so the workload can write anywhere in `/` at runtime.
+  Across stop and start the root is **wiped** — every boot re-reads the
+  image and starts fresh; only the workspace PVC (`/mnt/workspace`,
+  per-sandbox) persists. This is the recommended choice: the guest is
+  untrusted after the first workload executes, so persisted guest state
+  has no security value, and stale mutated state would poison later
+  boots of the same sandbox (a rebooting root workload would inherit
+  its own tampering).
 - **Image identity (digest pinning, option A)**: the first boot uses the
   configured `guest_image` tag (the digest does not exist until something
   pulls it — the documented first-generation window). Once the launcher

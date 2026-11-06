@@ -147,12 +147,6 @@ FRAG
     SHARED_SUPERVISOR_CONFIG=''
 fi
 
-# R4: the dm-verity binding is read server-side by the driver from the
-# guest image's OCI config (through the container runtime API) at create
-# time — no config rendering needed. The driver binds the hash to the
-# image; the config value (if set) is verified against the label.
-echo "==> verified boot: the driver reads the verity binding from the image config at create time"
-
 CONFIG_PATH="${STATE_DIR}/gateway.toml"
 cat >"${CONFIG_PATH}" <<EOF
 # OpenShell gateway for the KubeVirt compute-driver PoC (e2e/kubevirt/).
@@ -198,10 +192,6 @@ guest_image_pull_policy = "IfNotPresent"
 cpu_cores = 1
 memory = "1Gi"
 workload = "${OPENSHELL_KVPOC_WORKLOAD:-sandboxed}"
-# Optional: an operator-provided binding. Empty by default — the driver
-# resolves the binding from the image's OCI labels (R4). A non-empty
-# value that disagrees with the image label fails the create (drift).
-root_hash = "${OPENSHELL_KVPOC_ROOT_HASH:-}"
 ${SHARED_SUPERVISOR_CONFIG}
 EOF
 

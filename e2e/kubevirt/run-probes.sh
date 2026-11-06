@@ -543,7 +543,7 @@ fi
 # RFC caveat: root can read the boundary's memory, learn the handle, and
 # present it after a reset. Acceptable: root already holds the key and
 # handle in-session (it can impersonate its own boundary without
-# rebooting). The initramfs agent plus dm-verity (commit 6) make post-reset
+# rebooting). The fence plus the supervisor's policy make post-reset
 # CODE trusted.
 
 # The invariant: a reset must not pass unnoticed. Whatever terminal or
@@ -610,7 +610,7 @@ done
 # /dev/port. The probe tries, in order: the module, the device node, and a
 # direct port-I/O arm of the TCO timer. RFC wording: "not exposed by the
 # stock kernel; reachable by root; covered by reset detection (P1) and
-# trusted boot (commit 6)".
+# the fresh-per-boot image".
 #
 # The port-io helper is a PROBE TOOL and does not ship in the guest image:
 # /dev/port is byte-granular and QEMU drops byte writes to the dword/word
@@ -726,7 +726,7 @@ if [ "${ARMED}" = "1" ]; then
             && echo "  supervisor exit reason: ${P2_HANDLE_LINE}" \
             || echo "  (no attachment-denied line captured; log cadence)"
         if [ "${P2_PHASE}" = "Phase: Error" ]; then
-            echo "PASS/recorded: the iTCO watchdog reset the guest (guest side: ${WD_RESET}); the control plane ended the generation (Phase Error) — covered by reset detection (P1) and trusted boot"
+            echo "PASS/recorded: the iTCO watchdog reset the guest (guest side: ${WD_RESET}); the control plane ended the generation (Phase Error) — covered by reset detection (P1) and the fresh-per-boot image"
         else
             echo "FINDING: the watchdog reset the guest (${WD_RESET}) but the control plane reports '${P2_PHASE}'; record for the reset-detection design (item 7)"
         fi
@@ -737,12 +737,12 @@ if [ "${ARMED}" = "1" ]; then
         # is "root can arm the TCO and make it fire; the reset gate is
         # what it is on this wiring" — either way covered by reset
         # detection (P1) and trusted boot.
-        echo "FINDING: the TCO timer FIRED (TCO1_STS TIMEOUT, ${TCO_STATUS#*TCO1_STS=0x0008}) — root arms and fires it. This run: $( [ -n "${WD_RESET}" ] && echo "the machine RESET (${WD_RESET})" || echo "the machine did NOT reset (uptime continuous, phase unchanged); the reset gate held" ). Either outcome is covered by reset detection (P1) and trusted boot; the RFC records the demonstrated state (armable, firing, reset outcome as observed)"
+        echo "FINDING: the TCO timer FIRED (TCO1_STS TIMEOUT, ${TCO_STATUS#*TCO1_STS=0x0008}) — root arms and fires it. This run: $( [ -n "${WD_RESET}" ] && echo "the machine RESET (${WD_RESET})" || echo "the machine did NOT reset (uptime continuous, phase unchanged); the reset gate held" ). Either outcome is covered by reset detection (P1) and the fresh-per-boot image; the RFC records the demonstrated state (armable, firing, reset outcome as observed)"
     else
-        echo "FINDING: the watchdog did not observably fire within 120s and no status flags were readable; the RFC records the surface as reachable-by-root regardless — covered by reset detection (P1) and trusted boot"
+        echo "FINDING: the watchdog did not observably fire within 120s and no status flags were readable; the RFC records the surface as reachable-by-root regardless — covered by reset detection (P1) and the fresh-per-boot image"
     fi
 else
-    echo "FINDING: the TCO could not be armed from the stock guest (no /dev/watchdog, port-I/O arm unavailable or readback implausible); the surface is still reachable by root with a custom kernel module — covered by reset detection (P1) and trusted boot"
+    echo "FINDING: the TCO could not be armed from the stock guest (no /dev/watchdog, port-I/O arm unavailable or readback implausible); the surface is still reachable by root with a custom kernel module — covered by reset detection (P1) and the fresh-per-boot image"
 fi
 
 # ---------------------------------------------------------------------------

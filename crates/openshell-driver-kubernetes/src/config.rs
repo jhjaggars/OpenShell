@@ -229,14 +229,6 @@ pub struct KubeVirtConfig {
     /// class — root workload, no in-guest enforcement, dedicated
     /// supervisor topology required).
     pub workload: KubeVirtWorkloadMode,
-    /// dm-verity binding for the guest rootfs: "<blocks>:<hash-start>:<root
-    /// hash>" as stamped by the image build
-    /// (io.openshell.kubevirt.verity-geometry + root-hash labels). When
-    /// set, the guest boots through the trusted initramfs: dm-verity over
-    /// the containerDisk rootfs, a read-only verified lower, and a tmpfs
-    /// overlay for the writable root. When empty, the legacy plain boot
-    /// (writable rootfs, no verification) is used.
-    pub root_hash: String,
 }
 
 impl Default for KubeVirtConfig {
@@ -248,7 +240,6 @@ impl Default for KubeVirtConfig {
             workload: KubeVirtWorkloadMode::default(),
             memory: "1Gi".to_string(),
             workspace_pvc: true,
-            root_hash: String::new(),
         }
     }
 }
@@ -804,20 +795,6 @@ impl KubernetesComputeConfig {
                     .to_string(),
             );
         }
-        // R1: the root workload class must not boot unverified. The binding
-        // may come from the config OR from the image's OCI labels (read
-        // server-side by the driver at create time, R4). Sandboxed mode
-        // keeps it optional. The driver's resolve_root_hash_binding
-        // fail-closes when neither is available.
-        // (No config-level check: the image label path means an empty config
-        // is valid in root mode when the image carries the binding.)
-        // R2: validate the binding's shape wherever it is set (root mode
-        // requires it; sandboxed mode may carry it) — it is interpolated
-        // into kernelArgs, so a malformed value must fail at load, not at
-        // render time.
-        if !self.kubevirt.root_hash.trim().is_empty() {
-            crate::kubevirt::validate_root_hash_binding(self.kubevirt.root_hash.trim())?;
-        }
         Ok(())
     }
 
@@ -1316,55 +1293,6 @@ fn validate_provider_spiffe_workload_api_socket_path_value(
 #[cfg(test)]
 mod tests {
 
-    fn kubevirt_config(workload: KubeVirtWorkloadMode, root_hash: &str) -> KubernetesComputeConfig {
-        // Reach the kubevirt validation path (the default runtime is the
-        // pod mode, which skips it entirely).
-        KubernetesComputeConfig {
-            runtime: KubernetesRuntimeMode::KubeVirt,
-            grpc_endpoint: "https://gateway:443".to_string(),
-            kubevirt: KubeVirtConfig {
-                guest_image: "kvpoc/openshell-sandbox-vm:dev".to_string(),
-                workload,
-                root_hash: root_hash.to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn root_workload_verity_binding_from_config_or_image() {
-        // R4: the binding may come from the config OR from the image's
-        // OCI labels (read server-side by the driver at create time).
-        // An empty config in root mode is valid — the driver's
-        // resolve_root_hash_binding fail-closes when neither source has
-        // a binding. Sandboxed mode stays optional.
-        kubevirt_config(KubeVirtWorkloadMode::Root, "")
-            .validate_configuration()
-            .expect("root mode with empty config passes (the driver reads the image label)");
-        kubevirt_config(
-            KubeVirtWorkloadMode::Root,
-            &format!("179200:179200:{}", "0123abcd".repeat(8)),
-        )
-        .validate_configuration()
-        .expect("root mode with a config binding passes");
-        kubevirt_config(KubeVirtWorkloadMode::Sandboxed, "")
-            .validate_configuration()
-            .expect("sandboxed mode keeps the binding optional");
-    }
-
-    #[test]
-    fn malformed_verity_binding_fails_validation_in_any_mode() {
-        // R2 at the config boundary: a malformed binding is rejected even
-        // in sandboxed mode (it would be interpolated into kernelArgs).
-        let error = kubevirt_config(
-            KubeVirtWorkloadMode::Sandboxed,
-            "179200:179200:0123 init=/bin/sh",
-        )
-        .validate_configuration()
-        .expect_err("a space in the binding must fail validation");
-        assert!(error.contains("root_hash"), "{error}");
-    }
     use super::*;
     use BTreeMap as HashMap;
 

@@ -70,66 +70,6 @@ const KUBEVIRT_GUEST_INITRD_PATH: &str = "/boot/initramfs-virt";
 const KUBEVIRT_KERNEL_ARGS: &str =
     "console=ttyS0 root=/dev/vda rw rootfstype=ext4 modules=ext4 init=/opt/openshell/init";
 
-/// Kernel arguments for the verified boot (commit 6): the initramfs init
-/// (initramfs-init.sh, shipped in the image) consumes the verity geometry
-/// and root hash, opens dm-verity over the containerDisk, mounts the
-/// read-only verified lower, stacks a tmpfs overlay, and execs the guest
-/// init from a trusted bind path. The `root=`/`init=` of the legacy args
-/// are inert in this flow — the initramfs owns the root decision — but
-/// kept for the stock initramfs fallback path.
-fn kubevirt_kernel_args(root_hash: &str) -> Result<String, String> {
-    if root_hash.is_empty() {
-        Ok(KUBEVIRT_KERNEL_ARGS.to_string())
-    } else {
-        // R2: the binding is operator config or image label interpolated
-        // into kernelArgs — the trust anchor. A malformed value (e.g.
-        // containing a space) would inject kernel arguments, so validate
-        // the exact shape before it reaches the command line.
-        validate_root_hash_binding(root_hash)?;
-        Ok(format!(
-            "{KUBEVIRT_KERNEL_ARGS} openshell_verity={root_hash}"
-        ))
-    }
-}
-
-/// Validate a dm-verity root-hash binding: `<blocks>:<hash-start>:<hash>`
-/// with decimal block counts and a 64-character lowercase-hex sha256.
-/// Returns a descriptive error for anything else.
-pub fn validate_root_hash_binding(root_hash: &str) -> Result<(), String> {
-    let parts: Vec<&str> = root_hash.split(':').collect();
-    if parts.len() != 3 {
-        return Err(format!(
-            "root_hash must be <blocks>:<hash-start>:<hash> (3 colon-separated \
-             fields), got {root_hash:?}"
-        ));
-    }
-    // The first two fields are decimal block counts (the digest is hex and
-    // validated separately below).
-    for (index, part) in parts.iter().take(2).enumerate() {
-        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(format!(
-                "root_hash field {} ({part:?}) must be a decimal block count",
-                index + 1
-            ));
-        }
-    }
-    let hash = parts[2];
-    if hash.len() != 64
-        || !hash
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    {
-        return Err("root_hash digest must be 64 lowercase hex characters (sha256)".to_string());
-    }
-    Ok(())
-}
-
-/// Resource claim carrying the verified-root binding: the dm-verity root
-/// hash of the guest image, when configured. The claim makes the binding
-/// auditable on the trusted descriptor (it mirrors what the guest actually
-/// verified at boot).
-pub const ROOT_HASH_CLAIM: &str = "kubevirt.root_hash";
-
 /// Condition reason set on `Ready=False` while the VM is booting. Matches the
 /// gateway's transient-reason vocabulary so the sandbox stays `Provisioning`
 /// rather than `Error`.
@@ -367,10 +307,6 @@ pub struct KubeVirtSandboxParams<'a> {
     pub namespace: &'a str,
     /// `KubeVirt` resource name (`{workspace}--{name}` in shared mode).
     pub kube_name: &'a str,
-    /// The driver-resolved `dm-verity` binding (R4): read from the image's
-    /// `OCI` config at create time. Overrides the config's `root_hash` for
-    /// both the VM kernel args and the bootstrap descriptor claims.
-    pub resolved_root_hash: String,
 }
 
 /// Render the workspace PVC. The guest init formats it on first boot (sentinel
@@ -407,16 +343,14 @@ pub fn render_workspace_pvc(params: &KubeVirtSandboxParams<'_>) -> PersistentVol
 }
 
 /// Render the `VirtualMachine`.
-pub fn render_virtual_machine(
-    params: &KubeVirtSandboxParams<'_>,
-) -> Result<DynamicObject, KubernetesDriverError> {
+pub fn render_virtual_machine(params: &KubeVirtSandboxParams<'_>) -> DynamicObject {
     let sandbox = params.sandbox;
     let kubevirt = &params.config.kubevirt;
-    // The kernel args carry the resolved verity binding; a malformed
-    // binding is an error, not a panic (image label contents must not be
-    // able to crash the request path).
-    let kernel_args = kubevirt_kernel_args(&params.resolved_root_hash)
-        .map_err(KubernetesDriverError::Precondition)?;
+    // The kernel args boot the purpose-built initramfs init, which mounts
+    // the containerDisk root read-only and stacks a writable tmpfs overlay
+    // (the guest root is writable at runtime and fresh from the image on
+    // every boot — the guest is untrusted once a workload has run).
+    let kernel_args = KUBEVIRT_KERNEL_ARGS;
     let mut labels = sandbox_labels(sandbox, Some(&params.config.gateway_id));
     let annotations = sandbox_annotations(sandbox);
 
@@ -548,7 +482,7 @@ pub fn render_virtual_machine(
         ..Default::default()
     };
     obj.data = data;
-    Ok(obj)
+    obj
 }
 
 /// Label set on the VM template so the VMI (and virt-launcher pod) carry the
@@ -604,179 +538,6 @@ pub const KUBEVIRT_CREATE_DEADLINE_MS: i64 = 10 * 60 * 1000;
 /// the VM spec's direct kernel boot (M6: the claim tracks what runs, not
 /// the configured string — after a config change, start must not claim an
 /// image the VM is not booting).
-/// Read the dm-verity root-hash binding from the guest image's OCI config.
-///
-/// R4: the driver reads the binding server-side from the image itself at
-/// create/pin time, binding the hash to the image — not to a config value
-/// that could drift. **Dev-only**: the read goes through the gateway
-/// host's container runtime (the Docker Engine REST API over its unix
-/// socket, honouring `DOCKER_HOST` for the `unix://` scheme) by tag —
-/// the same OCI config blob a registry serves, but read from the local
-/// daemon where k3d side-loads land. A production registry-backed
-/// cluster must read the config from the registry's manifest API at the
-/// pinned digest instead (NOT implemented; a pending user decision).
-/// Returns None when the image has no labels (a pre-verity image), the
-/// daemon is unreachable, or the image is not present locally.
-const ROOT_HASH_LABEL: &str = "io.openshell.kubevirt.root-hash";
-const GEOMETRY_LABEL: &str = "io.openshell.kubevirt.verity-geometry";
-const DOCKER_API_VERSION: &str = "v1.46";
-
-/// The maximum accepted HTTP response from the local daemon's image
-/// inspect endpoint. The OCI config blob for a guest image is well under
-/// a megabyte; refuse absurd sizes instead of buffering unboundedly.
-const DOCKER_INSPECT_MAX_RESPONSE: u64 = 4 * 1024 * 1024;
-
-/// Resolve the container-runtime socket for the label read. `DOCKER_HOST`
-/// is honoured for the `unix://` scheme (the local-daemon case this
-/// dev-only read targets). Other schemes (`tcp://`, `npipe://`) are not
-/// supported: a remote daemon needs auth and TLS decisions that belong
-/// to the registry-backed read, not this dev path.
-fn docker_socket_path() -> Option<std::path::PathBuf> {
-    match std::env::var("DOCKER_HOST") {
-        Ok(value) if !value.is_empty() => {
-            if let Some(path) = value.strip_prefix("unix://") {
-                if path.is_empty() {
-                    return None;
-                }
-                Some(std::path::PathBuf::from(path))
-            } else {
-                tracing::debug!(
-                    host = %value,
-                    "DOCKER_HOST uses an unsupported scheme; only unix:// is honoured for the dev-only label read"
-                );
-                None
-            }
-        }
-        _ => Some(std::path::PathBuf::from("/var/run/docker.sock")),
-    }
-}
-
-/// The image reference is interpolated into the HTTP request line; only
-/// references made of unreserved path characters are accepted, so the
-/// reference can never inject CR/LF or header bytes into the request to
-/// the runtime API.
-fn safe_image_ref(image: &str) -> bool {
-    !image.is_empty()
-        && image
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'/' | b':' | b'-' | b'_'))
-}
-
-/// Decode a chunked transfer body: a hex size line, that many bytes of
-/// chunk data, CRLF, repeated; a zero-sized chunk ends the body.
-fn decode_chunked_body(body: &str) -> Option<String> {
-    let mut decoded = String::with_capacity(body.len());
-    let mut rest = body;
-    loop {
-        let (size_line, remainder) = rest.split_once("\r\n")?;
-        // Chunk extensions (after `;`) are ignored.
-        let size_text = size_line.split(';').next()?.trim();
-        let size = usize::from_str_radix(size_text, 16).ok()?;
-        rest = remainder;
-        if size == 0 {
-            return Some(decoded);
-        }
-        if rest.len() < size + 2 || !rest.is_char_boundary(size) {
-            return None;
-        }
-        decoded.push_str(&rest[..size]);
-        rest = &rest[size..];
-        if !rest.starts_with("\r\n") {
-            return None;
-        }
-        rest = &rest[2..];
-    }
-}
-
-/// Read the dm-verity root-hash binding from the guest image's OCI config
-/// through the container runtime's API (the Docker Engine REST API via
-/// its unix socket), which serves the same OCI config blob a registry
-/// would. Blocking I/O with connect/read timeouts — call from
-/// `spawn_blocking` on the async path. Returns `None` when the image has
-/// no labels (a pre-verity image), the daemon is unreachable, or the
-/// image is not present locally.
-pub fn read_image_verity_binding(guest_image: &str) -> Option<String> {
-    // The Docker Engine API serves the OCI image config (the same data a
-    // registry would): GET /images/{name}/json returns Config.Labels.
-    // Connect over the unix socket, not via the docker CLI.
-    use std::io::{Read as _, Write as _};
-    if !safe_image_ref(guest_image) {
-        tracing::warn!(
-            image = %guest_image,
-            "guest image ref contains characters that cannot be sent to the container runtime API; no verity label was read"
-        );
-        return None;
-    }
-    let socket = docker_socket_path()?;
-    if !socket.exists() {
-        tracing::debug!(
-            image = %guest_image,
-            socket = %socket.display(),
-            "no container runtime socket; the image config is not readable server-side"
-        );
-        return None;
-    }
-    // Connect and read with timeouts: this runs on the sandbox create
-    // path, and a wedged daemon must not stall creation.
-    // std has no connect timeout for unix sockets, but connecting to a
-    // local socket is immediate (the kernel either connects or refuses);
-    // the read/write timeouts below cover a wedged daemon.
-    let mut stream = std::os::unix::net::UnixStream::connect(&socket).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .ok()?;
-    let request = format!(
-        "GET /{DOCKER_API_VERSION}/images/{guest_image}/json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-    );
-    stream.write_all(request.as_bytes()).ok()?;
-    let mut response = Vec::new();
-    // `Connection: close` means EOF terminates the body; cap the read so
-    // a broken daemon cannot make us buffer unboundedly.
-    stream
-        .take(DOCKER_INSPECT_MAX_RESPONSE)
-        .read_to_end(&mut response)
-        .ok()?;
-    let response = String::from_utf8_lossy(&response);
-
-    // Split headers from body; the body is the JSON image inspect result.
-    let (headers, body) = response.split_once("\r\n\r\n")?;
-    // The status line must be a 200 (a 404 for an absent image or a 5xx
-    // from the daemon is not a binding).
-    let status = headers.lines().next()?.split_whitespace().nth(1)?;
-    if status != "200" {
-        tracing::debug!(
-            image = %guest_image,
-            status = %status,
-            "the container runtime API did not return the image config"
-        );
-        return None;
-    }
-    let body = if headers
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked")
-    {
-        decode_chunked_body(body)?
-    } else {
-        body.to_string()
-    };
-    let inspect: serde_json::Value = serde_json::from_str(body.trim_start()).ok()?;
-
-    let labels = inspect
-        .pointer("/Config/Labels")
-        .and_then(serde_json::Value::as_object)?;
-    let root_hash = labels
-        .get(ROOT_HASH_LABEL)
-        .and_then(serde_json::Value::as_str)?;
-    let geometry = labels
-        .get(GEOMETRY_LABEL)
-        .and_then(serde_json::Value::as_str)?;
-    if root_hash.is_empty() || geometry.is_empty() {
-        return None;
-    }
-    Some(format!("{geometry}:{root_hash}"))
-}
-
 pub fn kubevirt_boot_image(vm: &DynamicObject) -> String {
     vm.data
         .pointer("/spec/template/spec/domain/firmware/kernelBoot/container/image")
@@ -1160,52 +921,6 @@ pub async fn list_virtual_machines(
 mod tests {
     use super::*;
 
-    #[test]
-    fn read_image_verity_binding_returns_none_for_absent_socket() {
-        // The function reads through /var/run/docker.sock; in the test
-        // environment there is no socket (or the image doesn't exist).
-        // Verify it returns None (not an error) — the caller decides
-        // whether None is fatal based on the workload mode.
-        let result = read_image_verity_binding("kvpoc/openshell-sandbox-vm:this-does-not-exist");
-        assert!(
-            result.is_none(),
-            "an unreadable image must yield no binding (not an error)"
-        );
-    }
-
-    #[test]
-    fn image_ref_with_request_injection_bytes_yields_no_label() {
-        // The image ref is interpolated into the HTTP request line; a ref
-        // carrying CR/LF (or other non-path bytes) must be refused before
-        // any request is built, so image refs can never inject headers or
-        // a second request into the runtime API call.
-        for evil in [
-            "evil\\r\\nGET /_ping HTTP/1.1\\r\\n\\r\\n",
-            "evil image",
-            "evil%2f..",
-            "",
-        ] {
-            assert!(
-                read_image_verity_binding(evil).is_none(),
-                "an unsafe ref must yield no binding: {evil:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn chunked_bodies_decode_to_the_payload() {
-        // The daemon may answer with Transfer-Encoding: chunked; the
-        // decoder must reassemble the chunks (not just find the first
-        // `{`, which mis-parses when a chunk boundary splits the JSON or
-        // an extension appears in the size line).
-        let body = "5\r\n{\"a\":\r\n3;ext=1\r\n123\r\n2\r\n42\r\n0\r\n\r\n";
-        assert_eq!(decode_chunked_body(body).as_deref(), Some("{\"a\":12342"));
-        // A truncated body (no terminal chunk) decodes to None.
-        assert_eq!(decode_chunked_body("5\r\nabc"), None);
-        // A body whose declared size exceeds its content is None.
-        assert_eq!(decode_chunked_body("ff\r\nabc\r\n0\r\n\r\n"), None);
-    }
-
     #[allow(
         unused_imports,
         reason = "used by the tests below; the inline test above also imports super"
@@ -1238,7 +953,6 @@ mod tests {
                 memory: "2Gi".to_string(),
                 workspace_pvc: true,
                 workload: crate::config::KubeVirtWorkloadMode::default(),
-                root_hash: String::new(),
             },
             shared_supervisor: Some(crate::SharedSupervisorConfig {
                 service_name: "openshell-supervisor".to_string(),
@@ -1259,14 +973,13 @@ mod tests {
             config,
             namespace: "kvpoc-sandboxes",
             kube_name: "default--demo",
-            resolved_root_hash: String::new(),
         }
     }
 
     #[test]
     fn virtual_machine_renders_kubevirt_contract() {
         let cfg = config();
-        let vm = render_virtual_machine(&params(&sandbox(), &cfg)).expect("render");
+        let vm = render_virtual_machine(&params(&sandbox(), &cfg));
 
         assert_eq!(vm.metadata.name.as_deref(), Some("default--demo"));
         assert_eq!(vm.metadata.namespace.as_deref(), Some("kvpoc-sandboxes"));
@@ -1340,7 +1053,7 @@ mod tests {
         // device, so nothing optional is attached — no graphics, no memory
         // balloon, no input. The serial console stays for the boot log.
         let cfg = config();
-        let vm = render_virtual_machine(&params(&sandbox(), &cfg)).expect("render");
+        let vm = render_virtual_machine(&params(&sandbox(), &cfg));
         let devices = &vm.data["spec"]["template"]["spec"]["domain"]["devices"];
         assert_eq!(devices["autoattachGraphicsDevice"], false);
         assert_eq!(devices["autoattachMemBalloon"], false);
@@ -1352,7 +1065,7 @@ mod tests {
     fn virtual_machine_omits_workspace_without_pvc() {
         let mut cfg = config();
         cfg.kubevirt.workspace_pvc = false;
-        let vm = render_virtual_machine(&params(&sandbox(), &cfg)).expect("render");
+        let vm = render_virtual_machine(&params(&sandbox(), &cfg));
         let volumes = vm.data["spec"]["template"]["spec"]["volumes"]
             .as_array()
             .unwrap();
@@ -1368,7 +1081,7 @@ mod tests {
     #[test]
     fn vm_status_maps_conditions() {
         let cfg = config();
-        let vm = render_virtual_machine(&params(&sandbox(), &cfg)).expect("render");
+        let vm = render_virtual_machine(&params(&sandbox(), &cfg));
         let mut with_status = vm.clone();
         with_status.data["status"] = serde_json::json!({"ready": true});
         let (_, sbx) =
@@ -1396,7 +1109,7 @@ mod tests {
 
         // A freshly created VM (runStrategy Once, not ready) must NOT report
         // Suspended even though printableStatus is Stopped.
-        let mut fresh = render_virtual_machine(&params(&sandbox(), &config())).expect("render");
+        let mut fresh = render_virtual_machine(&params(&sandbox(), &config()));
         fresh.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Stopped"});
         let (_, sbx) = sandbox_from_vm_object("kvpoc-sandboxes", fresh).expect("managed vm");
         let status = sbx.status.expect("status");
@@ -1406,7 +1119,7 @@ mod tests {
     #[test]
     fn unmanaged_vm_is_rejected() {
         let cfg = config();
-        let mut vm = render_virtual_machine(&params(&sandbox(), &cfg)).expect("render");
+        let mut vm = render_virtual_machine(&params(&sandbox(), &cfg));
         vm.metadata
             .labels
             .as_mut()
@@ -1627,7 +1340,6 @@ mod kubevirt_review_tests {
                 memory: "2Gi".to_string(),
                 workspace_pvc: true,
                 workload: crate::config::KubeVirtWorkloadMode::default(),
-                root_hash: String::new(),
             },
             shared_supervisor: Some(crate::SharedSupervisorConfig {
                 service_name: "openshell-supervisor".to_string(),
@@ -1648,7 +1360,6 @@ mod kubevirt_review_tests {
             config,
             namespace: "kvpoc-sandboxes",
             kube_name: "default--demo",
-            resolved_root_hash: String::new(),
         }
     }
 
@@ -1776,8 +1487,7 @@ mod kubevirt_review_tests {
         // composes Provisioning (keeping the supervisor instance) rather
         // than Stopped (which withdraws it before the guest dials).
         let cfg = review_config();
-        let mut vm =
-            render_virtual_machine(&review_params(&review_sandbox(), &cfg)).expect("render");
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["spec"]["runStrategy"] = serde_json::json!("Halted");
         vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Stopped"});
         vm.metadata
@@ -1806,8 +1516,7 @@ mod kubevirt_review_tests {
         // Without the annotation the same Halted VM is a user stop:
         // Suspended=True, no Bootstrapping.
         let cfg = review_config();
-        let mut vm =
-            render_virtual_machine(&review_params(&review_sandbox(), &cfg)).expect("render");
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["spec"]["runStrategy"] = serde_json::json!("Halted");
         vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Stopped"});
         let (_, sbx) =
@@ -1828,51 +1537,6 @@ mod kubevirt_review_tests {
     }
 
     #[test]
-    fn root_hash_binding_format_is_validated() {
-        // R2: the binding is interpolated into kernelArgs; anything that is
-        // not <decimal>:<decimal>:<64 lowercase hex> must be rejected — a
-        // value with a space would inject kernel arguments.
-        let digest = "0123abcd".repeat(8);
-        assert!(validate_root_hash_binding(&format!("179200:179200:{digest}")).is_ok());
-        assert!(
-            validate_root_hash_binding(&format!("179200:179200:{}", "1e89c067".repeat(8))).is_ok()
-        );
-        // Argument injection: a space in any field.
-        assert!(validate_root_hash_binding("179200:179200:0123 init=/bin/sh").is_err());
-        assert!(validate_root_hash_binding("179200 1:2:0123abcd").is_err());
-        // Wrong field counts.
-        assert!(validate_root_hash_binding("179200:0123abcd").is_err());
-        assert!(validate_root_hash_binding("1:2:3:0123abcd").is_err());
-        // Non-decimal counts.
-        assert!(validate_root_hash_binding("0x10:179200:0123abcd").is_err());
-        assert!(validate_root_hash_binding(":179200:0123abcd").is_err());
-        // Digest shape: too short, too long, non-hex, uppercase.
-        assert!(validate_root_hash_binding("1:2:0123").is_err());
-        assert!(
-            validate_root_hash_binding(
-                "1:2:0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd00"
-            )
-            .is_err()
-        );
-        assert!(validate_root_hash_binding("1:2:zz23abcd").is_err());
-        assert!(validate_root_hash_binding("1:2:0123ABCD").is_err());
-    }
-
-    #[test]
-    fn kernel_args_carry_verity_binding_when_configured() {
-        // Commit 6: the verified boot passes the dm-verity geometry and
-        // root hash to the initramfs init on the kernel command line; an
-        // empty binding keeps the legacy plain boot.
-        assert_eq!(kubevirt_kernel_args("").unwrap(), KUBEVIRT_KERNEL_ARGS);
-        let args =
-            kubevirt_kernel_args(&format!("179200:179200:{}", "0123abcd".repeat(8))).unwrap();
-        assert!(
-            args.contains("openshell_verity=179200:179200:0123abcd"),
-            "the verity binding must reach the command line: {args}"
-        );
-    }
-
-    #[test]
     fn supervisor_failure_while_vm_halting_is_not_an_error() {
         // S1: while the VM is halting (`printableStatus: Stopping` — the
         // VMI is terminating), the dedicated supervisor Pod exiting
@@ -1880,8 +1544,7 @@ mod kubevirt_review_tests {
         // not a failure. Mapping it to SupervisorFailed aborted in-flight
         // stops ("sandbox lifecycle changed while stop completed").
         let cfg = review_config();
-        let mut vm =
-            render_virtual_machine(&review_params(&review_sandbox(), &cfg)).expect("render");
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["spec"]["runStrategy"] = serde_json::json!("Once");
         vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Stopping"});
         let (_, sbx) = sandbox_from_vm_object_with_runtime(
@@ -1914,8 +1577,7 @@ mod kubevirt_review_tests {
         // halting) VM still maps to the terminal Error — the suppression
         // must not hide genuine crashes.
         let cfg = review_config();
-        let mut vm =
-            render_virtual_machine(&review_params(&review_sandbox(), &cfg)).expect("render");
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["spec"]["runStrategy"] = serde_json::json!("Once");
         vm.data["status"] = serde_json::json!({"ready": true, "printableStatus": "Running"});
         let (_, sbx) = sandbox_from_vm_object_with_runtime(
@@ -1939,8 +1601,7 @@ mod kubevirt_review_tests {
         // non-transient Ready=False reason) instead of provisioning
         // forever.
         let cfg = review_config();
-        let mut vm =
-            render_virtual_machine(&review_params(&review_sandbox(), &cfg)).expect("render");
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["spec"]["runStrategy"] = serde_json::json!("Once");
         vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Running"});
         let (_, sbx) = sandbox_from_vm_object_with_runtime(
@@ -1960,8 +1621,7 @@ mod kubevirt_review_tests {
         // Pod is deleted under it — the failure must still surface as a
         // terminal Error, not hide behind VMReady.
         let cfg = review_config();
-        let mut vm =
-            render_virtual_machine(&review_params(&review_sandbox(), &cfg)).expect("render");
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["spec"]["runStrategy"] = serde_json::json!("Once");
         vm.data["status"] = serde_json::json!({"ready": true, "printableStatus": "Running"});
         let (_, sbx) = sandbox_from_vm_object_with_runtime(
@@ -1978,8 +1638,7 @@ mod kubevirt_review_tests {
         assert_eq!(ready.reason, REASON_SUPERVISOR_FAILED);
         // Without the failure the same VM stays transient.
         let cfg = review_config();
-        let mut vm =
-            render_virtual_machine(&review_params(&review_sandbox(), &cfg)).expect("render");
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["spec"]["runStrategy"] = serde_json::json!("Once");
         vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Running"});
         let (_, sbx) = sandbox_from_vm_object_with_runtime(
@@ -2002,8 +1661,7 @@ mod kubevirt_review_tests {
         // were reported for that window, the snapshot must stay
         // Bootstrapping (Provisioning), never SupervisorFailed (Error).
         let cfg = review_config();
-        let mut vm =
-            render_virtual_machine(&review_params(&review_sandbox(), &cfg)).expect("render");
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["spec"]["runStrategy"] = serde_json::json!("Halted");
         vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Stopped"});
         vm.metadata
@@ -2039,8 +1697,7 @@ mod kubevirt_review_tests {
         // database has no record to reclaim with) maps the sandbox to the
         // public Error phase instead of provisioning forever.
         let cfg = review_config();
-        let mut vm =
-            render_virtual_machine(&review_params(&review_sandbox(), &cfg)).expect("render");
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["spec"]["runStrategy"] = serde_json::json!("Halted");
         vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Stopped"});
         vm.metadata
@@ -2060,8 +1717,7 @@ mod kubevirt_review_tests {
         assert!(ready.message.contains("outlived the deadline"));
         // A fresh window stays Bootstrapping (Provisioning), not Error.
         let cfg = review_config();
-        let mut vm =
-            render_virtual_machine(&review_params(&review_sandbox(), &cfg)).expect("render");
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["spec"]["runStrategy"] = serde_json::json!("Halted");
         vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Stopped"});
         vm.metadata
@@ -2235,8 +1891,7 @@ mod kubevirt_review_tests {
         // the reconciler's annotation surfaces as an ImagePin condition so
         // operators see the unpinned state.
         let cfg = review_config();
-        let mut vm =
-            render_virtual_machine(&review_params(&review_sandbox(), &cfg)).expect("render");
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["status"] = serde_json::json!({"ready": true});
         vm.metadata
             .annotations
@@ -2258,8 +1913,7 @@ mod kubevirt_review_tests {
         assert!(pin.message.contains("no repository digest"));
         // Without the annotation there is no condition.
         let cfg = review_config();
-        let mut vm =
-            render_virtual_machine(&review_params(&review_sandbox(), &cfg)).expect("render");
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["status"] = serde_json::json!({"ready": true});
         let (_, sbx) =
             sandbox_from_vm_object_with_runtime("kvpoc-sandboxes", vm, None, None, None, None)
@@ -2279,8 +1933,7 @@ mod kubevirt_review_tests {
         // condition so operators see that isolation briefly depended on
         // the namespace-wide default-deny floor.
         let cfg = review_config();
-        let mut vm =
-            render_virtual_machine(&review_params(&review_sandbox(), &cfg)).expect("render");
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["status"] = serde_json::json!({"ready": true});
         vm.metadata
             .annotations
@@ -2307,8 +1960,7 @@ mod kubevirt_review_tests {
         assert_eq!(restored.reason, "ReFencedAfterDrift");
         // Without the marker there is no condition.
         let cfg = review_config();
-        let mut vm =
-            render_virtual_machine(&review_params(&review_sandbox(), &cfg)).expect("render");
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["status"] = serde_json::json!({"ready": true});
         let (_, sbx) =
             sandbox_from_vm_object_with_runtime("kvpoc-sandboxes", vm, None, None, None, None)
@@ -2346,8 +1998,7 @@ mod kubevirt_review_tests {
         // configuration gate until the CLI's provision timeout.
         let cfg = review_config();
         let stale = || {
-            let mut vm =
-                render_virtual_machine(&review_params(&review_sandbox(), &cfg)).expect("render");
+            let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
             vm.data["status"] =
                 serde_json::json!({"ready": false, "printableStatus": "ImagePullBackOff"});
             vm
@@ -2394,8 +2045,7 @@ mod kubevirt_review_tests {
         // ErrImagePull stays transient but the condition message must carry
         // the printableStatus so the cause reaches the user.
         let cfg = review_config();
-        let mut vm =
-            render_virtual_machine(&review_params(&review_sandbox(), &cfg)).expect("render");
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["status"] =
             serde_json::json!({"ready": false, "printableStatus": "ImagePullBackOff"});
         let (_, sbx) =
@@ -2412,8 +2062,7 @@ mod kubevirt_review_tests {
     #[test]
     fn vm_status_marks_terminal_vmi_as_error() {
         let cfg = review_config();
-        let mut vm =
-            render_virtual_machine(&review_params(&review_sandbox(), &cfg)).expect("render");
+        let mut vm = render_virtual_machine(&review_params(&review_sandbox(), &cfg));
         vm.data["spec"]["runStrategy"] = serde_json::json!("Once");
         vm.data["status"] = serde_json::json!({"ready": false, "printableStatus": "Stopped"});
 
@@ -2468,8 +2117,6 @@ mod kubevirt_review_tests {
         let mut cfg = review_config();
         cfg.kubevirt.workload = crate::config::KubeVirtWorkloadMode::Root;
         cfg.shared_supervisor = None;
-        // R1: the privileged class must carry the verity binding.
-        cfg.kubevirt.root_hash = format!("179200:179200:{}", "0123abcd".repeat(8));
         assert!(cfg.validate_kubevirt_config().is_ok());
 
         cfg.supervisor_topology = Some(crate::SupervisorTopology::Gateway);
