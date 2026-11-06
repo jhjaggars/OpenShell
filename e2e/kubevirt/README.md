@@ -28,10 +28,15 @@ What this branch demonstrates, on a local k3d cluster with nested KVM:
    denied raw-TCP connects, and HTTPS GET allowed / POST denied through the
    L7 proxy — the GET proves the per-sandbox proxy CA is delivered into the
    guest.
-4. **Egress fencing**: the virt-launcher pod's NetworkPolicy allows only the
-   supervisor Service and cluster DNS; direct egress from the guest is
-   blocked at both the boundary (seccomp broker) and the pod network
-   (fence).
+4. **Egress fencing**: the virt-launcher pod's NetworkPolicy admits only
+   the supervisor (the dedicated topology's supervisor Pod, or the shared
+   supervisor's Pods) — there is no DNS allowance: direct DNS to the
+   kube-dns Service or the CoreDNS pods is blocked, and the guest's
+   resolver is the boundary's loopback relay (`127.0.0.53`), which
+   answers policy-approved names synthetically (non-policy names never
+   reach an upstream resolver). Direct egress from the guest is blocked
+   at both the boundary (seccomp broker in sandboxed mode; the nftables
+   relay in root mode) and the pod network (fence).
 5. **Stop/start**: `Halted`/`Once` run-strategy mapping with the VM UID and
    fence UID stable across generations; start re-renders the boundary
    bootstrap for the new generation, re-registers the shared instance
