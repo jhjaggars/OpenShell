@@ -1751,6 +1751,80 @@ struct KubeVirtGeneration<'a> {
     workload_mode: crate::config::KubeVirtWorkloadMode,
 }
 
+/// Resolve the dm-verity binding from the label read and the operator
+/// config (R4). Pure — free of I/O — so the fail-closed rules are unit
+/// tested directly:
+/// - the label value is image content, so it is validated before use
+///   (a malformed label must never reach the kernel command line);
+/// - root mode with no readable label and no config binding fails closed
+///   at the driver — the supervisor's claim check is the second layer;
+/// - a config/label mismatch is a drift the operator must fix.
+fn resolve_verity_binding(
+    label_binding: Option<String>,
+    configured: &str,
+    workload_mode: crate::config::KubeVirtWorkloadMode,
+    boot_image: &str,
+) -> Result<String, KubernetesDriverError> {
+    use crate::config::KubeVirtWorkloadMode;
+    // M2: the label value is image content — validate its exact shape
+    // before it can be interpolated into kernel args (a label like
+    // `0123 init=/bin/sh` would inject kernel arguments).
+    let label_binding = match label_binding {
+        Some(label) => {
+            if let Err(reason) = crate::kubevirt::validate_root_hash_binding(&label) {
+                return Err(KubernetesDriverError::Message(format!(
+                    "the guest image {boot_image:?} carries a malformed verity label: {reason}"
+                )));
+            }
+            Some(label)
+        }
+        None => None,
+    };
+    let root_mode = workload_mode == KubeVirtWorkloadMode::Root;
+    match (label_binding, configured.is_empty()) {
+        (Some(label), false) => {
+            if label != configured {
+                return Err(KubernetesDriverError::Message(format!(
+                    "kubevirt root_hash mismatch: the configured binding {configured:?} does not match the guest image's label {label:?}; fix the configuration to match the image"
+                )));
+            }
+            Ok(label)
+        }
+        (Some(label), true) => {
+            // The config is empty but the image carries a binding: use
+            // the label (the image is the authority).
+            tracing::info!(
+                image = %boot_image,
+                "kubevirt root_hash resolved from the image label (config was empty)"
+            );
+            Ok(label)
+        }
+        (None, false) => {
+            // The config says verified but the image has no readable
+            // label. In root mode this is fail-closed; in sandboxed
+            // mode the config binding is used as-is.
+            if root_mode {
+                return Err(KubernetesDriverError::Message(format!(
+                    "kubevirt workload = \"root\" requires the guest image to carry the verity labels; {boot_image:?} has none readable server-side"
+                )));
+            }
+            Ok(configured.to_string())
+        }
+        (None, true) => {
+            // M1: no readable label and no config binding. Root mode
+            // fails closed at the driver — never render an unverified
+            // root VM. Sandboxed mode boots without verity (no trusted
+            // boot for sandboxed guests).
+            if root_mode {
+                return Err(KubernetesDriverError::Message(format!(
+                    "kubevirt workload = \"root\" requires a verity binding, but the guest image {boot_image:?} carries no readable verity label and the config root_hash is empty; the driver refuses to render an unverified root VM"
+                )));
+            }
+            Ok(String::new())
+        }
+    }
+}
+
 impl KubernetesComputeDriver {
     /// Environment that lets a supervisor export spans, joining the current
     /// trace, OCSF events, and relayed workload traces, identifying the
@@ -4651,8 +4725,9 @@ impl KubernetesComputeDriver {
         // R4: resolve the verity binding from the image's OCI config
         // before the VM is rendered — the kernel args and the bootstrap
         // both use it (the config's root_hash is the fallback).
-        let resolved_root_hash =
-            self.resolve_root_hash_binding(&self.config.kubevirt.guest_image)?;
+        let resolved_root_hash = self
+            .resolve_root_hash_binding(&self.config.kubevirt.guest_image)
+            .await?;
         let params = crate::kubevirt::KubeVirtSandboxParams {
             sandbox,
             config: &self.config,
@@ -4747,7 +4822,7 @@ impl KubernetesComputeDriver {
         // runStrategy patch to Once below), not when the VM object is
         // created. This lets vm_uid be the VM's real UID, as the claims
         // model decided.
-        let mut vm = crate::kubevirt::render_virtual_machine(&params);
+        let mut vm = crate::kubevirt::render_virtual_machine(&params)?;
         vm.data["spec"]["runStrategy"] = serde_json::json!("Halted");
         // The in-flight annotation maps the Halted window to a
         // `Bootstrapping` condition (Provisioning), not `Suspended`
@@ -5090,7 +5165,9 @@ impl KubernetesComputeDriver {
                 generation.workload_uid,
                 generation.workload_gid,
                 generation.workload_mode,
-                &self.resolve_root_hash_binding(&generation.boot_image)?,
+                &self
+                    .resolve_root_hash_binding(&generation.boot_image)
+                    .await?,
             )
             .map_err(KubernetesDriverError::Precondition)?
         };
@@ -6121,7 +6198,7 @@ impl KubernetesComputeDriver {
             workload_uid,
             workload_gid,
             workload_mode,
-            &self.resolve_root_hash_binding(&boot_image)?,
+            &self.resolve_root_hash_binding(&boot_image).await?,
         )
         .map_err(KubernetesDriverError::Precondition)?;
 
@@ -6570,43 +6647,31 @@ impl KubernetesComputeDriver {
     /// The binding is read server-side from the image's OCI config —
     /// binding the hash to the image — and the configured binding (if any)
     /// is verified against it. The label is authoritative: a config value
-    /// that disagrees with the image is a drift the operator must fix, and
-    /// a missing label on an image the config says is verified is a
-    /// fail-closed error in root mode.
-    fn resolve_root_hash_binding(&self, boot_image: &str) -> Result<String, KubernetesDriverError> {
-        let label_binding = crate::kubevirt::read_image_verity_binding(boot_image);
-        let configured = self.config.kubevirt.root_hash.trim();
-        match (label_binding, configured.is_empty()) {
-            (Some(label), false) => {
-                if label != configured {
-                    return Err(KubernetesDriverError::Message(format!(
-                        "kubevirt root_hash mismatch: the configured binding {configured:?} does not match the guest image's label {label:?}; fix the configuration to match the image"
-                    )));
-                }
-                Ok(label)
-            }
-            (Some(label), true) => {
-                // The config is empty but the image carries a binding: use
-                // the label (the image is the authority).
-                tracing::info!(
-                    image = %boot_image,
-                    "kubevirt root_hash resolved from the image label (config was empty)"
-                );
-                Ok(label)
-            }
-            (None, false) => {
-                // The config says verified but the image has no readable
-                // label. In root mode this is fail-closed; in sandboxed
-                // mode the config binding is used as-is.
-                if self.config.kubevirt.workload == crate::config::KubeVirtWorkloadMode::Root {
-                    return Err(KubernetesDriverError::Message(format!(
-                        "kubevirt workload = \"root\" requires the guest image to carry the verity labels; {boot_image:?} has none readable server-side"
-                    )));
-                }
-                Ok(configured.to_string())
-            }
-            (None, true) => Ok(String::new()),
-        }
+    /// that disagrees with the image is a drift the operator must fix.
+    /// Root mode fails closed when neither source has a binding — the
+    /// driver must never render an unverified root VM (the supervisor's
+    /// claim check is the second layer, not the only one).
+    async fn resolve_root_hash_binding(
+        &self,
+        boot_image: &str,
+    ) -> Result<String, KubernetesDriverError> {
+        // The socket read is blocking I/O with timeouts; keep it off the
+        // async executor so a slow daemon cannot stall sandbox creation.
+        let image = boot_image.to_string();
+        let label_binding =
+            tokio::task::spawn_blocking(move || crate::kubevirt::read_image_verity_binding(&image))
+                .await
+                .map_err(|join_error| {
+                    KubernetesDriverError::Message(format!(
+                        "the verity label read task failed: {join_error}"
+                    ))
+                })?;
+        resolve_verity_binding(
+            label_binding,
+            self.config.kubevirt.root_hash.trim(),
+            self.config.kubevirt.workload,
+            boot_image,
+        )
     }
 
     #[allow(
@@ -11981,6 +12046,102 @@ fn spawn_namespace_file_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VALID_BINDING: &str =
+        "179200:179200:0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd";
+
+    #[test]
+    fn root_mode_with_no_label_and_no_config_fails_closed() {
+        // M1: root mode, no readable label, empty config — the driver
+        // must refuse to render an unverified root VM (fail closed),
+        // not return an empty binding that renders no
+        // `openshell_verity=` kernel arg.
+        let error = resolve_verity_binding(
+            None,
+            "",
+            crate::config::KubeVirtWorkloadMode::Root,
+            "kvpoc/openshell-sandbox-vm:unlabeled",
+        )
+        .expect_err("root mode with neither source must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("refuses to render an unverified root VM"),
+            "the error must name the refusal: {error}"
+        );
+    }
+
+    #[test]
+    fn sandboxed_mode_with_no_label_and_no_config_boots_without_verity() {
+        // Sandboxed mode keeps verity optional: no label and no config
+        // binding means a plain (unverified) boot, which is correct for
+        // sandboxed guests (the boundary enforces in-guest).
+        let binding = resolve_verity_binding(
+            None,
+            "",
+            crate::config::KubeVirtWorkloadMode::Sandboxed,
+            "kvpoc/openshell-sandbox-vm:unlabeled",
+        )
+        .expect("sandboxed mode without a binding boots plainly");
+        assert!(binding.is_empty(), "no binding renders no verity args");
+    }
+
+    #[test]
+    fn malformed_label_fails_instead_of_reaching_the_kernel_args() {
+        // M2: the label value is image content. A malformed label
+        // (e.g. `0123 init=/bin/sh` — a kernel-arg injection attempt)
+        // must be an error at resolve time, never a value that reaches
+        // kubevirt_kernel_args (which would previously panic).
+        let error = resolve_verity_binding(
+            Some("0123 init=/bin/sh".to_string()),
+            "",
+            crate::config::KubeVirtWorkloadMode::Root,
+            "kvpoc/openshell-sandbox-vm:evil-label",
+        )
+        .expect_err("a malformed label must fail at resolve");
+        assert!(
+            error.to_string().contains("malformed verity label"),
+            "the error must name the malformed label: {error}"
+        );
+        // And the same in sandboxed mode (the label would reach
+        // kernelArgs there too) and with a configured binding present.
+        let error = resolve_verity_binding(
+            Some("179200:179200:not-hex".to_string()),
+            VALID_BINDING,
+            crate::config::KubeVirtWorkloadMode::Sandboxed,
+            "kvpoc/openshell-sandbox-vm:evil-label",
+        )
+        .expect_err("a malformed label must fail at resolve in any mode");
+        assert!(
+            error.to_string().contains("malformed verity label"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn label_and_config_mismatch_fails_and_label_alone_wins() {
+        // The config/label mismatch is a drift error; an empty config
+        // with a valid label uses the label.
+        let error = resolve_verity_binding(
+            Some(VALID_BINDING.to_string()),
+            "179200:179200:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            crate::config::KubeVirtWorkloadMode::Root,
+            "kvpoc/openshell-sandbox-vm:labelled",
+        )
+        .expect_err("a config/label mismatch must fail");
+        assert!(
+            error.to_string().contains("mismatch"),
+            "the error must name the mismatch: {error}"
+        );
+        let resolved = resolve_verity_binding(
+            Some(VALID_BINDING.to_string()),
+            "",
+            crate::config::KubeVirtWorkloadMode::Root,
+            "kvpoc/openshell-sandbox-vm:labelled",
+        )
+        .expect("a valid label with an empty config resolves");
+        assert_eq!(resolved, VALID_BINDING);
+    }
 
     /// Serve Pod GETs over one reusable HTTP/1 connection per client,
     /// delaying a request for Pod `slow-<millis>` by that many milliseconds.

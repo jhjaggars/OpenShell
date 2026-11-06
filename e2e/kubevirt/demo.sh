@@ -198,6 +198,10 @@ guest_image_pull_policy = "IfNotPresent"
 cpu_cores = 1
 memory = "1Gi"
 workload = "${OPENSHELL_KVPOC_WORKLOAD:-sandboxed}"
+# Optional: an operator-provided binding. Empty by default — the driver
+# resolves the binding from the image's OCI labels (R4). A non-empty
+# value that disagrees with the image label fails the create (drift).
+root_hash = "${OPENSHELL_KVPOC_ROOT_HASH:-}"
 ${SHARED_SUPERVISOR_CONFIG}
 EOF
 

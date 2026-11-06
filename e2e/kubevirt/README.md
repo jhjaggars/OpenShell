@@ -364,6 +364,23 @@ material); delete it to fully reset.
 
 ## Known gaps / follow-ups
 
+- **Root-mode verity binding (R4, in progress)**: in root mode the
+  driver resolves the dm-verity binding (geometry + root hash) from the
+  guest image's OCI config labels (`io.openshell.kubevirt.root-hash` /
+  `io.openshell.kubevirt.verity-geometry`, stamped by
+  `build-guest-image.sh`) at create time, and the resolved binding feeds
+  both the VM kernel args and the supervisor's launch-descriptor claim.
+  **The label read is dev-only**: it queries the gateway host's container
+  runtime (the Docker Engine REST API over its unix socket, honouring
+  `DOCKER_HOST` for the `unix://` scheme) **by tag** — the same OCI
+  config blob a registry serves, but read from the local daemon where
+  k3d side-loads land. It is not a production trust path: a
+  registry-backed cluster needs to read the config from the registry's
+  manifest API at the pinned digest (with pull-secret auth), which is
+  NOT implemented — the registry path is a pending user decision. Root
+  mode fails closed at the driver when neither the image label nor the
+  config provides a validated binding (the supervisor's claim check is
+  the second layer).
 - **Image identity (digest pinning, option A)**: the first boot uses the
   configured `guest_image` tag (the digest does not exist until something
   pulls it — the documented first-generation window). Once the launcher
