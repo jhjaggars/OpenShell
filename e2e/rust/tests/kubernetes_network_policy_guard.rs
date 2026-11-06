@@ -15,8 +15,8 @@
 //! These cases mutate namespace-wide policies, which suspends every sandbox
 //! in the namespace, so they run only when `OPENSHELL_E2E_NETPOL_GUARD`
 //! selects them: `isolation` (the default Helm lane), `shared-supervisor`,
-//! `managed` (with `values-workspace-managed.yaml`) or `ha` (two gateway
-//! replicas). Use the `e2e:kubernetes:netpol-guard*` mise tasks.
+//! `managed` (with `values-workspace-managed.yaml`), `operator` (with
+//! `values-workspace-operator.yaml`) or `ha` (two gateway replicas). Use the `e2e:kubernetes:netpol-guard*` mise tasks.
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -457,10 +457,15 @@ async fn api_server_ip() -> String {
     .await
 }
 
-/// Prove the workload Pod is fenced: a raw connect to the API server fails
-/// from it but succeeds from an unfenced probe Pod in the same namespace.
+/// A public address that answers on 443, used by the conformance suite too.
+const EXTERNAL_HOST: &str = "1.1.1.1";
+
+/// Prove the workload Pod is fenced: a raw connect to an external address and
+/// to the API server fails from it, while both succeed from an unfenced probe
+/// Pod in the same namespace.
 async fn assert_workload_egress_blocked(ns: &str, sandbox_id: &str, case: &str) {
-    let ip = api_server_ip().await;
+    let api = api_server_ip().await;
+    let targets = [EXTERNAL_HOST, api.as_str()];
     let probe = format!("netpol-probe-{}", std::process::id());
     kubectl(&[
         "-n",
@@ -484,19 +489,26 @@ async fn assert_workload_egress_blocked(ns: &str, sandbox_id: &str, case: &str) 
         "--timeout=120s",
     ])
     .await;
-    let control = raw_connect(ns, &probe, None, &ip, 443).await;
+    let mut controls = Vec::new();
+    for target in targets {
+        controls.push((target, raw_connect(ns, &probe, None, target, 443).await));
+    }
     kubectl(&["-n", ns, "delete", "pod", &probe, "--wait=false"]).await;
-    assert!(
-        control,
-        "{case}: the unfenced probe Pod could not reach {ip}:443, so the egress check proves nothing"
-    );
+    for (target, open) in controls {
+        assert!(
+            open,
+            "{case}: the unfenced probe Pod could not reach {target}:443, so the egress check proves nothing"
+        );
+    }
     let pod = workload_pod(ns, sandbox_id).await;
-    let open = raw_connect(ns, &pod, Some("agent"), &ip, 443).await;
-    assert!(
-        !open,
-        "{case}: workload Pod {pod} reached {ip}:443 directly after the repair"
-    );
-    println!("NETPOL_EGRESS_BLOCKED case={case} pod={pod} target={ip}:443");
+    for target in targets {
+        let open = raw_connect(ns, &pod, Some("agent"), target, 443).await;
+        assert!(
+            !open,
+            "{case}: workload Pod {pod} reached {target}:443 directly after the repair"
+        );
+        println!("NETPOL_EGRESS_BLOCKED case={case} pod={pod} target={target}:443");
+    }
 }
 
 /// Run every mutation against one policy and check the outcome.
@@ -783,6 +795,116 @@ async fn shared_control_policy_is_repaired_and_never_resurrected() {
         "{name} came back after its sandbox was deleted"
     );
     println!("NETPOL_NO_RESURRECTION policy={name} observed_s=40");
+}
+
+/// Operator mode: the guard watches allowlisted namespaces using the verbs the
+/// workspace chart grants, and leaves everything else alone.
+#[tokio::test]
+async fn operator_mode_guards_allowlisted_namespaces_only() {
+    if !selected("operator") {
+        return;
+    }
+    let ns = format!("ng-op-{}", std::process::id() % 100_000);
+    kubectl(&["create", "namespace", &ns]).await;
+    kubectl(&[
+        "label",
+        "namespace",
+        &ns,
+        "openshell.ai/e2e-operator-workspace=true",
+    ])
+    .await;
+    let chart = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/helm/openshell-workspace"
+    );
+    let context = std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE").expect("kube context");
+    let helm = tokio::process::Command::new("helm")
+        .args([
+            "--kube-context",
+            &context,
+            "install",
+            "openshell-workspace",
+            chart,
+            "--namespace",
+            &ns,
+            "--wait",
+        ])
+        .output()
+        .await
+        .expect("spawn helm");
+    assert!(
+        helm.status.success(),
+        "workspace chart: {}",
+        String::from_utf8_lossy(&helm.stderr)
+    );
+
+    // A namespace outside the allowlist holding a look-alike policy.
+    let foreign = format!("ng-foreign-{}", std::process::id() % 100_000);
+    kubectl(&["create", "namespace", &foreign]).await;
+    let look_alike = serde_json::json!({
+        "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+        "metadata": {"name": WORKLOADS, "namespace": foreign, "labels": {MANAGED_BY: "openshell"}},
+        "spec": {"podSelector": {}, "policyTypes": ["Egress"], "egress": [{}]}
+    });
+    kubectl_stdin(&["apply", "-f", "-"], &look_alike.to_string()).await;
+
+    let (output, code) = run_cli(&["workspace", "create", "--name", &ns]).await;
+    assert_eq!(code, 0, "workspace create: {output}");
+    let name = format!("ng-sb-{}", std::process::id() % 100_000);
+    // The gateway's namespace watcher needs a moment to allowlist the label.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (output, code) = run_cli(&[
+            "sandbox",
+            "create",
+            "--detach",
+            "--workspace",
+            &ns,
+            "--name",
+            &name,
+            "--",
+            "sh",
+            "-c",
+            "exec sleep infinity",
+        ])
+        .await;
+        if code == 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "sandbox create: {output}");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    wait_managed_ready(&ns, &name).await;
+    // Give the allowlist poll time to start the namespace's watch.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    for mutation in Mutation::ALL {
+        let case = format!("operator-workloads/{}", mutation.as_str());
+        let expected = baseline(&ns, WORKLOADS).await;
+        let since = mutate(&ns, WORKLOADS, mutation).await;
+        wait_restored(&ns, WORKLOADS, &expected, since, &case).await;
+        if mutation == Mutation::StripLabels {
+            let phase = sandbox_json(&name, Some(&ns)).await["phase"].clone();
+            assert_eq!(phase, "Ready", "{case}: label repair must not suspend");
+        } else {
+            wait_drift_suspended(&name, Some(&ns), WORKLOADS, since, &case).await;
+            let (output, code) = run_cli(&["sandbox", "start", &name, "--workspace", &ns]).await;
+            assert_eq!(code, 0, "{case}: start: {output}");
+            wait_managed_ready(&ns, &name).await;
+        }
+    }
+
+    let untouched = policy(&foreign, WORKLOADS)
+        .await
+        .expect("look-alike policy");
+    assert_eq!(
+        untouched["metadata"]["generation"], 1,
+        "the guard must not touch a namespace outside the allowlist: {untouched}"
+    );
+    println!("NETPOL_FOREIGN_UNTOUCHED namespace={foreign}");
+    let _ = run_cli(&["sandbox", "delete", &name, "--workspace", &ns]).await;
+    let _ = run_cli(&["workspace", "delete", &ns]).await;
+    kubectl(&["delete", "namespace", &ns, &foreign, "--wait=false"]).await;
 }
 
 /// Managed mode: the guard binds its role in each managed namespace and

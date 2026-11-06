@@ -564,6 +564,8 @@ jobs:
             name: shared supervisor
           - task: e2e:kubernetes:netpol-guard-managed
             name: workspace managed
+          - task: e2e:kubernetes:netpol-guard-operator
+            name: workspace operator
           - task: e2e:kubernetes:netpol-guard-ha
             name: two replicas
     permissions:
