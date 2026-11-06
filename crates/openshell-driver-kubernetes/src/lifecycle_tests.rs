@@ -1503,6 +1503,23 @@ mod netpol_guard_repairs {
     }
 
     #[tokio::test]
+    async fn a_sandbox_being_deleted_gets_no_repair_signal() {
+        let mut deleting = sandbox(true);
+        deleting["metadata"]["deletionTimestamp"] = serde_json::json!("2026-01-01T00:00:00Z");
+        let world = guarded_world(deleting);
+        let (_, supervisor) = stored_fences();
+        world.forget(http::Method::GET, SUPERVISOR_FENCE_PATH);
+        world
+            .on(http::Method::GET, SUPERVISOR_FENCE_PATH, 404, not_found_status())
+            .on(http::Method::POST, POLICIES_PATH, 201, serde_json::to_value(&supervisor).unwrap());
+        let key = PolicyKey::new(NS, "openshell-sandbox-supervisors");
+        let outcome = world.driver(KubernetesComputeConfig::default()).guard_policy_key(&key).await;
+        assert_eq!(write_of(&outcome), (Drift::Missing, RepairWrite::Created));
+        assert!(reconciled(&outcome).is_empty());
+        assert!(netpol_guard_shell::guard_signals(&key, &outcome).is_empty());
+    }
+
+    #[tokio::test]
     async fn no_sandboxes_means_no_repairs() {
         let world = guarded_world(sandbox(true));
         world.forget(http::Method::GET, LIST_PATH);

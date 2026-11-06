@@ -668,8 +668,10 @@ async fn each_repair_is_signalled_once_across_gateway_replicas() {
     let pods: serde_json::Value =
         serde_json::from_str(&kubectl(&["-n", &gateway_ns, "get", "pods", "-o", "json"]).await)
             .unwrap();
-    let needle = format!("NetworkPolicy restored {ns}/{SUPERVISORS}");
-    let mut count = 0;
+    let audit = format!("NetworkPolicy restored {ns}/{SUPERVISORS}");
+    let mut records = 0;
+    let mut repairs = 0;
+    let mut sandboxes = 0;
     let mut replicas = 0;
     for pod in pods["items"].as_array().unwrap() {
         let is_gateway = pod["spec"]["containers"]
@@ -687,22 +689,40 @@ async fn each_repair_is_signalled_once_across_gateway_replicas() {
             name,
             "-c",
             "openshell-gateway",
-            "--since=3m",
+            "--since=1m",
         ])
         .await;
-        count += strip_ansi(&logs)
-            .lines()
-            .filter(|line| line.contains("OCSF CONFIG:RESTORED") && line.contains(&needle))
-            .count();
+        for line in strip_ansi(&logs).lines() {
+            if line.contains("OCSF CONFIG:RESTORED") && line.contains(&audit) {
+                records += 1;
+            }
+            if line.contains("NetworkPolicy drift repaired")
+                && line.contains(&format!("policy=\"{SUPERVISORS}\""))
+            {
+                repairs += 1;
+                sandboxes += line
+                    .rsplit("sandbox_count=")
+                    .next()
+                    .and_then(|count| count.trim().parse::<usize>().ok())
+                    .expect("sandbox_count in the repair log");
+            }
+        }
     }
-    println!("NETPOL_SIGNALS replicas={replicas} restored_events={count}");
+    println!(
+        "NETPOL_SIGNALS replicas={replicas} repairs={repairs} sandboxes={sandboxes} restored_events={records}"
+    );
     if lane().as_deref() == Some("ha") {
         assert!(replicas >= 2, "the ha lane must run two gateway replicas");
     }
     assert_eq!(
-        count, 1,
-        "one repair must produce exactly one audit record across {replicas} replicas"
+        repairs, 1,
+        "one change must be repaired once across {replicas} replicas"
     );
+    assert_eq!(
+        records, sandboxes,
+        "one audit record per sandbox for that repair"
+    );
+    assert!(records >= 1, "the running sandbox must get an audit record");
     sandbox.cleanup().await;
 }
 

@@ -420,7 +420,11 @@ impl KubernetesComputeDriver {
         let affected: Vec<&TrustedSandbox> = match &kind {
             GuardedKind::WorkloadFence
             | GuardedKind::SupervisorEgress
-            | GuardedKind::ManagedSsh => sandboxes.iter().collect(),
+            | GuardedKind::ManagedSsh => sandboxes
+                .iter()
+                // A sandbox being deleted no longer depends on the policy.
+                .filter(|sandbox| sandbox.object.metadata.deletion_timestamp.is_none())
+                .collect(),
             GuardedKind::Control { .. } | GuardedKind::SharedControl { .. } => {
                 owner_sandbox.into_iter().collect()
             }
