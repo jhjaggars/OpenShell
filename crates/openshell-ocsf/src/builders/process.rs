@@ -262,9 +262,11 @@ mod guest_sourced_tests {
     #[test]
     fn forged_process_name_cannot_create_a_marker() {
         // The PROC shorthand escapes guest-controlled fields (process name,
-        // command line): a name starting with "[data_origin:guest] " would
-        // render like a marked event, and a newline would start a forged
-        // line. The escape prevents both.
+        // command line) with bracket escaping: a name starting with
+        // "[data_origin:guest] " renders as "\\[data_origin:guest\\] "
+        // (escaped brackets), visually distinct from the real
+        // fixed-position marker. The shorthand of an unmarked event must
+        // NOT start with the marked prefix.
         use crate::Process;
         let event = ProcessActivityBuilder::new(crate::ctx::ctx())
             .activity(ActivityId::Close)
@@ -282,15 +284,17 @@ mod guest_sourced_tests {
                 .is_none(),
             "a forged process name must not create a data_origin marking: {json}"
         );
-        // The shorthand renders the escaped (quoted) name, not a marker.
+        // The shorthand of an unmarked event must NOT start with the
+        // marked prefix. The escaped brackets make the forged name
+        // render as \\[data_origin:guest\\], not [data_origin:guest].
         let shorthand = event.format_shorthand();
         assert!(
-            !shorthand.contains("[INFO] [data_origin:guest] [data_origin:guest]"),
-            "the forged name must not appear as a double marker: {shorthand}"
+            !shorthand.starts_with("PROC:TERMINATE [INFO] [data_origin:guest]"),
+            "the forged name must not make the shorthand look marked: {shorthand}"
         );
         assert!(
-            shorthand.contains("PROC:TERMINATE [INFO]"),
-            "the activity must be Terminate (Close maps to process_label Terminate): {shorthand}"
+            shorthand.contains("\\[data_origin:guest\\]"),
+            "the forged brackets must be escaped: {shorthand}"
         );
     }
 

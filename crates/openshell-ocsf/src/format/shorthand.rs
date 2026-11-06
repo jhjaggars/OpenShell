@@ -92,6 +92,13 @@ fn escape_quoted_field(text: &str) -> String {
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),
+            // Escape brackets so a guest-controlled value can never begin
+            // with a context-tag-like [...] sequence — a forged
+            // [data_origin:guest] prefix must render as
+            // \[data_origin:guest\], visually distinct from the
+            // real fixed-position marker.
+            '[' => escaped.push_str("\\["),
+            ']' => escaped.push_str("\\]"),
             character if character.is_control() => {
                 use std::fmt::Write as _;
                 let _ = write!(escaped, "\\u{{{:x}}}", u32::from(character));
