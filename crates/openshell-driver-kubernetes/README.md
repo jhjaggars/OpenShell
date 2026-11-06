@@ -140,8 +140,11 @@ is user-serviceable, so the guard (`netpol_guard*.rs`) restores them.
 - **Fail closed.** After a repair, the shared per-sandbox reconcile
   (`reconcile_one_sandbox_runtime`) runs for each affected sandbox. A generation
   bound to the drifted workload fence or control policy no longer matches its
-  UID and generation and is suspended. Spec drift of the supervisor egress
-  policy suspends running generations explicitly. Label-only drift keeps the
+  UID and generation and is suspended. A generation also records the supervisor
+  egress policy's UID and generation on its Sandbox, outside boundary evidence,
+  so a repair of that spec suspends it from any replica's periodic pass, even
+  if the repairing replica died. Generations installed by an older gateway
+  recorded nothing, so the repairing replica suspends those itself. Label-only drift keeps the
   generation and suspends nothing, in the guard and in the periodic pass. A
   drift suspension records `openshell.ai/sandbox-runtime-suspension-reason` and
   `-policy`, reported as Ready reason `NetworkPolicyDrift` until the next start.

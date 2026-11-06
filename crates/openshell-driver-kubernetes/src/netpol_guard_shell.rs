@@ -462,16 +462,20 @@ impl KubernetesComputeDriver {
         } else {
             affected
         };
-        // The supervisor egress allowance isn't bound into evidence, so the
-        // reconcile below would pass once it is repaired. A spec change may
-        // have selected workloads and opened their egress, so fail closed
-        // explicitly for every generation that may be running.
+        // A supervisor egress spec change may have selected workloads and
+        // opened their egress, so generations that may be running must stop.
         let suspend_explicitly = pending == Some(true)
             || (matches!(kind, GuardedKind::SupervisorEgress)
                 && drift == Drift::Spec
                 && write.written());
         for sandbox in reconcile {
-            let outcome = if suspend_explicitly && sandbox.bound_state().may_run {
+            // A generation that recorded the policy fails closed through the
+            // shared reconcile, on any replica. An older generation didn't, so
+            // only this replica knows it has to suspend.
+            let outcome = if suspend_explicitly
+                && sandbox.bound_state().may_run
+                && !super::sandbox_runtime_supervisor_policy_is_recorded(&sandbox.object)
+            {
                 self.suspend_after_policy_drift(
                     &lookup_api,
                     sandbox,

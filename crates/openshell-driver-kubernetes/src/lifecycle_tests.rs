@@ -1428,6 +1428,80 @@ mod netpol_guard_repairs {
         );
     }
 
+    fn recording_supervisor_policy(uid: &str, generation: &str) -> serde_json::Value {
+        let mut object = sandbox(true);
+        let annotations = &mut object["metadata"]["annotations"];
+        annotations[ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_POLICY_UID] = serde_json::json!(uid);
+        annotations[ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_POLICY_GENERATION] =
+            serde_json::json!(generation);
+        object
+    }
+
+    #[tokio::test]
+    async fn a_replica_with_no_guard_state_suspends_after_another_replica_repaired_supervisor_egress() {
+        // The replica that repaired the spec died before suspending. Another
+        // replica's periodic pass, with empty guard state, sees only a policy
+        // in sync at a later generation than the sandbox recorded.
+        let world = world_with(recording_supervisor_policy("supervisor-fence-uid", "1"));
+        let (_, supervisor) = stored_fences();
+        world.forget(http::Method::GET, SUPERVISOR_FENCE_PATH);
+        world
+            .on(http::Method::GET, SUPERVISOR_FENCE_PATH, 200, serde_json::to_value(repaired(&supervisor, 3)).unwrap())
+            .on(http::Method::PATCH, CR_PATH, 200, sandbox(false));
+        let outcome = reconcile(&world).await;
+        assert_eq!(
+            outcome,
+            ReconcileOutcome::Suspended {
+                trigger: SuspendTrigger::SupervisorFenceGeneration,
+                write: SuspendWrite::Written
+            }
+        );
+        let patch = &world.bodies(&http::Method::PATCH, CR_PATH)[0];
+        assert_eq!(
+            patch["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_SUSPENSION_POLICY],
+            "openshell-sandbox-supervisors"
+        );
+    }
+
+    #[test]
+    fn the_supervisor_policy_record_tells_narrowing_from_a_spec_change() {
+        let (_, supervisor) = stored_fences();
+        let object: DynamicObject =
+            serde_json::from_value(recording_supervisor_policy("supervisor-fence-uid", "1")).unwrap();
+        let with = |uid: &str, generation| {
+            let mut policy = supervisor.clone();
+            policy.metadata.uid = Some(uid.into());
+            policy.metadata.generation = Some(generation);
+            policy
+        };
+        let matches = |policy: &NetworkPolicy| {
+            sandbox_runtime_supervisor_policy_matches_record(policy, &object)
+        };
+        assert!(matches(&with("supervisor-fence-uid", 1)), "unchanged");
+        assert!(!matches(&with("supervisor-fence-uid", 2)), "edited and repaired");
+        assert!(matches(&with("recreated-uid", 1)), "deleted and re-created by the guard");
+        assert!(!matches(&with("recreated-uid", 2)), "replaced, then repaired");
+        // An older gateway's generation recorded nothing.
+        let legacy: DynamicObject = serde_json::from_value(sandbox(true)).unwrap();
+        assert!(!sandbox_runtime_supervisor_policy_is_recorded(&legacy));
+        assert!(sandbox_runtime_supervisor_policy_matches_record(&with("x", 9), &legacy));
+    }
+
+    #[tokio::test]
+    async fn a_label_repair_of_a_recorded_supervisor_policy_suspends_nothing() {
+        let world = guarded_world(recording_supervisor_policy("supervisor-fence-uid", "1"));
+        let (_, supervisor) = stored_fences();
+        let mut stripped = supervisor.clone();
+        stripped.metadata.labels = None;
+        reads(&world, SUPERVISOR_FENCE_PATH, &stripped, &supervisor);
+        world.on(http::Method::PUT, SUPERVISOR_FENCE_PATH, 200, serde_json::to_value(&supervisor).unwrap());
+        world_running_pods(&world);
+        let key = PolicyKey::new(NS, "openshell-sandbox-supervisors");
+        let outcome = world.driver(KubernetesComputeConfig::default()).guard_policy_key(&key).await;
+        assert_eq!(write_of(&outcome), (Drift::Metadata, RepairWrite::Replaced));
+        assert_eq!(reconciled(&outcome), [ReconcileOutcome::Reconciled]);
+    }
+
     #[tokio::test]
     async fn no_sandboxes_means_no_repairs() {
         let world = guarded_world(sandbox(true));

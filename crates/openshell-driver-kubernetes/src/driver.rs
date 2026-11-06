@@ -127,6 +127,14 @@ const ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC: &str =
 const ANNOTATION_SANDBOX_RUNTIME_LOG_LEVEL: &str = "openshell.ai/sandbox-runtime-log-level";
 const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: &str =
     "openshell.ai/sandbox-runtime-network-policy-uid";
+/// The supervisor egress policy a generation ran with. Unlike the workload
+/// fence it isn't part of boundary evidence; it is recorded so that a repair
+/// of its spec fails closed on every replica, even if the replica that made
+/// the repair dies before suspending anything.
+const ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_POLICY_UID: &str =
+    "openshell.ai/sandbox-runtime-supervisor-policy-uid";
+const ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_POLICY_GENERATION: &str =
+    "openshell.ai/sandbox-runtime-supervisor-policy-generation";
 const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: &str =
     "openshell.ai/sandbox-runtime-network-policy-generation";
 /// Connection mode of the current runtime generation. Absent on legacy
@@ -421,6 +429,9 @@ pub(crate) enum SuspendTrigger {
     },
     /// The workload fence was replaced or its spec changed after binding.
     FenceGeneration,
+    /// The supervisor egress policy's spec changed after the generation
+    /// recorded it, so workloads may have had its egress.
+    SupervisorFenceGeneration,
     /// The boundary Service no longer matches the recorded mode.
     ControlPath,
     /// The generation's control `NetworkPolicy` is missing or changed.
@@ -438,7 +449,9 @@ impl SuspendTrigger {
     pub(crate) fn network_policy(self, sandbox_id: &str) -> Option<String> {
         let names = SandboxRuntimeNames::new(sandbox_id);
         match self {
-            Self::FenceSpec { supervisor: true } => Some(names.supervisor_policy),
+            Self::FenceSpec { supervisor: true } | Self::SupervisorFenceGeneration => {
+                Some(names.supervisor_policy)
+            }
             Self::FenceSpec { supervisor: false } | Self::FenceGeneration => {
                 Some(names.workload_policy)
             }
@@ -3946,6 +3959,10 @@ impl KubernetesComputeDriver {
                 "workload NetworkPolicy has no resourceVersion".to_string(),
             )
         })?;
+        let supervisor_fence = policies
+            .get(&names.supervisor_policy)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?;
         let target = self
             .resolve_generation_launch_target(
                 namespace,
@@ -3995,6 +4012,11 @@ impl KubernetesComputeDriver {
             ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: workload_pod_uid.clone(),
             ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: fence_uid.clone(),
             ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: fence_generation.to_string(),
+            ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_POLICY_UID: supervisor_fence.metadata.uid.clone(),
+            ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_POLICY_GENERATION: supervisor_fence
+                .metadata
+                .generation
+                .map(|generation| generation.to_string()),
         });
         if let GenerationLaunchTarget::Dedicated { pod_uid, .. } = &target {
             annotations[ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID] = pod_uid.clone().into();
@@ -5313,6 +5335,29 @@ impl KubernetesComputeDriver {
                 )
                 .await;
             return ReconcileOutcome::Suspended { trigger, write };
+        }
+        if workload_may_run && sandbox_runtime_supervisor_policy_is_recorded(&object) {
+            let Ok(Ok(supervisor_fence)) =
+                tokio::time::timeout(KUBE_API_TIMEOUT, policies.get(&names.supervisor_policy))
+                    .await
+            else {
+                return ReconcileOutcome::Skipped(SkipReason::FenceUnreadable);
+            };
+            if !sandbox_runtime_supervisor_policy_matches_record(&supervisor_fence, &object) {
+                warn!(
+                    sandbox_id,
+                    "namespace supervisor egress policy spec changed; suspending workload"
+                );
+                let trigger = SuspendTrigger::SupervisorFenceGeneration;
+                let write = self
+                    .suspend_sandbox_runtime_after_dependency_failure(
+                        lookup_api,
+                        &object,
+                        trigger.network_policy(&sandbox_id),
+                    )
+                    .await;
+                return ReconcileOutcome::Suspended { trigger, write };
+            }
         }
         if workload_may_run {
             let require_service = !sandbox_runtime_bootstrap_in_progress(&object);
@@ -8953,6 +8998,44 @@ fn sandbox_runtime_namespace_fence_generation_matches(
     )
 }
 
+/// Whether this generation recorded its supervisor egress policy. Generations
+/// installed by an older gateway didn't.
+fn sandbox_runtime_supervisor_policy_is_recorded(sandbox: &DynamicObject) -> bool {
+    sandbox
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|annotations| {
+            annotations.contains_key(ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_POLICY_UID)
+        })
+}
+
+/// Whether the supervisor egress policy's spec can't have changed since the
+/// generation recorded it. The same object must keep its generation. A
+/// different object is fine only at generation 1, which is what the guard
+/// re-creates after a deletion: deleting an allowance only narrows egress.
+/// A replacement with another spec is at least at generation 2 once repaired.
+fn sandbox_runtime_supervisor_policy_matches_record(
+    policy: &NetworkPolicy,
+    sandbox: &DynamicObject,
+) -> bool {
+    let Some(annotations) = sandbox.metadata.annotations.as_ref() else {
+        return true;
+    };
+    let Some(recorded_uid) = annotations.get(ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_POLICY_UID)
+    else {
+        return true;
+    };
+    if policy.metadata.uid.as_deref() == Some(recorded_uid.as_str()) {
+        annotations
+            .get(ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_POLICY_GENERATION)
+            .and_then(|generation| generation.parse::<i64>().ok())
+            == policy.metadata.generation
+    } else {
+        policy.metadata.generation == Some(1)
+    }
+}
+
 /// Whether `policy` is the exact object and generation recorded on the
 /// sandbox under the given annotation keys.
 fn sandbox_runtime_policy_generation_matches(
@@ -9188,6 +9271,8 @@ fn sandbox_runtime_suspension_completion_patch(resource_version: &str) -> serde_
                 ANNOTATION_SUPERVISOR_SESSION: serde_json::Value::Null,
                 ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: serde_json::Value::Null,
                 ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_POLICY_UID: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_POLICY_GENERATION: serde_json::Value::Null,
                 ANNOTATION_SANDBOX_RUNTIME_READINESS: "unavailable",
             },
         }
