@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Render/lint example for extra gateway pod containers. The sidecar shares an
+# emptyDir with the openshell-gateway container through a Unix socket: the
+# gatewayConfig interceptor stanza points at the socket path the sidecar
+# listens on, and the gateway container mounts the same directory to dial it.
+# Deploy the sidecar image separately; this overlay only wires chart-owned
+# objects. The extra Service port exposes the sidecar's metrics listener.
+server:
+  extraVolumes:
+    - name: interceptor-socket
+      emptyDir: {}
+  extraVolumeMounts:
+    - name: interceptor-socket
+      mountPath: /run/openshell/interceptors
+  extraContainers:
+    - name: sandbox-resources
+      image: ghcr.io/example/sandbox-resource-interceptor:latest
+      args:
+        - --socket
+        - /run/openshell/interceptors/sandbox-resources.sock
+        - --metrics-port
+        - "9091"
+      ports:
+        - name: interceptor-metrics
+          containerPort: 9091
+          protocol: TCP
+      volumeMounts:
+        - name: interceptor-socket
+          mountPath: /run/openshell/interceptors
+      readinessProbe:
+        httpGet:
+          path: /readyz
+          port: interceptor-metrics
+
+gatewayConfig:
+  openshell.gateway.interceptors:
+    - name: sandbox-resources
+      grpc_endpoint: unix:///run/openshell/interceptors/sandbox-resources.sock
+      failure_policy: fail_closed
+
+service:
+  extraPorts:
+    - name: interceptor-metrics
+      port: 9091
+      targetPort: interceptor-metrics
+      protocol: TCP

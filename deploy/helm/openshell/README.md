@@ -690,6 +690,7 @@ discovery endpoint or its TLS CA.
 | server.enableUserNamespaces | bool | `false` | Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox pods. Requires Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), plus a supporting container runtime and Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host UID and capabilities become namespaced. |
 | server.enableWebsocketTunnel | bool | `false` | Enable the WebSocket tunnel used by CLI/SDK clients behind an authenticated edge proxy. Leave disabled for direct gateway installs. |
 | server.externalDbSecret | string | `""` | Name of a pre-existing Opaque Secret containing a PostgreSQL connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL from this Secret instead of using dbUrl. The Secret must contain a `uri` key, e.g. postgresql://user:pass@host:5432/dbname. |
+| server.extraContainers | list | `[]` | Additional containers for the gateway pod, such as a sidecar sharing a volume with the openshell-gateway container. Entries are Kubernetes container specs rendered as Helm templates, so they may reference chart values and helpers. The gateway container always comes first. |
 | server.extraEnv | list | `[]` | Additional environment variables for the gateway container, such as OTEL_* exporter settings. Entries can read from a Secret with valueFrom. |
 | server.extraVolumeMounts | list | `[]` | Additional volume mounts for the gateway container. |
 | server.extraVolumes | list | `[]` | Additional volumes for the gateway pod. |
@@ -738,6 +739,7 @@ discovery endpoint or its TLS CA.
 | server.tls.enableMtls | bool | `true` | Enable mTLS client certificate authentication. When false, the gateway runs HTTPS-only without requiring client certificates (use OIDC for auth instead). Must be false when using BackendTLSPolicy because ingress proxies cannot present client certificates to the backend. |
 | server.workspaceDefaultStorageSize | string | `""` | Default storage size for the workspace PVC in sandbox pods. Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi"). Empty = built-in default (2Gi). |
 | server.workspaceStorageClass | string | `""` | Kubernetes StorageClass for the workspace PVC in sandbox pods. Empty (default) = omit storageClassName, using the cluster's default StorageClass. Set this on clusters with no default StorageClass, otherwise the workspace PVC stays Pending and the sandbox never starts. |
+| service.extraPorts | list | `[]` | Additional ports on the gateway Service, such as a metrics port for a sidecar container configured with server.extraContainers. Entries are Kubernetes ServicePort objects. |
 | service.healthPort | int | `8081` | Gateway health service port. |
 | service.metricsPort | int | `9090` | Gateway metrics service port (1-65535). Disable the endpoint with metrics.enabled, not port 0 or false. |
 | service.port | int | `8080` | Gateway gRPC/HTTP service port. |

@@ -1032,6 +1032,35 @@ The gateway validates snapshot structure and provider-profile semantics. It trea
 
 `image_pull_policy` is a shared driver setting with the canonical values `always`, `if_not_present`, `never`, and `newer`. Set it inside the relevant driver table. Drivers translate these values to their runtime APIs; `newer` is supported only by Podman and is rejected at Docker and Kubernetes startup.
 
+### Deploying an interceptor as a gateway pod sidecar
+
+On Kubernetes, run an interceptor as a sidecar in the gateway pod and point `grpc_endpoint` at a Unix socket on a volume shared with the gateway container. With the Helm chart, `server.extraContainers` appends containers after the gateway container (entries are rendered as Helm templates), and `server.extraVolumes` with `server.extraVolumeMounts` mount the socket directory into the gateway container. `service.extraPorts` can expose a sidecar's metrics listener on the gateway Service.
+
+```yaml
+server:
+  extraVolumes:
+    - name: interceptor-socket
+      emptyDir: {}
+  extraVolumeMounts:
+    - name: interceptor-socket
+      mountPath: /run/openshell/interceptors
+  extraContainers:
+    - name: quota
+      image: ghcr.io/example/quota-interceptor:latest
+      args: ["--socket", "/run/openshell/interceptors/quota.sock"]
+      volumeMounts:
+        - name: interceptor-socket
+          mountPath: /run/openshell/interceptors
+
+gatewayConfig:
+  openshell.gateway.interceptors:
+    - name: quota
+      grpc_endpoint: unix:///run/openshell/interceptors/quota.sock
+      failure_policy: fail_closed
+```
+
+A sidecar shares the gateway pod's scheduling and lifecycle: it moves with the gateway, and a `fail_closed` interceptor makes the RPCs it binds fail while the sidecar is unavailable. Use this form for interceptors that must run on the gateway's host and share only a volume with it; run network interceptors as separate Deployments with HTTPS endpoints.
+
 ## Credential Drivers
 
 Set `credential_drivers` only when the gateway should store provider secrets in an external credential backend. Provider secrets include injectable credentials and gateway-only refresh material such as OAuth refresh tokens, client secrets, and service-account private keys. OpenShell supports at most one enabled credential driver at a time. When `credential_drivers` is omitted, the gateway uses its default encrypted database credential storage. `credential_drivers = []` is invalid in the TOML file; omit the field for the default encrypted store, or select a backend such as `kubernetes-secrets` or `vault`.

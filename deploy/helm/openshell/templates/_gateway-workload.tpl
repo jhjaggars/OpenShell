@@ -264,6 +264,9 @@ spec:
         failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
       resources:
         {{- toYaml .Values.resources | nindent 8 }}
+    {{- with .Values.server.extraContainers }}
+    {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
   volumes:
     - name: gateway-config
       configMap:

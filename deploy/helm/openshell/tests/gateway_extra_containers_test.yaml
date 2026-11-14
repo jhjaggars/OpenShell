@@ -1,0 +1,136 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: gateway extra containers and Service ports
+templates:
+  - templates/gateway-config.yaml
+  - templates/statefulset.yaml
+  - templates/deployment.yaml
+  - templates/service.yaml
+
+tests:
+  - it: adds no sidecar container by default
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].name
+          value: openshell-gateway
+      - lengthEqual:
+          path: spec.template.spec.containers
+          count: 1
+
+  - it: adds extra containers after the gateway container in a StatefulSet
+    template: templates/statefulset.yaml
+    set:
+      server.extraContainers:
+        - name: interceptor
+          image: ghcr.io/example/interceptor:latest
+          volumeMounts:
+            - name: interceptor-socket
+              mountPath: /run/openshell/interceptors
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].name
+          value: openshell-gateway
+      - contains:
+          path: spec.template.spec.containers
+          content:
+            name: interceptor
+            image: ghcr.io/example/interceptor:latest
+            volumeMounts:
+              - name: interceptor-socket
+                mountPath: /run/openshell/interceptors
+
+  - it: adds extra containers after the gateway container in a Deployment
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: postgres-uri
+      server.extraContainers:
+        - name: interceptor
+          image: ghcr.io/example/interceptor:latest
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].name
+          value: openshell-gateway
+      - contains:
+          path: spec.template.spec.containers
+          content:
+            name: interceptor
+            image: ghcr.io/example/interceptor:latest
+
+  - it: renders extra container entries as Helm templates
+    template: templates/statefulset.yaml
+    set:
+      server.extraContainers:
+        - name: interceptor
+          image: "{{ .Release.Name }}-interceptor"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[1].image
+          value: RELEASE-NAME-interceptor
+
+  - it: shares an emptyDir volume between the gateway container and a sidecar
+    template: templates/statefulset.yaml
+    set:
+      server.extraVolumes:
+        - name: interceptor-socket
+          emptyDir: {}
+      server.extraVolumeMounts:
+        - name: interceptor-socket
+          mountPath: /run/openshell/interceptors
+      server.extraContainers:
+        - name: interceptor
+          image: ghcr.io/example/interceptor:latest
+          volumeMounts:
+            - name: interceptor-socket
+              mountPath: /run/openshell/interceptors
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: interceptor-socket
+            emptyDir: {}
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: interceptor-socket
+            mountPath: /run/openshell/interceptors
+      - contains:
+          path: spec.template.spec.containers[1].volumeMounts
+          content:
+            name: interceptor-socket
+            mountPath: /run/openshell/interceptors
+
+  - it: adds no extra Service port by default
+    template: templates/service.yaml
+    asserts:
+      - lengthEqual:
+          path: spec.ports
+          count: 2
+
+  - it: adds extra Service ports after the built-in ports
+    template: templates/service.yaml
+    set:
+      service.extraPorts:
+        - name: interceptor-metrics
+          port: 9091
+          targetPort: interceptor-metrics
+          protocol: TCP
+    asserts:
+      - lengthEqual:
+          path: spec.ports
+          count: 3
+      - contains:
+          path: spec.ports
+          content:
+            name: interceptor-metrics
+            port: 9091
+            targetPort: interceptor-metrics
+            protocol: TCP
+      - equal:
+          path: spec.ports[0].name
+          value: grpc
+      - equal:
+          path: spec.ports[1].name
+          value: metrics

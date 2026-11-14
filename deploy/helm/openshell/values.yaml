@@ -270,6 +270,10 @@ service:
   healthPort: 8081
   # -- Gateway metrics service port (1-65535). Disable the endpoint with metrics.enabled, not port 0 or false.
   metricsPort: 9090
+  # -- Additional ports on the gateway Service, such as a metrics port for a
+  # sidecar container configured with server.extraContainers. Entries are
+  # Kubernetes ServicePort objects.
+  extraPorts: []
 
 # Optional TLS and mTLS configuration for the dedicated metrics listener.
 # Plaintext metrics remain the default for compatibility with existing
@@ -445,6 +449,11 @@ server:
     queueCapacity: 10000
     # -- Maximum encoded bytes waiting for the file writer.
     queueMaxBytes: 16777216
+  # -- Additional containers for the gateway pod, such as a sidecar sharing a
+  # volume with the openshell-gateway container. Entries are Kubernetes
+  # container specs rendered as Helm templates, so they may reference chart
+  # values and helpers. The gateway container always comes first.
+  extraContainers: []
   # -- Additional volumes for the gateway pod.
   extraVolumes: []
   # -- Additional volume mounts for the gateway container.
