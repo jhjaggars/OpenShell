@@ -13,6 +13,10 @@ spec:
   {{- if ne (include "openshell.autoscalingEnabled" .) "true" }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
+  {{- with (get (.Values.workload | default dict) "updateStrategy") }}
+  updateStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "openshell.selectorLabels" . | nindent 6 }}

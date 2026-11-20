@@ -26,6 +26,13 @@ workload:
   # gateways; this override exists for operators who explicitly require
   # StatefulSet identity or storage semantics.
   allowMultiReplicaStatefulSet: false
+  # -- Update strategy for the gateway workload. Empty keeps the Kubernetes
+  # default (RollingUpdate). With workload.kind=deployment this renders as
+  # spec.strategy; set `{type: Recreate}` so the old gateway pod stops before
+  # the new one starts and two gateway versions never share the database
+  # during an upgrade. With workload.kind=statefulset this renders as
+  # spec.updateStrategy and accepts RollingUpdate or OnDelete.
+  updateStrategy: {}
 
 gateway:
   image:

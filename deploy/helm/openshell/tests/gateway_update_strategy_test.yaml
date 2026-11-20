@@ -1,0 +1,109 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: gateway workload update strategy
+templates:
+  - templates/gateway-config.yaml
+  - templates/deployment.yaml
+  - templates/statefulset.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: leaves the Deployment strategy to the Kubernetes default
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+    asserts:
+      - notExists:
+          path: spec.strategy
+
+  - it: leaves the StatefulSet update strategy to the Kubernetes default
+    template: templates/statefulset.yaml
+    asserts:
+      - notExists:
+          path: spec.updateStrategy
+
+  - it: renders Recreate on the Deployment
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      workload.updateStrategy.type: Recreate
+      server.externalDbSecret: my-pg-secret
+    asserts:
+      - equal:
+          path: spec.strategy
+          value:
+            type: Recreate
+
+  - it: renders a RollingUpdate budget on the Deployment
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      workload.updateStrategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxSurge: 0
+          maxUnavailable: 1
+    asserts:
+      - equal:
+          path: spec.strategy
+          value:
+            type: RollingUpdate
+            rollingUpdate:
+              maxSurge: 0
+              maxUnavailable: 1
+
+  - it: renders OnDelete as the StatefulSet update strategy
+    template: templates/statefulset.yaml
+    set:
+      workload.updateStrategy.type: OnDelete
+    asserts:
+      - equal:
+          path: spec.updateStrategy
+          value:
+            type: OnDelete
+
+  - it: rejects Recreate with a StatefulSet
+    template: templates/statefulset.yaml
+    set:
+      workload.updateStrategy.type: Recreate
+    asserts:
+      - failedTemplate:
+          errorMessage: 'workload.updateStrategy.type "Recreate" is not valid with workload.kind=statefulset; use RollingUpdate or OnDelete.'
+
+  - it: rejects OnDelete with a Deployment
+    template: templates/statefulset.yaml
+    set:
+      workload.kind: deployment
+      workload.updateStrategy.type: OnDelete
+      server.externalDbSecret: my-pg-secret
+    asserts:
+      - failedTemplate:
+          errorMessage: 'workload.updateStrategy.type "OnDelete" is not valid with workload.kind=deployment; use RollingUpdate or Recreate.'
+
+  - it: rejects a rollingUpdate block with Recreate
+    template: templates/statefulset.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      workload.updateStrategy:
+        type: Recreate
+        rollingUpdate:
+          maxSurge: 1
+    asserts:
+      - failedTemplate:
+          errorMessage: "workload.updateStrategy.rollingUpdate is only valid with type RollingUpdate."
+
+  - it: rejects a non-map update strategy
+    template: templates/statefulset.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      workload.updateStrategy: Recreate
+    asserts:
+      - failedTemplate:
+          errorMessage: "workload.updateStrategy must be a map, such as {type: Recreate}."

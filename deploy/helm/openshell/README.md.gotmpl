@@ -401,6 +401,21 @@ gateways. `workload.kind=statefulset` is still available for single-replica
 SQLite installs and for operators who explicitly need StatefulSet identity or
 storage semantics.
 
+By default the gateway workload uses the Kubernetes RollingUpdate strategy, so
+during an upgrade the new gateway pod starts, and runs its database
+migrations, while the old pod is still serving. To stop the old pod first, so
+two gateway versions never share the database, set
+`workload.updateStrategy.type=Recreate` with `workload.kind=deployment`. The
+gateway is then unavailable from when the old pod stops until the new pod is
+ready.
+
+```bash
+helm upgrade openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  -n openshell \
+  --reset-then-reuse-values \
+  --set workload.updateStrategy.type=Recreate
+```
+
 ### Credential storage
 
 By default, the chart uses the gateway's encrypted database credential storage.

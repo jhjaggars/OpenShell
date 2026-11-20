@@ -847,6 +847,26 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if and (gt $maxReplicas 1) (not .Values.server.externalDbSecret) -}}
 {{- fail (printf "%s > 1 requires server.externalDbSecret; multiple gateway replicas cannot share the default per-pod SQLite database." $maxReplicasSource) -}}
 {{- end -}}
+{{- $updateStrategy := get $workload "updateStrategy" | default dict -}}
+{{- if not (kindIs "map" $updateStrategy) -}}
+{{- fail "workload.updateStrategy must be a map, such as {type: Recreate}." -}}
+{{- end -}}
+{{- $updateStrategyType := get $updateStrategy "type" | default "" -}}
+{{- if eq $workloadKind "deployment" -}}
+{{- if and $updateStrategyType (not (has $updateStrategyType (list "RollingUpdate" "Recreate"))) -}}
+{{- fail (printf "workload.updateStrategy.type %q is not valid with workload.kind=deployment; use RollingUpdate or Recreate." $updateStrategyType) -}}
+{{- end -}}
+{{- if and (hasKey $updateStrategy "rollingUpdate") (ne $updateStrategyType "RollingUpdate") (ne $updateStrategyType "") -}}
+{{- fail "workload.updateStrategy.rollingUpdate is only valid with type RollingUpdate." -}}
+{{- end -}}
+{{- else -}}
+{{- if and $updateStrategyType (not (has $updateStrategyType (list "RollingUpdate" "OnDelete"))) -}}
+{{- fail (printf "workload.updateStrategy.type %q is not valid with workload.kind=statefulset; use RollingUpdate or OnDelete." $updateStrategyType) -}}
+{{- end -}}
+{{- if and (hasKey $updateStrategy "rollingUpdate") (ne $updateStrategyType "RollingUpdate") (ne $updateStrategyType "") -}}
+{{- fail "workload.updateStrategy.rollingUpdate is only valid with type RollingUpdate." -}}
+{{- end -}}
+{{- end -}}
 {{- if and (eq $workloadKind "statefulset") (gt $maxReplicas 1) (not (get $workload "allowMultiReplicaStatefulSet" | default false)) -}}
 {{- fail (printf "%s > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true; use workload.kind=deployment for external database-backed multi-replica gateways." $maxReplicasSource) -}}
 {{- end -}}
